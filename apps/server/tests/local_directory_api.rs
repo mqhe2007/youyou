@@ -2598,13 +2598,16 @@ async fn admin_media_library_browse_mkdir_move_upload_and_delete() {
         .await
         .expect("root body");
     let root_json: serde_json::Value = serde_json::from_slice(&root_body).expect("root json");
-    assert!(
-        root_json["folders"]
-            .as_array()
-            .expect("folders")
-            .iter()
-            .any(|folder| folder["path"] == "albums")
-    );
+    let albums_folder = root_json["folders"]
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|folder| folder["path"] == "albums")
+        .expect("albums folder");
+    let albums_thumbnail_id = albums_folder["thumbnailMediaId"]
+        .as_str()
+        .expect("albums folder thumbnail media id")
+        .to_owned();
 
     let mkdir = json_request(
         &app,
@@ -2631,15 +2634,49 @@ async fn admin_media_library_browse_mkdir_move_upload_and_delete() {
         .await
         .expect("albums body");
     let albums_json: serde_json::Value = serde_json::from_slice(&albums_body).expect("albums json");
+    let empty_folder = albums_json["folders"]
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|folder| folder["path"] == "albums/empty")
+        .expect("albums/empty folder");
     assert!(
-        albums_json["folders"]
-            .as_array()
-            .expect("folders")
-            .iter()
-            .any(|folder| folder["path"] == "albums/empty")
+        empty_folder["thumbnailMediaId"].is_null(),
+        "a folder without indexed media must not advertise a thumbnail"
     );
     assert_eq!(albums_json["media"].as_array().expect("media").len(), 1);
     let media_id = albums_json["media"][0]["id"].as_str().expect("media id");
+    assert_eq!(
+        albums_thumbnail_id, media_id,
+        "folder tile thumbnail must point at the first media inside the folder"
+    );
+
+    let info = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/media-library/media/{media_id}/info"),
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(info.status(), StatusCode::OK);
+    let info_body = to_bytes(info.into_body(), usize::MAX)
+        .await
+        .expect("info body");
+    let info_json: serde_json::Value = serde_json::from_slice(&info_body).expect("info json");
+    assert_eq!(info_json["name"], "shot.jpg");
+    assert_eq!(info_json["path"], "albums/shot.jpg");
+    assert_eq!(info_json["library"], "albums");
+    assert_eq!(info_json["width"], 2);
+    assert_eq!(info_json["height"], 2);
+    assert_eq!(info_json["mimeType"], "image/jpeg");
+    assert_eq!(info_json["isVideo"], false);
+    assert!(info_json["size"].as_u64().is_some_and(|size| size > 0));
+    assert!(
+        info_json["exif"].is_null(),
+        "a synthetic JPEG carries no camera metadata"
+    );
 
     let move_media = json_request(
         &app,

@@ -46,6 +46,10 @@ const lightbox = ref(null);
 const uploadInput = ref(null);
 const contextMenu = ref(null);
 const moveTargets = ref([]);
+const infoOpen = ref(false);
+const infoLoading = ref(false);
+const infoError = ref('');
+const infoData = ref(null);
 
 const breadcrumbs = computed(() => {
   if (!currentPath.value) return [];
@@ -201,6 +205,7 @@ function onGlobalKeydown(event) {
     closeLightbox();
     if (mkdirOpen.value) mkdirOpen.value = false;
     if (moveOpen.value) moveOpen.value = false;
+    if (infoOpen.value) closeInfo();
     if (selectMode.value) exitSelectMode();
   }
 }
@@ -208,6 +213,111 @@ function onGlobalKeydown(event) {
 function thumbnailUrl(mediaItem) {
   return `/api/v1/admin/media-library/media/${encodeURIComponent(mediaItem.id)}/thumbnail?size=256`;
 }
+
+const failedFolderThumbs = ref({});
+
+function folderThumbnailUrl(folder) {
+  return `/api/v1/admin/media-library/media/${encodeURIComponent(folder.thumbnailMediaId)}/thumbnail?size=256`;
+}
+
+function hasFolderThumbnail(folder) {
+  return Boolean(folder.thumbnailMediaId) && !failedFolderThumbs.value[folder.thumbnailMediaId];
+}
+
+function onFolderThumbError(folder) {
+  failedFolderThumbs.value = {
+    ...failedFolderThumbs.value,
+    [folder.thumbnailMediaId]: true,
+  };
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatDateTime(ms) {
+  const date = new Date(ms);
+  const day = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  return `${day} ${time}`;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return hours > 0
+    ? `${hours}:${pad2(minutes)}:${pad2(seconds)}`
+    : `${minutes}:${pad2(seconds)}`;
+}
+
+async function openInfo(mediaItem) {
+  closeContextMenu();
+  infoOpen.value = true;
+  infoLoading.value = true;
+  infoError.value = '';
+  infoData.value = null;
+  try {
+    infoData.value = await props.api.request(
+      `/api/v1/admin/media-library/media/${encodeURIComponent(mediaItem.id)}/info`,
+    );
+  } catch (error) {
+    infoError.value = getApiErrorMessage(error);
+  } finally {
+    infoLoading.value = false;
+  }
+}
+
+function closeInfo() {
+  infoOpen.value = false;
+  infoData.value = null;
+  infoError.value = '';
+}
+
+const infoRows = computed(() => {
+  const data = infoData.value;
+  if (!data) return [];
+  const rows = [['文件名', data.name]];
+  if (data.takenAt != null) {
+    rows.push(['拍摄时间', formatDateTime(data.takenAt)]);
+  } else if (data.sortAt != null) {
+    rows.push([
+      data.sortSource === 'filename' ? '文件名时间' : '媒体时间（回退）',
+      formatDateTime(data.sortAt),
+    ]);
+  } else {
+    rows.push(['媒体时间', '时间未知']);
+  }
+  if (data.modifiedAt != null) rows.push(['修改时间', formatDateTime(data.modifiedAt)]);
+  if (data.width != null && data.height != null) {
+    rows.push(['尺寸', `${data.width} × ${data.height}`]);
+  }
+  rows.push(['文件大小', formatFileSize(data.size)]);
+  if (data.mimeType) rows.push(['类型', data.mimeType]);
+  if (data.isVideo && data.durationMs != null) {
+    rows.push(['时长', formatDuration(data.durationMs)]);
+  }
+  const exif = data.exif;
+  if (exif) {
+    if (exif.cameraModel) rows.push(['相机型号', exif.cameraModel]);
+    if (exif.iso) rows.push(['ISO', exif.iso]);
+    if (exif.aperture) rows.push(['光圈', exif.aperture]);
+    if (exif.focalLength) rows.push(['焦距', exif.focalLength]);
+    if (exif.exposureTime) rows.push(['曝光时间', exif.exposureTime]);
+  }
+  rows.push(['路径', data.path]);
+  if (data.library) rows.push(['媒体库', data.library]);
+  if (data.contentHash) rows.push(['内容哈希', `${data.contentHash.slice(0, 16)}...`]);
+  return rows;
+});
 
 function contentUrl(mediaItem) {
   return `/api/v1/admin/media-library/media/${encodeURIComponent(mediaItem.id)}/content`;
@@ -570,7 +680,14 @@ function contextStyle() {
           <Square v-else :size="14" :stroke-width="2" />
         </span>
         <span class="media-tile-preview folder-preview" aria-hidden="true">
-          <Folder :size="36" :stroke-width="iconStrokeWidth" />
+          <img
+            v-if="hasFolderThumbnail(folder)"
+            :src="folderThumbnailUrl(folder)"
+            alt=""
+            loading="lazy"
+            @error="onFolderThumbError(folder)"
+          >
+          <Folder v-else :size="36" :stroke-width="iconStrokeWidth" />
         </span>
         <span class="media-tile-meta">
           <strong>{{ folder.name }}</strong>
@@ -595,9 +712,6 @@ function contextStyle() {
         <span class="media-tile-preview">
           <img :src="thumbnailUrl(item)" :alt="item.name" loading="lazy">
           <span v-if="item.isVideo" class="media-video-badge">视频</span>
-        </span>
-        <span class="media-tile-meta">
-          <strong>{{ item.name }}</strong>
         </span>
       </button>
     </div>
@@ -627,6 +741,15 @@ function contextStyle() {
           @click="openLightbox(contextMenu.item)"
         >
           预览
+        </button>
+        <button
+          v-if="contextMenu.kind === 'media'"
+          class="media-context-item"
+          type="button"
+          role="menuitem"
+          @click="openInfo(contextMenu.item)"
+        >
+          属性
         </button>
         <button
           v-if="contextMenu.kind === 'folder'"
@@ -719,6 +842,36 @@ function contextStyle() {
             </button>
           </div>
         </form>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="infoOpen"
+        class="media-overlay"
+        role="presentation"
+        @click.self="closeInfo"
+      >
+        <div
+          class="media-dialog-card media-dialog-card-info"
+          role="dialog"
+          aria-modal="true"
+          aria-label="媒体属性"
+          @click.stop
+        >
+          <h2>属性</h2>
+          <p v-if="infoLoading" class="media-dialog-hint">正在读取属性…</p>
+          <p v-else-if="infoError" class="media-dialog-error">{{ infoError }}</p>
+          <div v-else class="media-info-list">
+            <div v-for="row in infoRows" :key="row[0]" class="media-info-row">
+              <span class="media-info-label">{{ row[0] }}</span>
+              <span class="media-info-value">{{ row[1] }}</span>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" type="button" @click="closeInfo">关闭</button>
+          </div>
+        </div>
       </div>
     </Teleport>
 

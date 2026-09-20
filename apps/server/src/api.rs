@@ -171,7 +171,8 @@ async fn complete_auth_attempt(state: &AppState, key: Option<&str>, failed: bool
         crate::media_library::delete_library_entry,
         crate::media_library::upload_library,
         crate::media_library::library_media_content,
-        crate::media_library::library_media_thumbnail
+        crate::media_library::library_media_thumbnail,
+        crate::media_library::library_media_info
     ),
     components(schemas(
         HealthResponse,
@@ -223,6 +224,8 @@ async fn complete_auth_attempt(state: &AppState, key: Option<&str>, failed: bool
         crate::media_library::LibraryListResponse,
         crate::media_library::LibraryFolder,
         crate::media_library::LibraryMedia,
+        crate::media_library::LibraryMediaInfo,
+        crate::media_library::LibraryExif,
         metadata::Tag,
         metadata::Relation,
         uploads::StreamUploadResponse

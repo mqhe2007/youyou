@@ -44,6 +44,10 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/admin/media-library/media/{id}/thumbnail",
             get(library_media_thumbnail),
         )
+        .route(
+            "/api/v1/admin/media-library/media/{id}/info",
+            get(library_media_info),
+        )
 }
 
 /// Upload routes are mounted without the global short request timeout.
@@ -101,6 +105,10 @@ pub struct LibraryFolder {
     pub path: String,
     pub name: String,
     pub media_count: u64,
+    /// First media inside this folder tree, in the same order the media grid
+    /// renders (`sort_at` descending, ties broken by id ascending). Used as the
+    /// folder tile thumbnail. `None` when the folder has no indexed media.
+    pub thumbnail_media_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -118,6 +126,48 @@ pub struct LibraryMedia {
     pub sort_at: Option<i64>,
 }
 
+/// Full metadata for one media asset, mirroring the fields the Android client
+/// shows in its "详细信息" sheet so both surfaces tell the same story.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMediaInfo {
+    pub id: String,
+    pub name: String,
+    pub original_name: Option<String>,
+    /// EXIF capture time in milliseconds.
+    pub taken_at: Option<i64>,
+    /// Fallback ordering time in milliseconds.
+    pub sort_at: Option<i64>,
+    /// Where `sort_at` came from: `exif`, `filename` or `unknown`.
+    pub sort_source: String,
+    /// Filesystem modification time in milliseconds.
+    pub modified_at: Option<i64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub size: u64,
+    pub mime_type: Option<String>,
+    pub is_video: bool,
+    pub duration_ms: Option<i64>,
+    pub video_codec: Option<String>,
+    /// Media library directory name, i.e. the first path segment.
+    pub library: String,
+    /// Path relative to the media root.
+    pub path: String,
+    pub content_hash: Option<String>,
+    /// Camera parameters, read from the file on demand. Images only.
+    pub exif: Option<LibraryExif>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryExif {
+    pub camera_model: Option<String>,
+    pub iso: Option<String>,
+    pub aperture: Option<String>,
+    pub focal_length: Option<String>,
+    pub exposure_time: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct IndexedLocationRow {
     media_id: String,
@@ -132,6 +182,32 @@ struct IndexedLocationRow {
     sort_at: Option<i64>,
 }
 
+/// Roll-up of the indexed media nested under one direct child folder.
+#[derive(Debug, Default)]
+struct FolderAggregate {
+    media_count: u64,
+    /// `(sort_at, media_id)` of the entry that renders first when entering the
+    /// folder. Kept in sync with the grid ordering applied to `media`.
+    thumbnail: Option<(Option<i64>, String)>,
+}
+
+/// Mirrors the media grid ordering (`sort_at` descending, ties broken by id
+/// ascending) so a folder tile previews exactly what the folder opens with.
+fn is_preferred_thumbnail(
+    current: Option<&(Option<i64>, String)>,
+    sort_at: Option<i64>,
+    media_id: &str,
+) -> bool {
+    let Some((current_sort_at, current_id)) = current else {
+        return true;
+    };
+    match sort_at.cmp(current_sort_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => media_id < current_id.as_str(),
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct MediaServeRow {
     id: String,
@@ -140,6 +216,26 @@ struct MediaServeRow {
     content_hash: Option<String>,
     version: i64,
     is_video: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct MediaInfoRow {
+    id: String,
+    name: String,
+    original_name: Option<String>,
+    mime_type: Option<String>,
+    is_video: i64,
+    duration_ms: Option<i64>,
+    video_codec: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    taken_at: Option<i64>,
+    sort_at: Option<i64>,
+    sort_source: String,
+    normalized_path: String,
+    size: i64,
+    modified_at: Option<i64>,
+    content_hash: Option<String>,
 }
 
 #[utoipa::path(
@@ -529,6 +625,121 @@ pub(crate) async fn library_media_thumbnail(
     Ok(jpeg_response(bytes))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/media-library/media/{id}/info",
+    tag = "administration",
+    params(("id" = String, Path, description = "Media ID")),
+    responses(
+        (status = 200, description = "Media metadata", body = LibraryMediaInfo),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub(crate) async fn library_media_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Json<LibraryMediaInfo>> {
+    auth::require_admin(&state.db, &headers, false).await?;
+    let row = find_media_info(&state.db, &id).await?;
+
+    // Camera parameters are not persisted by the scanner; read them on demand
+    // so the admin sheet can show what the client shows.
+    let exif = if row.is_video == 0 {
+        let storage = state.storage.snapshot().await;
+        match storage.read_all(&row.normalized_path, None).await {
+            Ok(bytes) => read_exif_info(&bytes),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let library = row
+        .normalized_path
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+
+    Ok(Json(LibraryMediaInfo {
+        id: row.id,
+        name: row.name,
+        original_name: row.original_name,
+        taken_at: row.taken_at,
+        sort_at: row.sort_at,
+        sort_source: row.sort_source,
+        modified_at: row.modified_at,
+        width: row.width.and_then(|value| u64::try_from(value).ok()),
+        height: row.height.and_then(|value| u64::try_from(value).ok()),
+        size: u64::try_from(row.size).unwrap_or(0),
+        mime_type: row.mime_type,
+        is_video: row.is_video != 0,
+        duration_ms: row.duration_ms,
+        video_codec: row.video_codec,
+        library,
+        path: row.normalized_path,
+        content_hash: row.content_hash,
+        exif,
+    }))
+}
+
+/// Mirrors the camera fields the Android client reads with `ExifInterface`.
+/// Returns `None` when the file carries no usable camera metadata.
+fn read_exif_info(bytes: &[u8]) -> Option<LibraryExif> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let text = |tag: exif::Tag| -> Option<String> {
+        let value = exif_field(&exif, tag)?.display_value().to_string();
+        let value = value.trim().trim_matches('"').to_owned();
+        (!value.is_empty()).then_some(value)
+    };
+    let rational =
+        |tag: exif::Tag| -> Option<f64> { exif_rational(&exif_field(&exif, tag)?.value, 0) };
+
+    let info = LibraryExif {
+        camera_model: text(exif::Tag::Model),
+        iso: exif_field(&exif, exif::Tag::PhotographicSensitivity)
+            .and_then(|field| field.value.get_uint(0))
+            .map(|value| value.to_string()),
+        aperture: rational(exif::Tag::FNumber).map(|value| format!("f/{value:.1}")),
+        focal_length: rational(exif::Tag::FocalLength).map(|value| format!("{value:.1}mm")),
+        exposure_time: rational(exif::Tag::ExposureTime).map(|value| {
+            if value > 0.0 && value < 1.0 {
+                format!("1/{}s", (1.0 / value).round() as i64)
+            } else {
+                format!("{value:.1}s")
+            }
+        }),
+    };
+
+    let empty = info.camera_model.is_none()
+        && info.iso.is_none()
+        && info.aperture.is_none()
+        && info.focal_length.is_none()
+        && info.exposure_time.is_none();
+    (!empty).then_some(info)
+}
+
+/// Looks a tag up across every IFD. Camera parameters such as aperture and
+/// shutter speed live in the Exif sub-IFD, so `In::PRIMARY` alone would miss
+/// nearly everything a real camera writes.
+fn exif_field(exif: &exif::Exif, tag: exif::Tag) -> Option<&exif::Field> {
+    exif.fields().find(|field| field.tag == tag)
+}
+
+/// EXIF rationals arrive as numerator/denominator pairs; the client formats
+/// the derived float, so do the same here.
+fn exif_rational(value: &exif::Value, index: usize) -> Option<f64> {
+    match value {
+        exif::Value::Rational(values) => values.get(index).map(exif::Rational::to_f64),
+        exif::Value::SRational(values) => values.get(index).map(exif::SRational::to_f64),
+        _ => None,
+    }
+}
+
 async fn generate_video_thumbnail(
     storage: &LocalFilesystemStorageDriver,
     row: &MediaServeRow,
@@ -604,7 +815,7 @@ async fn build_listing(
     .fetch_all(pool)
     .await?;
 
-    let mut folder_counts = BTreeMap::<String, u64>::new();
+    let mut folder_aggregates = BTreeMap::<String, FolderAggregate>::new();
     let mut media = Vec::new();
     for row in rows {
         let relative = match relative_child(&row.normalized_path, path) {
@@ -612,7 +823,11 @@ async fn build_listing(
             None => continue,
         };
         if let Some((folder_name, _)) = relative.split_once('/') {
-            *folder_counts.entry(folder_name.to_owned()).or_default() += 1;
+            let aggregate = folder_aggregates.entry(folder_name.to_owned()).or_default();
+            aggregate.media_count += 1;
+            if is_preferred_thumbnail(aggregate.thumbnail.as_ref(), row.sort_at, &row.media_id) {
+                aggregate.thumbnail = Some((row.sort_at, row.media_id));
+            }
             continue;
         }
         media.push(LibraryMedia {
@@ -634,21 +849,22 @@ async fn build_listing(
         use futures_util::TryStreamExt;
         while let Some(entry) = stream.try_next().await? {
             if entry.is_directory {
-                folder_counts.entry(entry.name).or_insert(0);
+                folder_aggregates.entry(entry.name).or_default();
             }
         }
     }
 
-    let folders = folder_counts
+    let folders = folder_aggregates
         .into_iter()
-        .map(|(name, media_count)| LibraryFolder {
+        .map(|(name, aggregate)| LibraryFolder {
             path: if path.is_empty() {
                 name.clone()
             } else {
                 format!("{path}/{name}")
             },
             name,
-            media_count,
+            media_count: aggregate.media_count,
+            thumbnail_media_id: aggregate.thumbnail.map(|(_, media_id)| media_id),
         })
         .collect::<Vec<_>>();
 
@@ -1017,6 +1233,43 @@ async fn find_verified_media(pool: &SqlitePool, id: &str) -> AppResult<MediaServ
             b.content_hash,
             a.version,
             a.is_video
+        FROM media_assets a
+        INNER JOIN media_locations l ON l.media_asset_id = a.id
+        LEFT JOIN content_blobs b ON b.id = a.blob_id
+        WHERE a.id = ?1
+          AND a.identity_state = 'verified'
+          AND l.hash_state = 'verified'
+          AND l.storage_id = 'local'
+        ORDER BY l.normalized_path ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("media not found".to_owned()))
+}
+
+async fn find_media_info(pool: &SqlitePool, id: &str) -> AppResult<MediaInfoRow> {
+    sqlx::query_as::<_, MediaInfoRow>(
+        r#"
+        SELECT
+            a.id,
+            a.name,
+            a.original_name,
+            a.mime_type,
+            a.is_video,
+            a.duration_ms,
+            a.video_codec,
+            a.width,
+            a.height,
+            a.taken_at,
+            a.sort_at,
+            a.sort_source,
+            l.normalized_path,
+            l.size,
+            l.modified_at,
+            b.content_hash
         FROM media_assets a
         INNER JOIN media_locations l ON l.media_asset_id = a.id
         LEFT JOIN content_blobs b ON b.id = a.blob_id
