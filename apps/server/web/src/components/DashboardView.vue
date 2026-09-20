@@ -1,5 +1,5 @@
 <script setup>
-// 管理端外壳：侧边导航 + 顶栏（面包屑 / 刷新 / 用户菜单）+ Toast 反馈。
+// 管理端外壳：侧边导航 + 顶栏（面包屑 / 用户菜单）+ Toast 反馈。
 // 数据加载与任务轮询集中在壳层，通过 props 下发、事件上抛。
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import {
@@ -10,7 +10,6 @@ import {
   ListTodo,
   LogOut,
   Menu,
-  RefreshCw,
   Trash2,
   Users,
   X,
@@ -380,21 +379,6 @@ onUnmounted(() => {
           </div>
         </div>
         <div class="topbar-actions">
-          <button
-            class="btn btn-ghost btn-sm topbar-refresh"
-            type="button"
-            :disabled="refreshing"
-            @click="refreshAll"
-          >
-            <RefreshCw
-              class="refresh-glyph"
-              :class="{ spinning: refreshing }"
-              :size="16"
-              :stroke-width="iconStrokeWidth"
-              aria-hidden="true"
-            />
-            <span class="refresh-label">刷新</span>
-          </button>
           <div class="dropdown dropdown-end">
             <button
               class="user-menu-trigger"

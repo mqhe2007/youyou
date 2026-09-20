@@ -591,15 +591,6 @@ a {
   animation: spin 0.9s linear infinite;
 }
 
-.topbar-refresh {
-  color: #6e6a64;
-}
-
-.topbar-refresh:hover {
-  background: #f1ebdf;
-  color: #292722;
-}
-
 .logout-button {
   color: #6e6a64;
 }
@@ -2142,10 +2133,6 @@ a {
 
   .breadcrumb {
     font-size: 0.7rem;
-  }
-
-  .refresh-label {
-    display: none;
   }
 
   .dashboard-alert {

@@ -509,7 +509,7 @@ function contextStyle() {
         </template>
         <template v-else>
           <button class="btn btn-outline btn-sm" type="button" :disabled="scanBusy || Boolean(busy)" @click="refreshFolder(currentPath)" title="扫描当前文件夹及子文件夹">
-            <RefreshCw :size="16" :stroke-width="iconStrokeWidth" :class="{ spinning: scanBusy }" aria-hidden="true" />
+            <RefreshCw class="refresh-glyph" :size="16" :stroke-width="iconStrokeWidth" :class="{ spinning: scanBusy }" aria-hidden="true" />
             {{ scanBusy ? '正在刷新…' : '刷新文件夹' }}
           </button>
           <button class="btn btn-outline btn-sm" type="button" :disabled="Boolean(busy)" @click="enterSelectMode">
