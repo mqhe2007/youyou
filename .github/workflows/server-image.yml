@@ -1,13 +1,17 @@
 name: 服务端镜像
 
-# 打 tag（v1.2.3）触发正式发版；workflow_dispatch 只验证构建，产物打 dev-<sha> 标签。
+# 服务端与客户端各自发版：推 server-v* 标签（形如 server-v0.3.2）触发正式发版，
+# workflow_dispatch 只验证构建，产物打 dev-<sha> 标签；客户端发布见 android-apk.yml。
+#
+# 发版前先把 apps/server/Cargo.toml 的 version 递增到目标号 —— tag 与它必须一致，
+# CI 会校验；镜像标签、健康接口与备份清单里的版本都来自这一处。
 #
 # 两个架构各自在原生 runner 上单独构建并推送临时标签，最后用 imagetools 合并成
 # 一个多架构 manifest。不用 QEMU 交叉模拟：Rust 的 release 编译在模拟下要一小时以上。
 on:
   push:
     tags:
-      - "v*"
+      - "server-v*"
   workflow_dispatch:
 
 permissions:
@@ -24,10 +28,22 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       release: ${{ steps.ver.outputs.release }}
     steps:
+      - uses: actions/checkout@v7
+
       - id: ver
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/server-v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#server-v}"
+            CARGO_VERSION=$(sed -nE 's/^version = "([^"]+)".*/\1/p' apps/server/Cargo.toml | head -1)
+            if [[ -z "$CARGO_VERSION" ]]; then
+              echo "::error::无法从 apps/server/Cargo.toml 解析 version"
+              exit 1
+            fi
+            if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} 与 Cargo.toml version ${CARGO_VERSION} 不一致"
+              exit 1
+            fi
+            echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
             echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"

@@ -26,6 +26,8 @@ use crate::{
 const SETUP_TOKEN_FILE: &str = "setup-token";
 const ADMIN_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const PAIRING_CODE_TTL_MS: i64 = 10 * 60 * 1000;
+// 服务端接受的客户端版本下限。只在 API 不兼容时抬高，日常改动不要动 ——
+// 客户端与服务端独立发版，抬它等于强制所有旧客户端升级。
 pub const MIN_CLIENT_VERSION: &str = "0.1.3";
 const MIN_CLIENT_VERSION_TUPLE: (u64, u64, u64) = (0, 1, 3);
 pub const ADMIN_SESSION_COOKIE: &str = "youyou_admin_session";
@@ -219,9 +221,9 @@ pub async fn initialize_admin(
     setup_token: &str,
     password: &str,
 ) -> AppResult<()> {
-    if password.chars().count() < 12 {
+    if password.chars().count() < 8 {
         return Err(AppError::BadRequest(
-            "admin password must contain at least 12 characters".to_owned(),
+            "admin password must contain at least 8 characters".to_owned(),
         ));
     }
     let stored_token = tokio::fs::read_to_string(token_path)

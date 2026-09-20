@@ -99,7 +99,6 @@ async fn complete_auth_attempt(state: &AppState, key: Option<&str>, failed: bool
 #[openapi(
     info(
         title = "youyou Server API",
-        version = "0.1.0",
         description = "API for a user-operated youyou media server."
     ),
     tags(
@@ -231,8 +230,15 @@ async fn complete_auth_attempt(state: &AppState, key: Option<&str>, failed: bool
 )]
 pub struct ApiDoc;
 
+/// utoipa 的 info(version) 只接受字面量，运行期注入才能让文档版本与 crate 版本同源。
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    let mut document = ApiDoc::openapi();
+    document.info.version = env!("CARGO_PKG_VERSION").to_owned();
+    document
+}
+
 async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    Json(openapi_document())
 }
 
 pub fn build_router(state: AppState) -> Router {

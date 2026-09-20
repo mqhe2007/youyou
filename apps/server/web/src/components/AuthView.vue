@@ -69,8 +69,8 @@ function submitLogin() {
 function submitSetup() {
   localError.value = '';
 
-  if (setupForm.password.length < 12) {
-    localError.value = '管理员密码至少需要 12 个字符。';
+  if (setupForm.password.length < 8) {
+    localError.value = '管理员密码至少需要 8 个字符。';
     return;
   }
 
@@ -149,9 +149,9 @@ function submitSetup() {
                 class="input input-bordered"
                 :type="showPassword ? 'text' : 'password'"
                 required
-                minlength="12"
+                minlength="8"
                 autocomplete="new-password"
-                placeholder="至少 12 个字符"
+                placeholder="至少 8 个字符"
               >
               <button
                 class="password-toggle"
@@ -172,7 +172,7 @@ function submitSetup() {
               class="input input-bordered"
               :type="showPassword ? 'text' : 'password'"
               required
-              minlength="12"
+              minlength="8"
               autocomplete="new-password"
               placeholder="再次确认管理员密码"
             >

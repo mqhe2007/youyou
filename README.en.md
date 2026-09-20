@@ -78,7 +78,11 @@ Building the client: `cd apps/android && ./gradlew assembleDebug`. A signed rele
 `release-signing/keystore.properties` in the repository root (not committed); when it is missing,
 the release build fails outright so that nothing unsigned can be published by accident. Official
 builds are produced by GitHub Actions on tags and published to this repository's Releases;
-`workflow_dispatch` runs the same signing flow without publishing.
+`workflow_dispatch` runs the same signing flow without publishing. The server and the client
+release independently: `server-vX.Y.Z` tags publish the image, `app-vX.Y.Z` tags publish the APK,
+and the two version numbers need not match. A tag must match the version declared in that
+component's own code — `version` in `apps/server/Cargo.toml`, `versionName` in the Android build —
+so bump it before tagging; CI enforces this.
 
 Running the server locally: `cargo run --manifest-path apps/server/Cargo.toml`; the admin UI is at
 `http://127.0.0.1:8989/admin`.

@@ -7,12 +7,12 @@
 
 use std::process::Command;
 
-use utoipa::OpenApi;
-use youyou_server::api::ApiDoc;
+use youyou_server::api::openapi_document;
 
 #[test]
 fn openapi_contract_passes_sanity_check() {
-    let document = ApiDoc::openapi();
+    let document = openapi_document();
+    assert_eq!(document.info.version, env!("CARGO_PKG_VERSION"));
     let json = serde_json::to_string_pretty(&document).expect("serialize openapi");
 
     let mut temp_path = std::env::temp_dir();

@@ -60,7 +60,10 @@ make acceptance       # 以上全部
 客户端构建：`cd apps/android && ./gradlew assembleDebug`。签名 Release 需要仓库根
 目录下的 `release-signing/keystore.properties`（不入库）；缺失时 Release 打包直接
 失败，以免误发未签名包。正式包由 GitHub Actions 在打 tag 时构建并发布到本仓库
-Releases，`workflow_dispatch` 可走同样的签名流程但不发布。
+Releases，`workflow_dispatch` 可走同样的签名流程但不发布。服务端与客户端各自发版、
+各自编号：推 `server-vX.Y.Z` 发镜像，推 `app-vX.Y.Z` 发 APK，两边版本号不要求一致；
+但 tag 必须与对应代码里的版本号相同（服务端 `apps/server/Cargo.toml` 的 `version`，
+APP 的 `versionName`），发版前先递增到位，CI 会校验。
 
 本地起服务端：`cargo run --manifest-path apps/server/Cargo.toml`，管理页在
 `http://127.0.0.1:8989/admin`。

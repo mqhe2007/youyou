@@ -21,6 +21,10 @@ use crate::db;
 const DATABASE_FILE: &str = "youyou.db";
 const MANIFEST_FILE: &str = "manifest.json";
 const FORMAT_VERSION: i64 = 1;
+/// 恢复向前兼容：新版可以恢复旧备份（启动时的迁移会把旧库升上来），旧版不能恢复
+/// 新备份。这个下限是"明确不兼容"的唯一表达方式 —— 只有数据库结构发生破坏性变更
+/// 时才抬高它，抬高意味着早于它的备份不再可恢复。
+const MIN_RESTORABLE_BACKUP_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,13 +202,7 @@ pub async fn cleanup_orphan_artifacts(pool: &SqlitePool, data_dir: &Path) -> any
 
 pub async fn restore(data_dir: &Path, backup_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     let manifest = verify(backup_dir).await?;
-    if manifest.server_version != env!("CARGO_PKG_VERSION") {
-        bail!(
-            "backup was created by youyou-server {}, current binary is {}",
-            manifest.server_version,
-            env!("CARGO_PKG_VERSION")
-        );
-    }
+    ensure_restorable_version(&manifest.server_version)?;
 
     fs::create_dir_all(data_dir)
         .await
@@ -238,6 +236,41 @@ pub async fn restore(data_dir: &Path, backup_dir: &Path) -> anyhow::Result<Optio
         });
     }
     Ok(safety_backup)
+}
+
+fn ensure_restorable_version(backup_version: &str) -> anyhow::Result<()> {
+    let Some(backup) = parse_version(backup_version) else {
+        bail!("backup manifest records an unusable server version {backup_version:?}");
+    };
+    let floor = parse_version(MIN_RESTORABLE_BACKUP_VERSION)
+        .expect("MIN_RESTORABLE_BACKUP_VERSION is a version triple");
+    if backup < floor {
+        bail!(
+            "backup was created by youyou-server {backup_version}, older than the oldest restorable version {MIN_RESTORABLE_BACKUP_VERSION}"
+        );
+    }
+    // 当前构建的版本号解析不了（非常规号）就跳过上限判断；备份自身的完整性校验
+    // 已经在 verify 里做过。
+    if let Some(current) = parse_version(env!("CARGO_PKG_VERSION")) {
+        if backup > current {
+            bail!(
+                "backup was created by youyou-server {backup_version}, newer than the current binary {}; restore it with that version instead",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split(['-', '+']).next()?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 async fn current_schema_version(pool: &SqlitePool) -> anyhow::Result<i64> {
