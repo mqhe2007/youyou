@@ -1,0 +1,30 @@
+services:
+  youyou-server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    image: youyou-server:dev
+    # 镜像内置用户是 uid 10001，而 bind mount 的宿主目录属主是部署者本人，
+    # 容器内那个 uid 对它没有写权限（Linux 上会直接起不来）。因此默认按部署者
+    # uid 运行；用命名卷部署时可设 PUID=10001 PGID=10001。
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${YOUYOU_SERVER_PORT:-8989}:${YOUYOU_SERVER_PORT:-8989}"
+    environment:
+      YOUYOU_SERVER_PORT: "${YOUYOU_SERVER_PORT:-8989}"
+      YOUYOU_SERVER_DIR: /srv/youyou
+      RUST_LOG: info
+    volumes:
+      # Host runtime dir (data/ + media/); override via YOUYOU_SERVER_DIR in project .env
+      - "${YOUYOU_SERVER_DIR:-${HOME}/youyou-server}:/srv/youyou"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail --silent http://127.0.0.1:$${YOUYOU_SERVER_PORT}/api/v1/health",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

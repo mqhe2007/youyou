@@ -1,0 +1,40 @@
+# 本地机密与运行配置（可提交的示例见 .env.example）
+.env
+.env.*
+!.env.example
+
+# 签名材料：keystore 与口令一律不入库
+/release-signing/
+*.jks
+*.keystore
+
+# Android / Gradle 构建产物
+**/build/
+**/android/.gradle/
+**/android/.kotlin/
+**/android/local.properties
+*.apk
+*.aab
+
+# Rust 与 Node 构建产物、依赖
+**/target/
+**/node_modules/
+apps/server/web/dist/
+
+# AI 助手工作目录与技能安装锁：本地工具状态，不属于项目内容
+.workbuddy/
+.agents/
+.qoder/
+skills-lock.json
+
+# 运行期数据与日志：SQLite 主库/临时库、脚本日志，一律不入库
+*.db
+*.db-journal
+*.log
+
+# 编辑器与系统杂物
+.idea/
+.DS_Store
+
+# Python 脚本运行期字节码缓存
+__pycache__/

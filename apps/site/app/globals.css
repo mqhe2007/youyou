@@ -1,0 +1,301 @@
+/* 柚柚相册落地页设计 token：品牌色值以官网与产品设计规范为准 */
+@import "tailwindcss";
+
+@theme inline {
+  --color-surface: var(--surface);
+  --color-surface-alt: var(--surface-alt);
+  --color-surface-muted: var(--surface-muted);
+  --color-ink: var(--ink);
+  --color-subtle: var(--subtle);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-fg: var(--accent-fg);
+  --color-gallery: var(--gallery);
+  --color-gallery-ink: var(--gallery-ink);
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC",
+    "Source Han Sans SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+:root {
+  /* 浅色主题：暖象牙 scaffold，单一鲜柚黄强调色 */
+  --surface: #fffbf5;
+  --surface-alt: #fffdfa;
+  --surface-muted: #f5f1eb;
+  --ink: #1c1b1a;
+  --subtle: #625e58;
+  --line: #e9e2d8;
+  --accent: #ffd63a;
+  --accent-strong: #f0c82e;
+  --accent-fg: #1c1b1a;
+  --gallery: #121110;
+  --gallery-ink: #ede7de;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* 深色主题：暖黑基底，与设计系统 DarkSurface / surfaceBright 对齐 */
+    --surface: #1a1816;
+    --surface-alt: #201d1a;
+    --surface-muted: #2a2724;
+    --ink: #f2eee8;
+    --subtle: #b9b4ac;
+    --line: #3b362f;
+    --accent: #ffd63a;
+    --accent-strong: #f0c82e;
+    --accent-fg: #1c1b1a;
+    --gallery: #121110;
+    --gallery-ink: #ede7de;
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 3px;
+}
+
+/* 圆角体系（设计系统 8/12/16/24 一级）：
+   按钮全圆角，图片帧 16px，表面积为 12px */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 999px;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  padding: 0.75rem 1.5rem;
+  transition:
+    background-color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    transform 0.15s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.btn:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.btn-sm {
+  padding: 0.5rem 1.25rem;
+  font-size: 0.875rem;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.btn-primary:hover {
+  background: var(--accent-strong);
+}
+
+.btn-invert {
+  background: var(--ink);
+  color: var(--surface);
+}
+
+.btn-invert:hover {
+  background: var(--subtle);
+}
+
+.btn-on-accent {
+  border: 1px solid color-mix(in srgb, var(--accent-fg) 30%, transparent);
+  color: var(--accent-fg);
+  background: transparent;
+}
+
+.btn-on-accent:hover {
+  border-color: var(--accent-fg);
+  background: color-mix(in srgb, var(--accent-fg) 8%, transparent);
+}
+
+.btn-ghost {
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.btn-ghost:hover {
+  border-color: var(--ink);
+}
+
+.link-quiet {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 4px;
+  transition: text-decoration-color 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.link-quiet:hover {
+  text-decoration-color: var(--ink);
+}
+
+.link-ink {
+  color: var(--accent-fg);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent-fg) 35%, transparent);
+  text-underline-offset: 4px;
+  transition: text-decoration-color 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.link-ink:hover {
+  text-decoration-color: var(--accent-fg);
+}
+
+.code-block {
+  background: #1a1816;
+  color: #f2eee8;
+  border-radius: 16px;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.9;
+  overflow-x: auto;
+}
+
+.code-block code {
+  display: block;
+  padding: 1.25rem 1.5rem;
+}
+
+/* 按钮内图标 hover 微位移（借鉴 high-end-visual-design 的 trailing-icon 动效，保持克制） */
+.cta-icon {
+  transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.group:hover .cta-icon {
+  transform: translateX(2px) scale(1.05);
+}
+
+.github-stars {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  height: 2.25rem;
+  padding: 0 0.65rem 0 0.35rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-alt) 80%, transparent);
+  color: var(--ink);
+  text-decoration: none;
+  transition:
+    border-color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    background-color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    transform 0.15s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.github-stars:hover {
+  border-color: color-mix(in srgb, var(--ink) 28%, var(--line));
+  background: var(--surface-alt);
+}
+
+.github-stars:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.github-stars-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.55rem;
+  height: 1.55rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.github-stars-icon {
+  display: block;
+}
+
+.github-stars-meta {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+  padding-right: 0.15rem;
+}
+
+.github-stars-caption {
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--subtle);
+}
+
+.github-stars-count {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.social-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: transparent;
+  transition:
+    border-color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    background-color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    color 0.25s cubic-bezier(0.32, 0.72, 0, 1),
+    transform 0.15s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.social-link:hover {
+  border-color: var(--ink);
+  background: var(--surface-alt);
+}
+
+.social-link:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .btn,
+  .link-quiet,
+  .link-ink,
+  .cta-icon,
+  .github-stars,
+  .social-link {
+    transition: none;
+  }
+
+  .group:hover .cta-icon {
+    transform: none;
+  }
+
+  .github-stars:active,
+  .social-link:active {
+    transform: none;
+  }
+}

@@ -1,0 +1,179 @@
+name: Android 客户端安装包
+
+# 仓库已开源，APK 直接发布到本仓库的 Releases，内测用户匿名可下。
+# 打 tag（v1.2.3）才创建 Release；workflow_dispatch 走同样的签名与构建流程，
+# 但产物只作为 artifact 保留 7 天，不对外发布 —— 用来验证签名链路而不占版本号。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_REPO: ${{ github.repository }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # compileSdk / ndkVersion 一律从 build.gradle.kts 读取，避免 CI 与工程配置漂移。
+      - name: 解析版本与 SDK 组件
+        id: version
+        working-directory: apps/android
+        run: |
+          set -euo pipefail
+          # sed 而非 grep -oP：BSD/GNU 行为一致，且已在本地实测取数结果。
+          read_var() { sed -nE "$1" app/build.gradle.kts | head -1; }
+          COMPILE_SDK=$(read_var 's/^[[:space:]]*compileSdk = ([0-9]+).*/\1/p')
+          NDK_VERSION=$(read_var 's/^[[:space:]]*ndkVersion = "([^"]+)".*/\1/p')
+          VERSION_NAME=$(read_var 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p')
+          VERSION_CODE=$(read_var 's/^[[:space:]]*versionCode = ([0-9]+).*/\1/p')
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          for pair in "compileSdk=$COMPILE_SDK" "ndkVersion=$NDK_VERSION" \
+            "versionName=$VERSION_NAME" "versionCode=$VERSION_CODE"; do
+            if [[ -z "${pair#*=}" ]]; then
+              echo "::error::无法从 build.gradle.kts 解析 ${pair%%=*}"
+              exit 1
+            fi
+          done
+
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$VERSION_NAME" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 versionName ${VERSION_NAME} 不一致"
+            exit 1
+          fi
+
+          {
+            echo "compile_sdk=$COMPILE_SDK"
+            echo "ndk_version=$NDK_VERSION"
+            echo "version_name=$VERSION_NAME"
+            echo "version_code=$VERSION_CODE"
+            echo "short_sha=$SHORT_SHA"
+            echo "apk=youyou-${VERSION_NAME}-${VERSION_CODE}-${SHORT_SHA}.apk"
+          } >> "$GITHUB_OUTPUT"
+
+      # Google 从 Android 17 起按小版本发布 platform：仓库里只有
+      # platforms;android-37.0，没有 platforms;android-37。已在本机用只含
+      # android-37.0 的空 SDK 根强制全量重编验证过，AGP 能把 compileSdk = 37
+      # 解析到它。build-tools 不在此列出：AGP 9.2.1 默认用 36.0.0 并自行安装。
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-${{ steps.version.outputs.compile_sdk }}.0
+            ndk;${{ steps.version.outputs.ndk_version }}
+
+      - name: 校验 SDK 组件齐备
+        working-directory: apps/android
+        run: |
+          set -euo pipefail
+          for d in "platforms/android-${{ steps.version.outputs.compile_sdk }}.0" \
+                   "ndk/${{ steps.version.outputs.ndk_version }}"; do
+            if [[ ! -d "${ANDROID_HOME}/${d}" ]]; then
+              echo "::error::SDK 组件缺失：${d}"
+              ls -1 "${ANDROID_HOME}/cmdline-tools" 2>/dev/null
+              "${ANDROID_HOME}"/cmdline-tools/*/bin/sdkmanager --list_installed 2>&1 | tail -25
+              exit 1
+            fi
+          done
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+
+      - name: 拒绝与已发布二进制重复的 versionCode
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CODE='${{ steps.version.outputs.version_code }}'
+          api() { curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" "$1"; }
+          if api "https://api.github.com/repos/${RELEASE_REPO}/releases/tags/${GITHUB_REF_NAME}" \
+            > /dev/null; then
+            echo "::error::${RELEASE_REPO} 已发布过 ${GITHUB_REF_NAME}，拒绝覆盖"
+            exit 1
+          fi
+          # 归档约定：同一个 versionCode 只能对应一个二进制，否则装了旧包的人
+          # 既无法覆盖升级，也判断不出装的是哪个构建。
+          if api "https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=100" \
+            | grep -oE '"name": "[^"]*"' | grep -qF "(${CODE})"; then
+            echo "::error::versionCode ${CODE} 已被占用，请先在 build.gradle.kts 递进 versionCode"
+            exit 1
+          fi
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: 还原签名库
+        working-directory: apps/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_BASE64:-}" ]]; then
+            echo "::error::缺少 secret RELEASE_KEYSTORE_BASE64（base64 编码的 youyou-release.jks）"
+            exit 1
+          fi
+          mkdir -p ../../release-signing
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode \
+            > ../../release-signing/youyou-release.jks
+          {
+            echo "storeFile=release-signing/youyou-release.jks"
+            echo "storePassword=${STORE_PASSWORD}"
+            echo "keyAlias=${KEY_ALIAS}"
+            echo "keyPassword=${KEY_PASSWORD}"
+          } > ../../release-signing/keystore.properties
+
+      - name: 构建签名 APK
+        working-directory: apps/android
+        run: |
+          set -euo pipefail
+          ./gradlew assembleRelease --no-daemon
+          APK='${{ steps.version.outputs.apk }}'
+          cp app/build/outputs/apk/release/app-release.apk "${RUNNER_TEMP}/${APK}"
+          printf '%s  %s\n' "$(sha256sum "${RUNNER_TEMP}/${APK}" | cut -d' ' -f1)" "$APK" \
+            > "${RUNNER_TEMP}/SHA256SUMS"
+          cat "${RUNNER_TEMP}/SHA256SUMS"
+
+      # 试运行：完整走签名与发布产物命名流程，但只留 artifact，不对外发布。
+      - name: 上传待检产物
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.apk }}
+          path: |
+            ${{ runner.temp }}/${{ steps.version.outputs.apk }}
+            ${{ runner.temp }}/SHA256SUMS
+          retention-days: 7
+
+      - name: 发布到本仓库 Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          repository: ${{ env.RELEASE_REPO }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: 柚柚相册 ${{ steps.version.outputs.version_name }} (${{ steps.version.outputs.version_code }})
+          files: |
+            ${{ runner.temp }}/${{ steps.version.outputs.apk }}
+            ${{ runner.temp }}/SHA256SUMS
+          body: |
+            版本 `${{ steps.version.outputs.version_name }}`，versionCode `${{ steps.version.outputs.version_code }}`，提交 `${{ steps.version.outputs.short_sha }}`。
+
+            - 需要 Android 12（API 31）及以上
+            - 覆盖安装保留数据
+            - 服务端需配套升级到镜像 `${{ steps.version.outputs.version_name }}`
+            - 完整性校验见 `SHA256SUMS`
+          fail_on_unmatched_files: true

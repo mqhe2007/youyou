@@ -1,0 +1,24 @@
+{
+  "name": "youyou-admin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "柚柚相册管理端",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.38.0",
+    "qrcode.vue": "^3.10.0",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "daisyui": "^5.7.23",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.2.2"
+  }
+}
