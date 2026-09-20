@@ -16,6 +16,7 @@ import {
   X,
 } from '@lucide/vue';
 import { getApiErrorMessage } from '../api';
+import { isActiveJob, isTerminalJob } from '../utils/formatters';
 import DashboardHome from './DashboardHome.vue';
 import MediaLibraryView from './MediaLibraryView.vue';
 import LogsView from './LogsView.vue';
@@ -48,7 +49,7 @@ const toast = ref(null);
 const status = ref(null);
 const storage = ref(null);
 const jobs = ref({ items: [] });
-const currentJob = ref(null);
+const watchedScanId = ref(null);
 const libraryRevision = ref(0);
 const diagnostics = ref(null);
 const auditLog = ref([]);
@@ -66,14 +67,6 @@ const activeNavigation = computed(
 const activeJobs = computed(() =>
   (jobs.value.items || []).filter((job) => isActiveJob(job)),
 );
-
-function isActiveJob(job) {
-  return ['queued', 'running', 'interrupted'].includes(job?.status);
-}
-
-function isTerminalJob(job) {
-  return ['succeeded', 'failed', 'cancelled'].includes(job?.status);
-}
 
 function notify(message, type = 'info') {
   window.clearTimeout(toastTimer);
@@ -115,12 +108,9 @@ async function loadDashboard({ silent = false } = {}) {
     storage.value = storageResult;
     jobs.value = jobsResult || { items: [] };
 
-    const active = activeJobs.value[0];
-    if (active) {
-      currentJob.value = active;
+    if (activeJobs.value.length) {
       scheduleJobPoll();
-    } else if (!currentJob.value || !isTerminalJob(currentJob.value)) {
-      currentJob.value = null;
+    } else {
       stopJobPoll();
     }
 
@@ -199,17 +189,22 @@ function onHashChange() {
   }
 }
 
+async function loadJobs() {
+  const result = await props.api.request('/api/v1/admin/jobs?limit=20');
+  jobs.value = result || { items: [] };
+}
+
 async function startScan(path = '') {
   if (actionBusy.value === 'scan-start') return;
   actionBusy.value = 'scan-start';
   try {
-    currentJob.value = await props.api.request(`/api/v1/admin/jobs/scan?path=${encodeURIComponent(path)}`, {
+    const job = await props.api.request(`/api/v1/admin/jobs/scan?path=${encodeURIComponent(path)}`, {
       method: 'POST',
     });
-    replaceJob(currentJob.value);
+    watchedScanId.value = job?.id || null;
+    await loadJobs();
     notify(`正在刷新「${path || '全部'}」，进度可在日志中查看。`, 'success');
     scheduleJobPoll();
-    await loadDashboard({ silent: true });
   } catch (error) {
     handleError(error);
   } finally {
@@ -219,7 +214,7 @@ async function startScan(path = '') {
 
 function scheduleJobPoll() {
   window.clearTimeout(pollTimer);
-  pollTimer = window.setTimeout(pollJob, 1200);
+  pollTimer = window.setTimeout(pollJobs, 1500);
 }
 
 function stopJobPoll() {
@@ -227,37 +222,38 @@ function stopJobPoll() {
   pollTimer = null;
 }
 
-function replaceJob(job) {
-  const items = jobs.value.items || [];
-  const index = items.findIndex((item) => item.id === job.id);
-  if (index === -1) {
-    jobs.value = { ...jobs.value, items: [job, ...items] };
-    return;
-  }
-  const nextItems = [...items];
-  nextItems[index] = job;
-  jobs.value = { ...jobs.value, items: nextItems };
-}
-
-async function pollJob() {
-  if (!currentJob.value?.id) return;
-
+async function pollJobs() {
   try {
-    const job = await props.api.request(
-      `/api/v1/admin/jobs/${encodeURIComponent(currentJob.value.id)}`,
-    );
-    currentJob.value = job;
-    replaceJob(job);
-    if (isActiveJob(job)) {
+    await loadJobs();
+    if (watchedScanId.value) {
+      const watched = (jobs.value.items || []).find((job) => job.id === watchedScanId.value);
+      if (watched && isTerminalJob(watched)) {
+        watchedScanId.value = null;
+        libraryRevision.value += 1;
+        notify(
+          watched.status === 'succeeded' ? '文件夹刷新完成，详情见日志。' : '文件夹刷新未完成，请查看日志。',
+          watched.status === 'succeeded' ? 'success' : 'error',
+        );
+        await loadDashboard({ silent: true });
+      }
+    }
+    if (activeJobs.value.length) {
       scheduleJobPoll();
     } else {
       stopJobPoll();
-      if (job.kind === 'scan') {
-        libraryRevision.value += 1;
-        notify(job.status === 'succeeded' ? '文件夹刷新完成，详情见日志。' : '文件夹刷新未完成，请查看日志。', job.status === 'succeeded' ? 'success' : 'error');
-      }
-      await loadDashboard({ silent: true });
     }
+  } catch (error) {
+    handleError(error, true);
+  }
+}
+
+async function cancelJob(jobId) {
+  try {
+    await props.api.request(`/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+    });
+    notify('任务已取消。', 'success');
+    await loadJobs();
   } catch (error) {
     handleError(error);
   }
@@ -504,7 +500,7 @@ onUnmounted(() => {
           <LogsView
             v-else-if="activeSection === 'logs'"
             :jobs="jobs"
-            :current-job="currentJob"
+            @cancel-job="cancelJob"
           />
         </template>
       </main>

@@ -5,7 +5,38 @@ export function isTerminalJob(job) {
 }
 
 export function isActiveJob(job) {
-  return ['queued', 'running'].includes(job?.status);
+  return ['queued', 'running', 'interrupted'].includes(job?.status);
+}
+
+export function runningJobOf(items) {
+  return (items || []).find((job) => job?.status === 'running') || null;
+}
+
+// worker 单线程按 created_at 先进先出取任务，等待队列展示必须同序。
+export function waitingJobs(items) {
+  return (items || [])
+    .filter((job) => ['queued', 'interrupted'].includes(job?.status))
+    .sort((a, b) => Number(a.createdAt) - Number(b.createdAt));
+}
+
+// 执行耗时：只算真正开始执行之后的部分，不含排队等待。
+// 升级前落库的老记录没有 startedAt，返回 null 交给调用方显示为未知，
+// 不要用 createdAt 顶替——那正好会把排队时间算回来。
+export function jobRunDurationMs(job) {
+  if (job?.startedAt == null || job?.finishedAt == null) return null;
+  return Math.max(0, Number(job.finishedAt) - Number(job.startedAt));
+}
+
+// 正在运行的任务已跑了多久。起点由服务端在 set_job_running 落库，
+// 因此中途刷新页面也准，不需要前端自己记观测时刻。
+export function jobElapsedMs(job, now) {
+  if (job?.status !== 'running' || job?.startedAt == null) return null;
+  return Math.max(0, Number(now) - Number(job.startedAt));
+}
+
+export function jobScopeLabel(job) {
+  if (job?.kind !== 'scan') return '';
+  return job.checkpoint?.scopePath || '全部';
 }
 
 export function formatBytes(value) {
@@ -34,6 +65,17 @@ export function formatTime(value) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+export function formatDuration(ms) {
+  if (ms == null || Number.isNaN(Number(ms)) || Number(ms) < 0) return '—';
+  const totalSeconds = Math.round(Number(ms) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+  if (minutes > 0) return `${minutes} 分 ${seconds} 秒`;
+  return `${seconds} 秒`;
 }
 
 export function jobKindLabel(kind) {
@@ -111,10 +153,24 @@ export function auditResultLabel(result) {
   return result === 'success' ? '成功' : result === 'failure' ? '失败' : result || '—';
 }
 
+// 终态任务若 message 仍停在入队占位文案（服务端显式取消排队任务时不改写 message），
+// 与「已取消」状态并列会得到「已取消 / 备份正在排队」这种自相矛盾的结果列。
+const PRE_START_MESSAGES = new Set(['backup queued', 'retry queued', 'queued']);
+
+export function jobOutcomeLabel(job) {
+  if (isTerminalJob(job) && PRE_START_MESSAGES.has(job?.message)) return '未开始执行';
+  return jobMessage(job);
+}
+
 export function jobMessage(job) {
   const message = job?.message;
   if (!message) {
     return job?.status === 'running' ? '服务端正在处理' : progressLabel(job);
+  }
+
+  const scanProgress = message.match(/^discovered=(\d+), indexed=(\d+)$/);
+  if (scanProgress) {
+    return `已发现 ${formatNumber(scanProgress[1])} 项，已建立索引 ${formatNumber(scanProgress[2])} 项`;
   }
 
   const scanSummary = message.match(

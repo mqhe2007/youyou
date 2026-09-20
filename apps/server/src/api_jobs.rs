@@ -15,6 +15,7 @@ pub(crate) struct JobResponse {
     message: Option<String>,
     last_error: Option<String>,
     created_at: i64,
+    started_at: Option<i64>,
     updated_at: i64,
     finished_at: Option<i64>,
 }
@@ -34,6 +35,7 @@ pub(crate) struct JobRow {
     message: Option<String>,
     last_error: Option<String>,
     created_at: i64,
+    started_at: Option<i64>,
     updated_at: i64,
     finished_at: Option<i64>,
 }
@@ -1217,6 +1219,7 @@ pub(crate) async fn retry_job(
         SET status = 'queued', current = 0, total = NULL, checkpoint = CASE WHEN kind = 'scan' THEN checkpoint ELSE NULL END, message = 'retry queued',
             retry_count = retry_count + 1, run_after = ?1,
             cancel_requested = 0, updated_at = ?1, finished_at = NULL,
+            started_at = NULL,
             lease_owner = NULL, lease_until = NULL
         WHERE id = ?2
         "#,
@@ -1264,11 +1267,15 @@ pub(crate) fn job_response(job: JobRow) -> JobResponse {
         message: job.message,
         last_error: job.last_error,
         created_at: job.created_at,
+        started_at: job.started_at,
         updated_at: job.updated_at,
         finished_at: job.finished_at,
     }
 }
 
+/// 把任务从 queued/interrupted 推进到 running。
+/// `started_at` 只在首次进入 running 时落值：租约过期后的自动恢复会再次调用本函数，
+/// 若覆盖会让「已运行」在恢复后倒退，也会让「执行耗时」只剩最后一轮。
 pub(crate) async fn set_job_running(
     pool: &SqlitePool,
     id: &str,
@@ -1278,6 +1285,7 @@ pub(crate) async fn set_job_running(
         r#"
         UPDATE jobs
         SET status = 'running', updated_at = ?1, heartbeat_at = ?1,
+            started_at = COALESCE(started_at, ?1),
             lease_owner = ?2, lease_until = ?1 + 60000
         WHERE id = ?3 AND status IN ('queued', 'interrupted')
           AND cancel_requested = 0

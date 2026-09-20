@@ -3368,3 +3368,137 @@ async fn trash_prepare_enables_sibling_directory() {
     assert!(config.enabled, "同文件系统且扫描树之外应启用删除能力");
     assert!(config.blocked_reason.is_none());
 }
+
+/// 轮询到终态为止（比 wait_admin_job 更宽容：自动恢复要等 worker 的下一轮唤醒）。
+async fn wait_job_settled(
+    app: &axum::Router,
+    admin_token: &str,
+    job_id: &str,
+) -> serde_json::Value {
+    for _ in 0..300 {
+        let response = request(
+            app,
+            Method::GET,
+            &format!("/api/v1/admin/jobs/{job_id}"),
+            None,
+            Some(admin_token),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let job_json: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        if matches!(
+            job_json["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            return job_json;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("job {job_id} never reached a terminal state");
+}
+
+/// `started_at` 的存在意义是把「排队等待」和「实际执行」分开：
+/// 终态记录的耗时 = finished_at - started_at，不含排队时间。
+#[tokio::test]
+async fn job_records_execution_start_and_resets_it_only_on_manual_retry() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    tokio::fs::create_dir_all(media.path().join("album"))
+        .await
+        .expect("album directory");
+    tokio::fs::write(media.path().join("album/a.jpg"), b"a")
+        .await
+        .expect("photo");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token) = establish_admin(&app, setup_token.trim()).await;
+
+    let scan = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let scan_body = to_bytes(scan.into_body(), usize::MAX)
+        .await
+        .expect("scan body");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&scan_body).expect("scan json")["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+
+    let settled = wait_job_settled(&app, &admin_token, &job_id).await;
+    assert_eq!(settled["status"], "succeeded");
+    let created_at = settled["createdAt"].as_i64().expect("createdAt");
+    let started_at = settled["startedAt"].as_i64().expect("startedAt");
+    let finished_at = settled["finishedAt"].as_i64().expect("finishedAt");
+    assert!(
+        created_at <= started_at,
+        "执行起点不能早于入队时间：{created_at} > {started_at}"
+    );
+    assert!(
+        started_at <= finished_at,
+        "执行起点不能晚于结束时间：{started_at} > {finished_at}"
+    );
+
+    // 租约过期后 worker 会再次接管同一个任务，此时不能改写执行起点，
+    // 否则「已运行」会在恢复后倒退，「耗时」也只剩最后一轮。
+    sqlx::query(
+        "UPDATE jobs SET status = 'interrupted', run_after = 0, finished_at = NULL, \
+         lease_owner = NULL, lease_until = NULL WHERE id = ?1",
+    )
+    .bind(&job_id)
+    .execute(&state.db)
+    .await
+    .expect("mark interrupted");
+    let resumed = wait_job_settled(&app, &admin_token, &job_id).await;
+    assert_eq!(resumed["status"], "succeeded");
+    assert_eq!(
+        resumed["startedAt"].as_i64(),
+        Some(started_at),
+        "自动恢复不应改写执行起点"
+    );
+
+    // 停在 interrupted，人工重试应开启新的执行周期。
+    sqlx::query(
+        "UPDATE jobs SET status = 'interrupted', run_after = ?1, finished_at = NULL, \
+         lease_owner = NULL, lease_until = NULL WHERE id = ?2",
+    )
+    .bind(i64::MAX / 2)
+    .bind(&job_id)
+    .execute(&state.db)
+    .await
+    .expect("park interrupted");
+
+    let retry = request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/jobs/{job_id}/retry"),
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry_body = to_bytes(retry.into_body(), usize::MAX)
+        .await
+        .expect("retry body");
+    let retry_json: serde_json::Value = serde_json::from_slice(&retry_body).expect("retry json");
+    assert_eq!(retry_json["status"], "queued");
+    assert!(
+        retry_json["startedAt"].is_null(),
+        "人工重试应清空执行起点，重新计时"
+    );
+}
