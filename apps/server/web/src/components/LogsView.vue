@@ -14,6 +14,7 @@ import {
   jobOutcomeLabel,
   jobRunDurationMs,
   jobScopeLabel,
+  jobShowsError,
   jobStatusClass,
   jobStatusLabel,
   progressValue,
@@ -137,7 +138,7 @@ function requestCancel(job) {
         </div>
       </div>
 
-      <div v-if="focusJob.lastError" class="task-error">{{ jobErrorMessage(focusJob.lastError) }}</div>
+      <div v-if="jobShowsError(focusJob)" class="task-error">{{ jobErrorMessage(focusJob.lastError) }}</div>
       <div class="task-actions">
         <span class="task-updated">最近更新：{{ formatTime(focusJob.updatedAt) }}</span>
         <button
@@ -228,7 +229,7 @@ function requestCancel(job) {
               </td>
               <td>
                 <small class="table-secondary">{{ jobOutcomeLabel(job) }}</small>
-                <small v-if="job.lastError" class="table-error">{{ jobErrorMessage(job.lastError) }}</small>
+                <small v-if="jobShowsError(job)" class="table-error">{{ jobErrorMessage(job.lastError) }}</small>
               </td>
               <td class="table-num">{{ formatDuration(jobRunDurationMs(job)) }}</td>
               <td class="table-time">{{ formatTime(job.finishedAt ?? job.updatedAt) }}</td>

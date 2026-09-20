@@ -204,6 +204,14 @@ export function jobErrorMessage(message) {
   }[message] || '任务未能完成，请检查服务端日志。';
 }
 
+// lastError 是历史痕迹：任务被服务端重启打断后自动恢复成功，它也不会被清空，
+// 于是「已完成」「进行中」底下会挂出一行「任务未能完成」的红字。
+// 只在任务确实没跑起来的时候展示——失败、被中断、被取消。
+export function jobShowsError(job) {
+  if (!job?.lastError) return false;
+  return !['running', 'succeeded'].includes(job.status);
+}
+
 export function quickCheckLabel(value) {
   if (value == null) return '—';
   return value === 'ok' ? '检查通过' : '需要检查';
