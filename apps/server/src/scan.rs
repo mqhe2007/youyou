@@ -839,7 +839,7 @@ pub(crate) async fn index_media_with_time(
             }
         }
     } else if media_format
-        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Builtin)
+        .is_some_and(|format| format.kind == crate::media_format::MediaKind::Image)
     {
         match extract_image_metadata(storage, &entry.path).await {
             Ok(metadata) => metadata,
@@ -1316,6 +1316,21 @@ async fn extract_image_metadata(
     path: &str,
 ) -> anyhow::Result<ExtractedMetadata> {
     let bytes = storage.read_all(path, None).await?;
+    if crate::media_format::from_path(path)
+        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Heif)
+    {
+        // HEIC/HEIF：尺寸从 ISOBMFF 容器解析（不依赖解码器），
+        // EXIF（含拍摄时间）走 kamadak-exif 的 HEIF 支持。
+        let (width, height) = crate::heif::dimensions(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("HEIF 容器未找到图像尺寸（ispe）"))?;
+        return Ok(ExtractedMetadata {
+            duration_ms: None,
+            width: Some(i64::from(width)),
+            height: Some(i64::from(height)),
+            taken_at: extract_exif_taken_at(&bytes),
+            video_codec: None,
+        });
+    }
     let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
     let (width, height) = reader.into_dimensions()?;
     Ok(ExtractedMetadata {

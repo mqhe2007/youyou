@@ -5,6 +5,7 @@ pub mod backup;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod heif;
 pub mod media_format;
 pub mod media_library;
 pub mod metadata;
@@ -56,6 +57,12 @@ pub async fn initialize(
     }
     if let Err(error) = backup::cleanup_orphan_artifacts(&db, data_dir).await {
         tracing::error!(error = ?error, "backup artifact cleanup failed during startup");
+    }
+    match crate::heif::tool() {
+        Some(tool) => tracing::info!(tool = ?tool, "HEIC/HEIF 解码器可用"),
+        None => tracing::warn!(
+            "未找到 HEIC/HEIF 解码器（heif-convert/sips）：HEIC 可被索引，缩略图将使用占位图"
+        ),
     }
     let health = storage_driver.health_check().await?;
     ensure_local_storage(&db, storage_driver.root(), health.read_only).await?;

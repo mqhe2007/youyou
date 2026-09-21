@@ -334,6 +334,10 @@ internal fun PhotoTile(
 ) {
     val model = photoThumbnailModel(photo)
     var imageLoadFailed by remember(photo.id, model) { mutableStateOf(false) }
+    // 缩略图加载失败时退回远程原图，由设备本地解码（Android 12 原生支持 HEIF）；
+    // 服务端未安装 HEIF 解码器时返回 503，正是这条路径兜底。
+    var useContentFallback by remember(photo.id, model) { mutableStateOf(false) }
+    val effectiveModel = if (useContentFallback) photo.remoteContentUrl else model
 
     Box(
         modifier = modifier
@@ -354,9 +358,18 @@ internal fun PhotoTile(
     ) {
         // 画面本体单独一层：播放角标、同步徽章和多选圈叠在其上。
         Box(modifier = Modifier.fillMaxSize()) {
-            PhotoThumbnailLayer(photo = photo, onLoadFailed = { imageLoadFailed = true })
+            PhotoThumbnailLayer(
+                model = effectiveModel,
+                onLoadFailed = {
+                    if (!useContentFallback && !photo.remoteContentUrl.isNullOrBlank()) {
+                        useContentFallback = true
+                    } else {
+                        imageLoadFailed = true
+                    }
+                },
+            )
 
-            if (imageLoadFailed || model == null) {
+            if (imageLoadFailed || effectiveModel == null) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.96f),
@@ -427,15 +440,14 @@ internal fun PhotoTile(
 
 /** 网格 tile 的缩略图画面（方形裁切）。 */
 @Composable
-private fun PhotoThumbnailLayer(photo: Photo, onLoadFailed: () -> Unit = {}) {
+private fun PhotoThumbnailLayer(model: Any?, onLoadFailed: () -> Unit = {}) {
     val context = LocalContext.current
     val view = LocalView.current
-    val thumbnailModel = photoThumbnailModel(photo)
     Box(modifier = Modifier.fillMaxSize()) {
-        if (thumbnailModel != null) {
+        if (model != null) {
             AsyncImage(
                 model = ImageRequest.Builder(context)
-                    .data(thumbnailModel)
+                    .data(model)
                     .crossfade(true)
                     .listener(onError = { _, _ -> view.post(onLoadFailed) })
                     .build(),

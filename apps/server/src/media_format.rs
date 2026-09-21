@@ -16,6 +16,8 @@ pub enum Decoder {
     Builtin,
     /// ffmpeg / ffprobe 外部解码。
     Ffmpeg,
+    /// HEIC/HEIF：容器尺寸自行解析，缩略图依赖 heif-convert / sips。
+    Heif,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +32,14 @@ const fn image(mime: &'static str) -> MediaFormat {
         kind: MediaKind::Image,
         mime,
         decoder: Decoder::Builtin,
+    }
+}
+
+const fn heif(mime: &'static str) -> MediaFormat {
+    MediaFormat {
+        kind: MediaKind::Image,
+        mime,
+        decoder: Decoder::Heif,
     }
 }
 
@@ -50,6 +60,9 @@ const FORMATS: &[(&str, MediaFormat)] = &[
     ("gif", image("image/gif")),
     ("webp", image("image/webp")),
     ("bmp", image("image/bmp")),
+    // iPhone 默认拍照格式：尺寸解析不依赖外部工具，缩略图需要 HEIF 解码器
+    ("heic", heif("image/heic")),
+    ("heif", heif("image/heif")),
     // 视频：ffmpeg / ffprobe
     ("mp4", video("video/mp4")),
     ("m4v", video("video/x-m4v")),
@@ -105,6 +118,11 @@ mod tests {
 
     #[test]
     fn covers_legacy_formats_and_is_case_insensitive() {
+        assert_eq!(from_path("IMG_0001.HEIC").unwrap().decoder, Decoder::Heif);
+        assert_eq!(
+            mime_for_path("IMG_0001.heif").as_deref(),
+            Some("image/heif")
+        );
         assert_eq!(
             from_path("a/b/井冈山游记.MPG").unwrap().kind,
             MediaKind::Video

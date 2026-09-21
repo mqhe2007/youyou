@@ -22,14 +22,20 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 ARG FFMPEG_PACKAGE_VERSION=7:5.1.9-0+deb12u1
+# HEIC/HEIF 解码：bookworm 的 ffmpeg 5.1 不支持 HEIF，使用 libheif 的 heif-convert。
+ARG LIBHEIF_PACKAGE_VERSION=1.15.1-1+deb12u1
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates curl "ffmpeg=${FFMPEG_PACKAGE_VERSION}" \
+        "libheif1=${LIBHEIF_PACKAGE_VERSION}" "libheif-examples=${LIBHEIF_PACKAGE_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
     && test "$(dpkg-query -W -f='${Version}' ffmpeg)" = "${FFMPEG_PACKAGE_VERSION}" \
+    && test "$(dpkg-query -W -f='${Version}' libheif1)" = "${LIBHEIF_PACKAGE_VERSION}" \
+    && test "$(dpkg-query -W -f='${Version}' libheif-examples)" = "${LIBHEIF_PACKAGE_VERSION}" \
     && ffmpeg -version >/dev/null \
     && ffprobe -version >/dev/null \
+    && dpkg-query -L libheif-examples | grep -q '/heif-convert$' \
     && useradd --system --uid 10001 --create-home --home-dir /nonexistent youyou
 
 COPY --from=builder /src/target/release/youyou-server /usr/local/bin/youyou-server

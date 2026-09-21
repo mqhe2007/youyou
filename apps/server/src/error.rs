@@ -47,6 +47,11 @@ pub enum AppError {
     #[error("temporary storage is full")]
     DiskFull,
 
+    /// 服务端缺少处理该媒体类型的能力（例如未安装 HEIC 解码器）。
+    /// 客户端可据此回退到原始内容（由设备本地解码）。
+    #[error("{0}")]
+    Unavailable(String),
+
     #[error(transparent)]
     Storage(#[from] StorageError),
 
@@ -127,6 +132,12 @@ impl AppError {
                 "disk_full",
                 true,
                 "temporary storage is full".to_owned(),
+            ),
+            Self::Unavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                message.clone(),
             ),
             Self::Storage(StorageError::InvalidPath(message)) => (
                 StatusCode::BAD_REQUEST,

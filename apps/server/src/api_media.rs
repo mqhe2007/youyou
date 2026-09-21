@@ -883,6 +883,39 @@ pub(crate) async fn render_thumbnail(
             }
         };
     }
+    // HEIC/HEIF：image crate 不支持该容器，走 heif-convert / sips；解码器缺失
+    // 或解码失败时返回占位图。
+    if crate::media_format::from_path(normalized_path)
+        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Heif)
+    {
+        if crate::heif::tool().is_none() {
+            // 服务端缺少 HEIF 解码器：明确告知调用方（而非返回占位图），
+            // 客户端可回退到原始内容并用设备解码（Android 12 原生支持 HEIF）。
+            return Err(AppError::Unavailable(
+                "HEIC/HEIF 缩略图需要服务端 HEIF 解码器（heif-convert 或 sips）".to_owned(),
+            ));
+        }
+        let source = storage.root().join(normalized_path);
+        return match crate::heif::decode_thumbnail(&source, size).await {
+            Ok(jpeg) => match downscale_jpeg(&jpeg, size) {
+                Ok(bytes) => Ok(ThumbnailRender::Rendered(bytes)),
+                Err(error) => {
+                    tracing::warn!(media_id, path = %normalized_path, error = ?error,
+                        "HEIC 缩略图重编码失败；使用占位图");
+                    Ok(ThumbnailRender::Placeholder(placeholder_thumbnail(size)?))
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    media_id,
+                    path = %normalized_path,
+                    error = ?error,
+                    "HEIC 缩略图解码不可用；使用占位图"
+                );
+                Ok(ThumbnailRender::Placeholder(placeholder_thumbnail(size)?))
+            }
+        };
+    }
     // 源文件读不到是真实错误（仍报错）；能读到但解不开则给占位图。
     let source = storage.read_all(normalized_path, None).await?;
     match image::load_from_memory(&source) {
@@ -906,6 +939,18 @@ pub(crate) async fn render_thumbnail(
             Ok(ThumbnailRender::Placeholder(placeholder_thumbnail(size)?))
         }
     }
+}
+
+/// 把任意 JPEG 解码并缩放到 `size` 以内再编码（HEIC 解码器输出的图可能很大）。
+fn downscale_jpeg(bytes: &[u8], size: u32) -> anyhow::Result<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| anyhow::anyhow!("decode heic output: {error}"))?;
+    let thumbnail = decoded.thumbnail(size, size);
+    let mut encoded = Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut encoded, ImageFormat::Jpeg)
+        .map_err(|error| anyhow::anyhow!("encode heic thumbnail: {error}"))?;
+    Ok(encoded.into_inner())
 }
 
 /// 中性占位缩略图（浅灰底 JPEG）。

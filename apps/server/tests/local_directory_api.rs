@@ -1766,6 +1766,111 @@ fn write_video_fixture(path: &std::path::Path, encoder: &str, format: &str, size
     );
 }
 
+/// 用 macOS sips 生成真实 HEIC 夹具（无 sips 的环境跳过相关用例）。
+fn heic_fixture(rgb: [u8; 3], size: u32) -> Option<Vec<u8>> {
+    let dir = tempdir().ok()?;
+    let png = dir.path().join("src.png");
+    let heic = dir.path().join("src.heic");
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(size, size, image::Rgb(rgb)))
+        .save_with_format(&png, image::ImageFormat::Png)
+        .ok()?;
+    let output = std::process::Command::new("sips")
+        .args(["-s", "format", "heic"])
+        .arg(&png)
+        .arg("--out")
+        .arg(&heic)
+        .output()
+        .ok()?;
+    output.status.success().then(|| std::fs::read(&heic).ok())?
+}
+
+#[tokio::test]
+async fn indexes_heic_with_container_dimensions_and_decodes_thumbnail() {
+    let Some(heic) = heic_fixture([255, 0, 255], 8) else {
+        eprintln!("跳过：当前环境没有 sips 生成 HEIC 夹具");
+        return;
+    };
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library)
+        .await
+        .expect("library dir");
+    tokio::fs::write(library.join("IMG_20240105_000000.heic"), &heic)
+        .await
+        .expect("heic");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let now0 = youyou_server::db::now_millis();
+    sqlx::query("INSERT INTO users (name, created_at, updated_at) VALUES ('owner', ?1, ?1)")
+        .bind(now0)
+        .execute(&state.db)
+        .await
+        .expect("create user");
+    youyou_server::users::bind_user_library(
+        &state.db,
+        state.storage.snapshot().await.root(),
+        1,
+        "library",
+    )
+    .await
+    .expect("bind library");
+    let summary = youyou_server::scan::scan_directory(&state.db, state.storage.clone(), "scan")
+        .await
+        .expect("scan");
+    assert_eq!(summary.discovered, 1);
+    assert_eq!(summary.indexed, 1, "失败明细：{:?}", summary.failures);
+
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token2, csrf_token2) = establish_admin(&app, setup_token.trim()).await;
+    let device_token = pair_user_device(&app, &admin_token2, &csrf_token2, 1, "test-device").await;
+    let media_response = request(
+        &app,
+        Method::GET,
+        "/api/v1/media?limit=1",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    let body = to_bytes(media_response.into_body(), usize::MAX)
+        .await
+        .expect("media body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("media json");
+    let item = &json["items"][0];
+    assert_eq!(item["width"], 8, "尺寸应来自 HEIF 容器解析：{item}");
+    assert_eq!(item["height"], 8);
+    assert_eq!(item["mimeType"], "image/heic");
+    let media_id = item["id"].as_str().expect("media id");
+
+    let thumbnail = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/media/{media_id}/thumbnail?size=64"),
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    if youyou_server::heif::tool().is_some() {
+        assert_eq!(thumbnail.status(), StatusCode::OK);
+        let bytes = to_bytes(thumbnail.into_body(), usize::MAX)
+            .await
+            .expect("thumbnail body");
+        let decoded = image::load_from_memory(&bytes).expect("缩略图应可解码");
+        let pixel = decoded.to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            pixel[0] > 180 && pixel[2] > 180 && pixel[1] < 110,
+            "缩略图应是真实解码（洋红），实际 {pixel:?}"
+        );
+    } else {
+        // 服务端没有 HEIF 解码器：明确返回 503，客户端可回退原图本地解码。
+        assert_eq!(thumbnail.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
 #[tokio::test]
 async fn indexes_legacy_formats_with_metadata_and_thumbnails() {
     // 历史上被扫描白名单跳过的格式：MPG（家庭录像）、WMV、3GP、M4V 与 BMP。
