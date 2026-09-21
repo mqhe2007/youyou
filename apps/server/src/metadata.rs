@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -316,7 +316,7 @@ pub async fn remove_tag_media(
 }
 
 async fn detach_tag_relations_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     tag_id: &str,
     user_id: i64,
     now: i64,
@@ -326,13 +326,13 @@ async fn detach_tag_relations_tx(
         "SELECT media_asset_id, version FROM media_tags WHERE tag_id = ?1",
     )
     .bind(tag_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     for (media_id, current_version) in relations {
         sqlx::query("DELETE FROM media_tags WHERE tag_id = ?1 AND media_asset_id = ?2")
             .bind(tag_id)
             .bind(&media_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         let relation = relation_id(tag_id, &media_id);
         let version = current_version + 1;
@@ -363,7 +363,7 @@ async fn detach_tag_relations_tx(
 /// transaction. Relations are physically removed only after their durable
 /// version/tombstone has been recorded in `relation_versions`.
 pub(crate) async fn tombstone_media_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     media_id: &str,
     reason: &str,
     now: i64,
@@ -372,7 +372,7 @@ pub(crate) async fn tombstone_media_tx(
     let owner_user_id: Option<i64> =
         sqlx::query_scalar("SELECT owner_user_id FROM media_assets WHERE id = ?1")
             .bind(media_id)
-            .fetch_optional(&mut **transaction)
+            .fetch_optional(&mut *transaction)
             .await?
             .flatten();
     let changed = sqlx::query(
@@ -380,7 +380,7 @@ pub(crate) async fn tombstone_media_tx(
     )
     .bind(now)
     .bind(media_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?
     .rows_affected();
     if changed != 1 {
@@ -390,7 +390,7 @@ pub(crate) async fn tombstone_media_tx(
     detach_media_relations_tx(transaction, media_id, now, revision).await?;
     let version = sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
         .bind(media_id)
-        .fetch_one(&mut **transaction)
+        .fetch_one(&mut *transaction)
         .await?;
     let payload = serde_json::json!({
         "id": media_id,
@@ -415,7 +415,7 @@ pub(crate) async fn tombstone_media_tx(
 /// Remove all relations for a media asset while preserving durable deletion
 /// versions. This is used when a media tombstone is created.
 pub(crate) async fn detach_media_relations_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     media_id: &str,
     now: i64,
     revision: i64,
@@ -424,7 +424,7 @@ pub(crate) async fn detach_media_relations_tx(
         "SELECT album_id, version FROM album_media WHERE media_asset_id = ?1",
     )
     .bind(media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     let mut affected_albums = HashSet::new();
 
@@ -432,7 +432,7 @@ pub(crate) async fn detach_media_relations_tx(
         sqlx::query("DELETE FROM album_media WHERE album_id = ?1 AND media_asset_id = ?2")
             .bind(&album_id)
             .bind(media_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         let relation = relation_id(&album_id, media_id);
         let version = current_version + 1;
@@ -468,14 +468,14 @@ pub(crate) async fn detach_media_relations_tx(
         "#,
     )
     .bind(media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
 
     for (tag_id, current_version, tag_owner) in tag_relations {
         sqlx::query("DELETE FROM media_tags WHERE tag_id = ?1 AND media_asset_id = ?2")
             .bind(&tag_id)
             .bind(media_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         let relation = relation_id(&tag_id, media_id);
         let version = current_version + 1;
@@ -505,12 +505,12 @@ pub(crate) async fn detach_media_relations_tx(
         "SELECT id FROM albums WHERE cover_media_id = ?1 AND deleted_at IS NULL",
     )
     .bind(media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     for album_id in cover_albums {
         sqlx::query("UPDATE albums SET cover_media_id = NULL WHERE id = ?1 AND deleted_at IS NULL")
             .bind(&album_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         affected_albums.insert(album_id);
     }
@@ -525,7 +525,7 @@ pub(crate) async fn detach_media_relations_tx(
 /// identity. Both sides receive explicit changes so existing client
 /// projections cannot retain the old relation.
 pub(crate) async fn move_media_relations_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     old_media_id: &str,
     new_media_id: &str,
     now: i64,
@@ -539,7 +539,7 @@ pub(crate) async fn move_media_relations_tx(
         "SELECT album_id, version FROM album_media WHERE media_asset_id = ?1",
     )
     .bind(old_media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     let tag_relations = sqlx::query_as::<_, (String, i64, Option<i64>)>(
         r#"
@@ -550,7 +550,7 @@ pub(crate) async fn move_media_relations_tx(
         "#,
     )
     .bind(old_media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     let mut affected_albums = HashSet::new();
 
@@ -558,7 +558,7 @@ pub(crate) async fn move_media_relations_tx(
         sqlx::query("DELETE FROM album_media WHERE album_id = ?1 AND media_asset_id = ?2")
             .bind(&album_id)
             .bind(old_media_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         let old_relation = relation_id(&album_id, old_media_id);
         let old_delete_version = old_version + 1;
@@ -598,7 +598,7 @@ pub(crate) async fn move_media_relations_tx(
         .bind(new_media_id)
         .bind(new_version)
         .bind(now)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?
         .rows_affected();
         if inserted == 1 {
@@ -634,7 +634,7 @@ pub(crate) async fn move_media_relations_tx(
         sqlx::query("DELETE FROM media_tags WHERE tag_id = ?1 AND media_asset_id = ?2")
             .bind(&tag_id)
             .bind(old_media_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         let old_relation = relation_id(&tag_id, old_media_id);
         let old_delete_version = old_version + 1;
@@ -673,7 +673,7 @@ pub(crate) async fn move_media_relations_tx(
         .bind(new_media_id)
         .bind(new_version)
         .bind(now)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?
         .rows_affected();
         if inserted == 1 {
@@ -708,13 +708,13 @@ pub(crate) async fn move_media_relations_tx(
         "SELECT id FROM albums WHERE cover_media_id = ?1 AND deleted_at IS NULL",
     )
     .bind(old_media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     for album_id in cover_albums {
         sqlx::query("UPDATE albums SET cover_media_id = ?1 WHERE id = ?2 AND deleted_at IS NULL")
             .bind(new_media_id)
             .bind(&album_id)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         affected_albums.insert(album_id);
     }
@@ -725,7 +725,7 @@ pub(crate) async fn move_media_relations_tx(
     Ok(())
 }
 
-async fn load_album_tx(transaction: &mut Transaction<'_, Sqlite>, id: &str) -> AppResult<Album> {
+async fn load_album_tx(transaction: &mut SqliteConnection, id: &str) -> AppResult<Album> {
     sqlx::query_as::<_, Album>(
         r#"
         SELECT a.id, a.name, a.cover_media_id,
@@ -745,13 +745,13 @@ async fn load_album_tx(transaction: &mut Transaction<'_, Sqlite>, id: &str) -> A
         "#,
     )
     .bind(id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *transaction)
     .await?
     .ok_or_else(|| AppError::NotFound("album not found".to_owned()))
 }
 
 async fn touch_album_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     album_id: &str,
     now: i64,
     revision: i64,
@@ -761,7 +761,7 @@ async fn touch_album_tx(
     )
     .bind(now)
     .bind(album_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?
     .rows_affected();
     if updated != 1 {
@@ -794,14 +794,14 @@ async fn load_tag(pool: &SqlitePool, id: &str) -> AppResult<Tag> {
 }
 
 async fn load_tag_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     id: &str,
 ) -> AppResult<(Tag, Option<i64>)> {
     sqlx::query_as::<_, (String, String, i64, i64, i64, Option<i64>)>(
         "SELECT id, name, version, created_at, updated_at, user_id FROM tags WHERE id = ?1 AND deleted_at IS NULL",
     )
     .bind(id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *transaction)
     .await?
     .map(|row| {
         (
@@ -827,7 +827,7 @@ fn ensure_tag_owner(owner: Option<i64>, user_id: i64) -> AppResult<()> {
 }
 
 async fn ensure_tag_owner_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     user_id: i64,
     tag_id: &str,
 ) -> AppResult<()> {
@@ -835,7 +835,7 @@ async fn ensure_tag_owner_tx(
         "SELECT user_id FROM tags WHERE id = ?1 AND deleted_at IS NULL",
     )
     .bind(tag_id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *transaction)
     .await?
     .flatten();
     match owner {
@@ -845,7 +845,7 @@ async fn ensure_tag_owner_tx(
 }
 
 async fn ensure_tag_and_media(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     user_id: i64,
     tag_id: &str,
     media_id: &str,
@@ -855,7 +855,7 @@ async fn ensure_tag_and_media(
 }
 
 async fn ensure_media_for_user(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     media_id: &str,
     user_id: i64,
 ) -> AppResult<()> {
@@ -872,7 +872,7 @@ async fn ensure_media_for_user(
     )
     .bind(media_id)
     .bind(user_id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *transaction)
     .await?
     .is_some();
     if exists {
@@ -884,7 +884,7 @@ async fn ensure_media_for_user(
 
 #[allow(clippy::too_many_arguments)]
 async fn append_change(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     revision: i64,
     entity: &str,
     operation: &str,
@@ -912,7 +912,7 @@ async fn append_change(
     .bind(payload)
     .bind(now)
     .bind(owner_user_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
     Ok(())
 }
@@ -938,7 +938,7 @@ fn ensure_version(current: i64, expected: i64) -> AppResult<()> {
 }
 
 async fn next_relation_version(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     entity: &str,
     relation: &str,
 ) -> AppResult<i64> {
@@ -958,12 +958,12 @@ async fn next_relation_version(
     )
     .bind(entity)
     .bind(relation)
-    .fetch_one(&mut **transaction)
+    .fetch_one(&mut *transaction)
     .await?)
 }
 
 async fn remember_relation_version(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     entity: &str,
     relation: &str,
     version: i64,
@@ -982,7 +982,7 @@ async fn remember_relation_version(
     .bind(relation)
     .bind(version)
     .bind(deleted_at)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
     Ok(())
 }

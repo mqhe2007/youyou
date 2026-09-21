@@ -102,11 +102,7 @@ pub async fn backfill(pool: &SqlitePool) -> anyhow::Result<()> {
         .bind(uuid::Uuid::new_v4().to_string()).bind(crate::db::now_millis()).execute(pool).await?;
     Ok(())
 }
-pub async fn emit(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    id: &str,
-    revision: i64,
-) -> anyhow::Result<()> {
+pub async fn emit(tx: &mut sqlx::SqliteConnection, id: &str, revision: i64) -> anyhow::Result<()> {
     sqlx::query(r#"INSERT INTO change_log(revision,event_id,entity,operation,entity_id,version,payload,created_at,owner_user_id)
       SELECT ?1,?2,'media','upsert',a.id,a.version,json_object(
       'id',a.id,'name',a.name,'path',l.normalized_path,'size',l.size,'contentHash',b.content_hash,
@@ -116,7 +112,7 @@ pub async fn emit(
       'sortAt',a.sort_at,'sortSource',a.sort_source,'timeVersion',a.time_version,'originalName',a.original_name),?3,a.owner_user_id
       FROM media_assets a JOIN media_locations l ON l.media_asset_id=a.id LEFT JOIN content_blobs b ON b.id=a.blob_id
       WHERE a.id=?4 ORDER BY l.normalized_path LIMIT 1"#)
-      .bind(revision).bind(uuid::Uuid::new_v4().to_string()).bind(crate::db::now_millis()).bind(id).execute(&mut **tx).await?;
+      .bind(revision).bind(uuid::Uuid::new_v4().to_string()).bind(crate::db::now_millis()).bind(id).execute(&mut *tx).await?;
     Ok(())
 }
 

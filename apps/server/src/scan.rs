@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io::Cursor, sync::Arc};
+use std::{collections::HashSet, io::Cursor, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -8,23 +8,191 @@ use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 use tokio::{
     process::Command,
-    time::{Duration, timeout},
+    time::{Duration, sleep, timeout},
 };
 use uuid::Uuid;
 
 use crate::{
-    db::now_millis,
+    db::{begin_write, now_millis},
     metadata,
     storage::{LocalFilesystemStorageDriver, StorageDriver, StorageEntry, StorageRuntime},
     sync,
 };
+
+/// 进度落库节流间隔：每文件一次 UPDATE 会与客户端写入争抢写锁。
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(1000);
+/// 单文件索引的写锁重试退避（SQLITE_BUSY 类错误）。
+const INDEX_RETRY_BACKOFF_MS: [u64; 3] = [50, 150, 400];
+/// 作业检查点里保留的失败明细上限（避免长目录把 checkpoint 撑大）。
+const MAX_RECORDED_FAILURES: usize = 100;
+const MAX_FAILURE_REASON_CHARS: usize = 300;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ScanSummary {
     pub discovered: u64,
     pub indexed: u64,
     pub failed: u64,
+    /// 扩展名暂不可索引（仍在磁盘上，重扫会重新尝试）。
+    pub skipped_unsupported: u64,
+    /// 垃圾文件/目录与 0 字节文件（不进入媒体库，历史条目会被对账清理）。
+    pub skipped_ignored: u64,
+    /// 已知内容失败且文件未变更（未启用重试时跳过，避免重复哈希）。
+    pub skipped_failed: u64,
+    /// 因写锁竞争重试后成功的次数。
+    pub retried: u64,
+    pub failures: Vec<ScanFailure>,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+impl ScanSummary {
+    pub fn skipped_total(&self) -> u64 {
+        self.skipped_unsupported + self.skipped_ignored + self.skipped_failed
+    }
+
+    fn record_failure(&mut self, path: &str, error: &anyhow::Error) {
+        if self.failures.len() >= MAX_RECORDED_FAILURES {
+            return;
+        }
+        let mut reason = format!("{error:#}");
+        if reason.chars().count() > MAX_FAILURE_REASON_CHARS {
+            reason = reason.chars().take(MAX_FAILURE_REASON_CHARS).collect();
+            reason.push('…');
+        }
+        self.failures.push(ScanFailure {
+            path: path.to_owned(),
+            reason,
+        });
+    }
+}
+
+/// 扫描时应跳过的垃圾条目：隐藏文件（含 macOS `._*` 与 AppleDouble）、
+/// 系统/同步工具产生的元数据目录等。跳过即不进入媒体库，历史条目由对账清理。
+fn is_ignored_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    name.starts_with('.')
+        || matches!(
+            lower.as_str(),
+            "thumbs.db"
+                | "desktop.ini"
+                | "@eadir"
+                | "__macosx"
+                | "#recycle"
+                | "lost+found"
+                | "$recycle.bin"
+                | "system volume information"
+        )
+}
+
+/// 内容解析失败且文件未变更时跳过重复哈希（重试入口见 start_scan 的 `retry_failed`）。
+async fn is_unchanged_terminal_failure(
+    pool: &SqlitePool,
+    entry: &StorageEntry,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT size, modified_at FROM media_index_failures WHERE storage_id = 'local' AND normalized_path = ?1",
+    )
+    .bind(&entry.path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some_and(|(size, modified_at)| {
+        size == i64::try_from(entry.size.unwrap_or_default()).unwrap_or(i64::MAX)
+            && modified_at == entry.modified_at
+    }))
+}
+
+/// 记录内容级失败（损坏/不可解码）：持久化原因与指纹，重扫不再重复哈希。
+pub(crate) async fn record_index_failure(
+    pool: &SqlitePool,
+    entry: &StorageEntry,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let now = now_millis();
+    let size = i64::try_from(entry.size.unwrap_or_default()).unwrap_or(i64::MAX);
+    sqlx::query(
+        r#"
+        INSERT INTO media_index_failures
+            (storage_id, normalized_path, file_name, size, modified_at, reason, attempts,
+             first_failed_at, last_failed_at)
+        VALUES ('local', ?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)
+        ON CONFLICT(storage_id, normalized_path) DO UPDATE SET
+            file_name = excluded.file_name,
+            size = excluded.size,
+            modified_at = excluded.modified_at,
+            reason = excluded.reason,
+            attempts = media_index_failures.attempts + 1,
+            last_failed_at = excluded.last_failed_at
+        "#,
+    )
+    .bind(&entry.path)
+    .bind(&entry.name)
+    .bind(size)
+    .bind(entry.modified_at)
+    .bind(reason)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 内容级失败时丢弃本次预建的 pending 资产与位置行（仅限新文件首次索引），
+/// 失败本身由 `media_index_failures` 留痕，不再留下无说明的 pending 残留。
+async fn discard_failed_pending(
+    pool: &SqlitePool,
+    entry: &StorageEntry,
+    pending_media_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(media_id) = pending_media_id else {
+        return Ok(());
+    };
+    let mut transaction = begin_write(pool).await?;
+    sqlx::query("DELETE FROM media_locations WHERE storage_id = 'local' AND normalized_path = ?1")
+        .bind(&entry.path)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "DELETE FROM media_assets WHERE id = ?1 AND identity_state = 'pending' AND NOT EXISTS (SELECT 1 FROM media_locations WHERE media_asset_id = ?1)",
+    )
+    .bind(media_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// 单文件索引：SQLITE_BUSY 类错误退避重试，其余错误直接上抛。
+async fn index_with_retry(
+    pool: &SqlitePool,
+    storage: &LocalFilesystemStorageDriver,
+    entry: &StorageEntry,
+    summary: &mut ScanSummary,
+) -> anyhow::Result<()> {
+    let mut attempt = 0_usize;
+    loop {
+        match index_media(pool, storage, entry).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt >= INDEX_RETRY_BACKOFF_MS.len() || !crate::db::is_busy_anyhow(&error) {
+                    return Err(error);
+                }
+                let backoff = INDEX_RETRY_BACKOFF_MS[attempt];
+                attempt += 1;
+                summary.retried += 1;
+                tracing::debug!(
+                    path = %entry.path,
+                    attempt,
+                    backoff_ms = backoff,
+                    "retrying media index after lock contention"
+                );
+                sleep(Duration::from_millis(backoff)).await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -84,9 +252,16 @@ pub(crate) async fn scan_directory_with_lease(
             .and_then(|value| value.as_str())
             .unwrap_or(""),
     )?;
+    let retry_failed = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("retryFailed"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let mut directories = vec![scope_path.clone()];
     let mut seen_directories = HashSet::new();
     let mut seen_paths = HashSet::new();
+    let mut last_path: Option<String> = None;
+    let mut last_progress_at = Instant::now();
 
     while let Some(directory) = directories.pop() {
         if is_cancel_requested(pool, job_id).await? {
@@ -103,20 +278,34 @@ pub(crate) async fn scan_directory_with_lease(
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             if entry.is_directory {
-                directories.push(entry.path);
+                // 垃圾目录（.Trash/@eaDir/__MACOSX 等）不遍历；库内历史条目由对账清理。
+                if !is_ignored_name(&entry.name) {
+                    directories.push(entry.path);
+                }
                 continue;
             }
-            if !is_supported_media(&entry) {
+            if is_ignored_name(&entry.name) || entry.size == Some(0) {
+                summary.skipped_ignored += 1;
                 continue;
             }
+            // 文件确实存在：先登记，保证对账不会把「存在但暂不支持索引」的媒体
+            // 误判为已移除（例如上传入库的 HEIC）。
             seen_paths.insert(entry.path.clone());
+            if !is_supported_media(&entry) {
+                summary.skipped_unsupported += 1;
+                continue;
+            }
 
             if is_cancel_requested(pool, job_id).await? {
                 summary.cancelled = true;
                 return Ok(summary);
             }
+            if !retry_failed && is_unchanged_terminal_failure(pool, &entry).await? {
+                summary.skipped_failed += 1;
+                continue;
+            }
             summary.discovered += 1;
-            match index_media(pool, &storage, &entry).await {
+            match index_with_retry(pool, &storage, &entry, &mut summary).await {
                 Ok(()) => summary.indexed += 1,
                 Err(error) => {
                     summary.failed += 1;
@@ -126,27 +315,26 @@ pub(crate) async fn scan_directory_with_lease(
                         error = ?error,
                         "failed to index media"
                     );
+                    summary.record_failure(&entry.path, &error);
                 }
             }
-            let checkpoint = serde_json::json!({
-                "version": 1,
-                "kind": "scan",
-                "scopePath": scope_path,
-                "lastPath": entry.path,
-            })
-            .to_string();
-            let progress_saved = update_scan_progress(
-                pool,
-                job_id,
-                summary.discovered,
-                summary.indexed,
-                &checkpoint,
-                lease_owner,
-            )
-            .await?;
-            if lease_owner.is_some() && !progress_saved {
-                summary.cancelled = true;
-                return Ok(summary);
+            last_path = Some(entry.path.clone());
+            if last_progress_at.elapsed() >= PROGRESS_UPDATE_INTERVAL {
+                let checkpoint = scan_checkpoint(&scope_path, last_path.as_deref(), None);
+                last_progress_at = Instant::now();
+                let progress_saved = update_scan_progress(
+                    pool,
+                    job_id,
+                    summary.discovered,
+                    summary.indexed,
+                    &checkpoint,
+                    lease_owner,
+                )
+                .await?;
+                if lease_owner.is_some() && !progress_saved {
+                    summary.cancelled = true;
+                    return Ok(summary);
+                }
             }
         }
     }
@@ -155,20 +343,56 @@ pub(crate) async fn scan_directory_with_lease(
         summary.cancelled = true;
         return Ok(summary);
     }
+    // 收尾前落一次最终进度：节流窗口内的计数与 lastPath 不能丢。
+    let final_progress = scan_checkpoint(&scope_path, last_path.as_deref(), None);
+    let progress_saved = update_scan_progress(
+        pool,
+        job_id,
+        summary.discovered,
+        summary.indexed,
+        &final_progress,
+        lease_owner,
+    )
+    .await?;
+    if lease_owner.is_some() && !progress_saved {
+        return Err(anyhow::anyhow!("scan job lease was lost"));
+    }
     reconcile_missing_locations(pool, &seen_paths, &scope_path).await?;
     if let Some(lease_owner) = lease_owner {
-        let checkpoint = serde_json::json!({
-            "version": 1,
-            "kind": "scan",
-            "scopePath": scope_path,
-            "phase": "completed",
-        })
-        .to_string();
+        let checkpoint = scan_checkpoint(&scope_path, last_path.as_deref(), Some(&summary));
         if !update_scan_checkpoint(pool, job_id, &checkpoint, lease_owner).await? {
             return Err(anyhow::anyhow!("scan job lease was lost"));
         }
     }
     Ok(summary)
+}
+
+/// 扫描检查点 JSON：进度阶段只带 lastPath，完成阶段带跳过/失败明细。
+fn scan_checkpoint(
+    scope_path: &str,
+    last_path: Option<&str>,
+    summary: Option<&ScanSummary>,
+) -> String {
+    let mut value = serde_json::json!({
+        "version": 1,
+        "kind": "scan",
+        "scopePath": scope_path,
+    });
+    if let Some(summary) = summary {
+        value["phase"] = serde_json::json!("completed");
+        value["discovered"] = serde_json::json!(summary.discovered);
+        value["indexed"] = serde_json::json!(summary.indexed);
+        value["failed"] = serde_json::json!(summary.failed);
+        value["skippedUnsupported"] = serde_json::json!(summary.skipped_unsupported);
+        value["skippedIgnored"] = serde_json::json!(summary.skipped_ignored);
+        value["skippedFailed"] = serde_json::json!(summary.skipped_failed);
+        value["retried"] = serde_json::json!(summary.retried);
+        value["failures"] = serde_json::json!(summary.failures);
+    }
+    if let Some(last_path) = last_path {
+        value["lastPath"] = serde_json::json!(last_path);
+    }
+    value.to_string()
 }
 
 async fn reconcile_missing_locations(
@@ -190,7 +414,7 @@ async fn reconcile_missing_locations(
     )
     .fetch_all(pool)
     .await?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let revision = sync::allocate_revision(&mut transaction).await?;
     for (location_id, media_asset_id) in locations {
         let path = sqlx::query_scalar::<_, String>(
@@ -228,6 +452,26 @@ async fn reconcile_missing_locations(
             now_millis(),
             revision,
         )
+        .await?;
+    }
+    // 已消失文件的失败记录一并清理：文件回来时会重新走一次索引。
+    let recorded_failures = sqlx::query_scalar::<_, String>(
+        "SELECT normalized_path FROM media_index_failures WHERE storage_id = 'local'",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    for path in recorded_failures {
+        if (!scope_path.is_empty() && !path.starts_with(&scope_prefix))
+            || seen_paths.contains(&path)
+            || pending_paths.contains(&path)
+        {
+            continue;
+        }
+        sqlx::query(
+            "DELETE FROM media_index_failures WHERE storage_id = 'local' AND normalized_path = ?1",
+        )
+        .bind(&path)
+        .execute(&mut *transaction)
         .await?;
     }
     transaction.commit().await?;
@@ -309,7 +553,7 @@ async fn prepare_pending_index(
     owner_user_id: Option<i64>,
 ) -> anyhow::Result<PendingIndex> {
     let now = now_millis();
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let previous_location = sqlx::query_as::<_, ExistingLocation>(
         r#"
         SELECT l.media_asset_id, l.size, l.modified_at, l.hash_state, a.owner_user_id
@@ -556,11 +800,32 @@ pub(crate) async fn index_media_with_time(
                     error = ?error,
                     "video metadata extraction failed"
                 );
-                mark_location_hash_state(pool, &entry.path, "failed").await?;
+                // 内容级失败：持久化原因与指纹（重扫不重复哈希），且不再留下
+                // 无说明的 pending 残留。
+                let reason = format!("视频元数据解析失败：{error:#}");
+                if let Err(record_error) = record_index_failure(pool, entry, &reason).await {
+                    tracing::warn!(
+                        path = %entry.path,
+                        error = ?record_error,
+                        "failed to record index failure"
+                    );
+                }
+                if pending.pending_media_id.is_none() {
+                    mark_location_hash_state(pool, &entry.path, "failed").await?;
+                }
                 if let Some(media_id) = pending.reconcile_media_id.as_deref() {
                     emit_reconcile_change(pool, media_id).await?;
                 }
-                return Err(error);
+                if let Err(discard_error) =
+                    discard_failed_pending(pool, entry, pending.pending_media_id.as_deref()).await
+                {
+                    tracing::warn!(
+                        path = %entry.path,
+                        error = ?discard_error,
+                        "failed to discard pending media after index failure"
+                    );
+                }
+                return Err(anyhow::anyhow!(reason));
             }
         }
     } else {
@@ -587,7 +852,7 @@ pub(crate) async fn index_media_with_time(
 
     let now = now_millis();
 
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let revision = sync::allocate_revision(&mut transaction).await?;
     let existing_location = sqlx::query_as::<_, ExistingLocation>(
         r#"
@@ -896,6 +1161,14 @@ pub(crate) async fn index_media_with_time(
         .await?;
     }
 
+    // 索引成功：清掉历史失败记录（含本次修复的损坏文件）。
+    sqlx::query(
+        "DELETE FROM media_index_failures WHERE storage_id = 'local' AND normalized_path = ?1",
+    )
+    .bind(&entry.path)
+    .execute(&mut *transaction)
+    .await?;
+
     sqlx::query(
         "UPDATE media_assets SET sort_source=?1,time_version=1,original_name=?2 WHERE id=?3",
     )
@@ -992,7 +1265,7 @@ async fn emit_reconcile_change(pool: &SqlitePool, media_id: &str) -> anyhow::Res
         "version": version,
         "reason": "reconcile_required",
     });
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let revision = sync::allocate_revision(&mut transaction).await?;
     sqlx::query(
         r#"
@@ -1348,5 +1621,159 @@ mod tests {
         assert_eq!(operation, "delete");
         assert!(payload.contains("\"reconcile_required\""));
         Ok(())
+    }
+
+    async fn write_test_entry(
+        storage: &LocalFilesystemStorageDriver,
+        path: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<StorageEntry> {
+        tokio::fs::write(storage.root().join(path), bytes).await?;
+        let stat = storage.stat(path).await?;
+        Ok(StorageEntry {
+            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            path: path.to_owned(),
+            is_directory: false,
+            size: Some(stat.size),
+            modified_at: stat.modified_at,
+        })
+    }
+
+    #[tokio::test]
+    async fn scan_skips_junk_files_and_cleans_up_indexed_junk() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let media_root = root.path().join("media");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let state = crate::initialize(&root.path().join("data"), &media_root).await?;
+        let storage = state.storage.snapshot().await;
+
+        write_test_entry(&storage, "IMG_20240101_000000.jpg", b"photo").await?;
+        // 旧版本可能已收录的 AppleDouble 垃圾：本次扫描应对账墓碑。
+        let legacy_junk =
+            write_test_entry(&storage, "._1708264084494.jpg", b"apple-double").await?;
+        index_media(&state.db, &storage, &legacy_junk).await?;
+        // 新增垃圾：隐藏文件、同步缩略图目录、0 字节文件。
+        write_test_entry(&storage, ".DS_Store", b"ds").await?;
+        tokio::fs::create_dir_all(media_root.join("@eaDir")).await?;
+        write_test_entry(&storage, "@eaDir/thumb.jpg", b"thumb").await?;
+        write_test_entry(&storage, "empty.jpg", b"").await?;
+
+        let summary = scan_directory(&state.db, state.storage.clone(), "scan").await?;
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(summary.skipped_ignored, 3);
+
+        let locations: Vec<String> = sqlx::query_scalar(
+            "SELECT normalized_path FROM media_locations ORDER BY normalized_path",
+        )
+        .fetch_all(&state.db)
+        .await?;
+        assert_eq!(locations, vec!["IMG_20240101_000000.jpg".to_owned()]);
+        let tombstoned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_assets WHERE identity_state = 'tombstoned'",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        assert_eq!(tombstoned, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_does_not_tombstone_present_unsupported_files() -> anyhow::Result<()> {
+        // 上传路径可写入扫描白名单之外的格式（如 HEIC）；重扫必须按「文件仍在」
+        // 对待，否则这些媒体会在扫描后凭空消失（source_missing）。
+        let root = tempfile::tempdir()?;
+        let media_root = root.path().join("media");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let state = crate::initialize(&root.path().join("data"), &media_root).await?;
+        let storage = state.storage.snapshot().await;
+        let heic = write_test_entry(&storage, "IMG_20240102_000000.heic", b"heic-bytes").await?;
+        index_media(&state.db, &storage, &heic).await?;
+
+        let summary = scan_directory(&state.db, state.storage.clone(), "scan").await?;
+        assert_eq!(summary.skipped_unsupported, 1);
+        assert_eq!(summary.discovered, 0);
+        let location_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_locations WHERE normalized_path = 'IMG_20240102_000000.heic'",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        assert_eq!(location_count, 1);
+        let identity = sqlx::query_scalar::<_, String>("SELECT identity_state FROM media_assets")
+            .fetch_one(&state.db)
+            .await?;
+        assert_eq!(identity, "verified");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_video_failure_is_recorded_once_and_retried_only_on_demand()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let media_root = root.path().join("media");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let state = crate::initialize(&root.path().join("data"), &media_root).await?;
+        let storage = state.storage.snapshot().await;
+        write_test_entry(&storage, "MVI_0466.MOV", &[0_u8; 4096]).await?;
+
+        let first = scan_directory(&state.db, state.storage.clone(), "scan").await?;
+        assert_eq!(first.failed, 1);
+        assert_eq!(first.failures.len(), 1);
+        assert!(
+            first.failures[0].reason.contains("视频元数据解析失败"),
+            "unexpected reason: {}",
+            first.failures[0].reason
+        );
+        // 不再残留无说明的 pending 资产与位置行。
+        assert_eq!(media_asset_count(&state.db).await?, 0);
+        assert_eq!(location_count(&state.db).await?, 0);
+        assert_eq!(failure_attempts(&state.db).await?, 1);
+        let recorded: String = sqlx::query_scalar(
+            "SELECT reason FROM media_index_failures WHERE normalized_path = 'MVI_0466.MOV'",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        assert!(recorded.contains("视频元数据解析失败"), "{recorded}");
+
+        // 重扫：已知失败且文件未变更 → 跳过，不重复哈希大文件。
+        let second = scan_directory(&state.db, state.storage.clone(), "scan-again").await?;
+        assert_eq!(second.skipped_failed, 1);
+        assert_eq!(second.failed, 0);
+        assert_eq!(failure_attempts(&state.db).await?, 1);
+
+        // 显式重试（retryFailed）才重新索引。
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, status, created_at, updated_at, checkpoint) VALUES ('scan-retry', 'scan', 'running', 1, 1, ?1)",
+        )
+        .bind(
+            serde_json::json!({"version": 1, "kind": "scan", "scopePath": "", "retryFailed": true})
+                .to_string(),
+        )
+        .execute(&state.db)
+        .await?;
+        let third = scan_directory(&state.db, state.storage.clone(), "scan-retry").await?;
+        assert_eq!(third.failed, 1);
+        assert_eq!(failure_attempts(&state.db).await?, 2);
+        Ok(())
+    }
+
+    async fn media_asset_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_assets")
+            .fetch_one(pool)
+            .await
+    }
+
+    async fn location_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_locations")
+            .fetch_one(pool)
+            .await
+    }
+
+    async fn failure_attempts(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT attempts FROM media_index_failures WHERE normalized_path = 'MVI_0466.MOV'",
+        )
+        .fetch_one(pool)
+        .await
     }
 }

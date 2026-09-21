@@ -18,7 +18,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -1224,7 +1224,7 @@ async fn recover_purge(
 // ---------------------------------------------------------------------------
 
 async fn commit_delete_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     payload: &DeletePayload,
     now: i64,
     revision: i64,
@@ -1268,7 +1268,7 @@ async fn commit_delete_tx(
         .bind(&payload.deleted_by)
         .bind(now)
         .bind(now + TRASH_RETENTION_MS)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
         for tag in &payload.tags {
             sqlx::query(
@@ -1277,7 +1277,7 @@ async fn commit_delete_tx(
             .bind(&entry.entry_id)
             .bind(&tag.tag_id)
             .bind(&tag.tag_name)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         }
     }
@@ -1285,13 +1285,13 @@ async fn commit_delete_tx(
     // 该媒体在当前库内的全部 location 一并移出，不可只移走一份。
     sqlx::query("DELETE FROM media_locations WHERE media_asset_id = ?1 AND storage_id = 'local'")
         .bind(&media.media_id)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
     let remaining = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM media_locations WHERE media_asset_id = ?1",
     )
     .bind(&media.media_id)
-    .fetch_one(&mut **transaction)
+    .fetch_one(&mut *transaction)
     .await?;
     if remaining == 0 {
         metadata::tombstone_media_tx(
@@ -1307,7 +1307,7 @@ async fn commit_delete_tx(
 }
 
 async fn commit_restore_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     payload: &RestorePayload,
     asset: &AssetRow,
     now: i64,
@@ -1318,7 +1318,7 @@ async fn commit_restore_tx(
             "SELECT file_name, size FROM trash_entries WHERE id = ?1",
         )
         .bind(&item.entry_id)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
         let Some((file_name, size)) = snapshot else {
             continue;
@@ -1327,7 +1327,7 @@ async fn commit_restore_tx(
             "SELECT 1 FROM media_locations WHERE storage_id = 'local' AND normalized_path = ?1",
         )
         .bind(&item.target_path)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
         if exists.is_some() {
             continue;
@@ -1346,7 +1346,7 @@ async fn commit_restore_tx(
         .bind(&file_name)
         .bind(size)
         .bind(now)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
     }
 
@@ -1363,7 +1363,7 @@ async fn commit_restore_tx(
     .bind(if asset.is_favorite == 1 { 1_i64 } else { 0_i64 })
     .bind(now)
     .bind(&payload.media_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
 
     // 标签关系随回收保存，恢复时按 tag_id 重新关联；已删除的标签跳过而不重建。
@@ -1376,7 +1376,7 @@ async fn commit_restore_tx(
         "#,
     )
     .bind(&payload.media_id)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     for (tag_id, _) in tags {
         sqlx::query(
@@ -1385,7 +1385,7 @@ async fn commit_restore_tx(
         .bind(&tag_id)
         .bind(&payload.media_id)
         .bind(now)
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
     }
 
@@ -1394,7 +1394,7 @@ async fn commit_restore_tx(
     )
     .bind(now)
     .bind(&payload.media_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
 
     users::append_media_upsert_change(

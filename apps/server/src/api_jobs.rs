@@ -43,12 +43,17 @@ pub(crate) struct JobRow {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScanQuery {
     path: Option<String>,
+    /// 连同「已知内容失败且文件未变更」的条目一起重试（默认跳过，避免重复哈希大文件）。
+    retry_failed: Option<bool>,
 }
 
 #[utoipa::path(
     post,
     path = "/api/v1/admin/jobs/scan",
-    params(("path" = Option<String>, Query, description = "Folder to scan recursively, relative to storage root; omitted scans all")),
+    params(
+        ("path" = Option<String>, Query, description = "Folder to scan recursively, relative to storage root; omitted scans all"),
+        ("retry_failed" = Option<bool>, Query, description = "Retry files whose content failed to index previously, even when unchanged")
+    ),
     tag = "administration",
     responses(
         (status = 202, description = "Scan job started", body = JobResponse),
@@ -70,8 +75,13 @@ pub(crate) async fn start_scan(
             "scan path must be a directory".to_owned(),
         ));
     }
-    let checkpoint =
-        serde_json::json!({"version": 1, "kind": "scan", "scopePath": path}).to_string();
+    let checkpoint = serde_json::json!({
+        "version": 1,
+        "kind": "scan",
+        "scopePath": path,
+        "retryFailed": query.retry_failed.unwrap_or(false),
+    })
+    .to_string();
 
     let scan_active = sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind = 'scan' AND status IN ('queued', 'running', 'interrupted'))",
@@ -1318,8 +1328,11 @@ pub(crate) async fn set_job_succeeded(
     .bind(i64::try_from(summary.indexed).unwrap_or(i64::MAX))
     .bind(i64::try_from(summary.discovered).unwrap_or(i64::MAX))
     .bind(format!(
-        "discovered={}, indexed={}, failed={}",
-        summary.discovered, summary.indexed, summary.failed
+        "discovered={}, indexed={}, failed={}, skipped={}",
+        summary.discovered,
+        summary.indexed,
+        summary.failed,
+        summary.skipped_total()
     ))
     .bind(now_millis())
     .bind(id)
@@ -1425,8 +1438,11 @@ pub(crate) async fn set_job_cancelled(
     .bind(i64::try_from(summary.indexed).unwrap_or(i64::MAX))
     .bind(i64::try_from(summary.discovered).unwrap_or(i64::MAX))
     .bind(format!(
-        "cancelled: discovered={}, indexed={}, failed={}",
-        summary.discovered, summary.indexed, summary.failed
+        "cancelled: discovered={}, indexed={}, failed={}, skipped={}",
+        summary.discovered,
+        summary.indexed,
+        summary.failed,
+        summary.skipped_total()
     ))
     .bind(now_millis())
     .bind(id)

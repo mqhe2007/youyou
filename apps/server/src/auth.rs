@@ -19,7 +19,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    db::now_millis,
+    db::{begin_write, now_millis},
     error::{AppError, AppResult},
 };
 
@@ -491,7 +491,7 @@ pub async fn create_pairing_code(
 }
 
 pub async fn pair_device(pool: &SqlitePool, code: &str, name: &str) -> AppResult<DeviceTokens> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let pairing = sqlx::query_as::<_, PairingCodeRow>(
         r#"
         SELECT id, expires_at, max_attempts, attempts, used_at, user_id

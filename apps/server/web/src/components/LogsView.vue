@@ -13,6 +13,8 @@ import {
   jobMessage,
   jobOutcomeLabel,
   jobRunDurationMs,
+  jobScanReport,
+  jobScanSkipSummary,
   jobScopeLabel,
   jobShowsError,
   jobStatusClass,
@@ -26,7 +28,7 @@ const props = defineProps({
   jobs: { type: Object, required: true },
 });
 
-const emit = defineEmits(['cancel-job']);
+const emit = defineEmits(['cancel-job', 'retry-scan']);
 
 const iconStrokeWidth = 1.8;
 const cancelBusyId = ref('');
@@ -74,6 +76,18 @@ const runningRate = computed(() => {
   if (!job || elapsed == null || elapsed < 5000 || Number(job.current) <= 0) return null;
   return Math.round(Number(job.current) / (elapsed / 60000));
 });
+
+function scanReport(job) {
+  return jobScanReport(job);
+}
+
+function scanSkipSummary(job) {
+  return jobScanSkipSummary(scanReport(job));
+}
+
+function requestRetry(job) {
+  emit('retry-scan', job);
+}
 
 function requestCancel(job) {
   if (cancelBusyId.value) return;
@@ -229,6 +243,25 @@ function requestCancel(job) {
               </td>
               <td>
                 <small class="table-secondary">{{ jobOutcomeLabel(job) }}</small>
+                <template v-if="scanReport(job)">
+                  <small class="table-secondary">{{ scanSkipSummary(job) }}</small>
+                  <details v-if="scanReport(job).failures.length" class="scan-failures">
+                    <summary>失败明细 {{ scanReport(job).failures.length }} 项</summary>
+                    <ul>
+                      <li v-for="failure in scanReport(job).failures" :key="failure.path">
+                        <code>{{ failure.path }}</code> — {{ failure.reason }}
+                      </li>
+                    </ul>
+                  </details>
+                  <button
+                    v-if="scanReport(job).skippedFailed > 0 || scanReport(job).failures.length > 0"
+                    class="btn btn-outline btn-xs scan-retry"
+                    type="button"
+                    @click="requestRetry(job)"
+                  >
+                    重试失败项
+                  </button>
+                </template>
                 <small v-if="jobShowsError(job)" class="table-error">{{ jobErrorMessage(job.lastError) }}</small>
               </td>
               <td class="table-num">{{ formatDuration(jobRunDurationMs(job)) }}</td>

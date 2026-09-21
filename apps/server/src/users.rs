@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    db::now_millis,
+    db::{begin_write, now_millis},
     error::{AppError, AppResult},
     sync,
 };
@@ -90,7 +90,7 @@ pub async fn create_user(
         return Err(AppError::BadRequest("目录名越出了媒体存储根".to_owned()));
     }
 
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let now = now_millis();
     ensure_library_name_free(&mut transaction, &library_name).await?;
     let result =
@@ -128,12 +128,12 @@ fn validate_library_name(raw: &str) -> AppResult<String> {
 }
 
 async fn ensure_library_name_free(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transaction: &mut sqlx::SqliteConnection,
     library_name: &str,
 ) -> AppResult<()> {
     let taken = sqlx::query_scalar::<_, i64>("SELECT 1 FROM user_libraries WHERE root_path = ?1")
         .bind(library_name)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
     if taken.is_some() {
         return Err(AppError::Conflict(format!(
@@ -145,7 +145,7 @@ async fn ensure_library_name_free(
 
 /// 把目标目录下已索引的无属主媒体划归该用户（历史目录复用场景），并写变更。
 async fn claim_unowned_assets(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transaction: &mut sqlx::SqliteConnection,
     revision: i64,
     user_id: i64,
     root_relative: &str,
@@ -165,7 +165,7 @@ async fn claim_unowned_assets(
         "#,
     )
     .bind(root_relative)
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await?;
     if claimed_ids.is_empty() {
         return Ok(());
@@ -176,7 +176,7 @@ async fn claim_unowned_assets(
     .bind(user_id)
     .bind(now)
     .bind(serde_json::to_string(&claimed_ids).map_err(|e| AppError::Internal(e.into()))?)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
     for media_id in &claimed_ids {
         append_media_upsert_change(transaction, revision, media_id, Some(user_id), now).await?;
@@ -316,7 +316,7 @@ pub async fn bind_user_library(
             AppError::Conflict(format!("无法创建媒体库目录 {library_name}: {error}"))
         })?;
 
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let now = now_millis();
     ensure_library_name_free(&mut transaction, &library_name).await?;
     sqlx::query(
@@ -407,7 +407,7 @@ fn map_user_conflict(error: sqlx::Error) -> AppError {
 
 /// 以与 scan.rs 一致的 payload 形状，向指定用户的变更流写入媒体 upsert。
 pub(crate) async fn append_media_upsert_change(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transaction: &mut sqlx::SqliteConnection,
     revision: i64,
     media_id: &str,
     owner_user_id: Option<i64>,
@@ -433,7 +433,7 @@ pub(crate) async fn append_media_upsert_change(
         "#,
     )
     .bind(media_id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *transaction)
     .await?;
     let Some(row) = row else {
         return Ok(());
@@ -472,14 +472,14 @@ pub(crate) async fn append_media_upsert_change(
     .bind(serde_json::to_string(&payload).map_err(|e| AppError::Internal(e.into()))?)
     .bind(now)
     .bind(owner_user_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
     Ok(())
 }
 
 /// 向指定用户的变更流写入媒体 delete（归属移除/用户删除场景，文件本身仍在磁盘）。
 pub(crate) async fn append_media_delete_change(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transaction: &mut sqlx::SqliteConnection,
     revision: i64,
     media_id: &str,
     owner_user_id: i64,
@@ -487,7 +487,7 @@ pub(crate) async fn append_media_delete_change(
 ) -> AppResult<()> {
     let version: Option<i64> = sqlx::query_scalar("SELECT version FROM media_assets WHERE id = ?1")
         .bind(media_id)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
     let Some(version) = version else {
         return Ok(());
@@ -511,7 +511,7 @@ pub(crate) async fn append_media_delete_change(
     .bind(serde_json::to_string(&payload).map_err(|e| AppError::Internal(e.into()))?)
     .bind(now)
     .bind(owner_user_id)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?;
     Ok(())
 }

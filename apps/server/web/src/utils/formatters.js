@@ -174,11 +174,12 @@ export function jobMessage(job) {
   }
 
   const scanSummary = message.match(
-    /^(?:cancelled: )?discovered=(\d+), indexed=(\d+), failed=(\d+)$/,
+    /^(?:cancelled: )?discovered=(\d+), indexed=(\d+), failed=(\d+)(?:, skipped=(\d+))?$/,
   );
   if (scanSummary) {
     const prefix = message.startsWith('cancelled:') ? '扫描已取消' : '扫描完成';
-    return `${prefix}：发现 ${formatNumber(scanSummary[1])} 项，建立索引 ${formatNumber(scanSummary[2])} 项，失败 ${formatNumber(scanSummary[3])} 项`;
+    const skipped = scanSummary[4] ? `，跳过 ${formatNumber(scanSummary[4])} 项` : '';
+    return `${prefix}：发现 ${formatNumber(scanSummary[1])} 项，建立索引 ${formatNumber(scanSummary[2])} 项，失败 ${formatNumber(scanSummary[3])} 项${skipped}`;
   }
 
   return {
@@ -191,6 +192,31 @@ export function jobMessage(job) {
     'lease expired; queued for recovery': '任务已排队等待恢复',
     'lease expired; retry limit reached': '任务失败，已达到重试次数上限',
   }[message] || (job?.kind === 'backup' ? '数据库备份任务' : '服务端后台任务');
+}
+
+// 扫描作业的跳过/失败明细（来自作业检查点；运行中的扫描还没有终态明细）。
+export function jobScanReport(job) {
+  const checkpoint = job?.checkpoint;
+  if (!checkpoint || checkpoint.kind !== 'scan' || checkpoint.phase !== 'completed') return null;
+  const failures = Array.isArray(checkpoint.failures) ? checkpoint.failures : [];
+  const skippedUnsupported = Number(checkpoint.skippedUnsupported || 0);
+  const skippedIgnored = Number(checkpoint.skippedIgnored || 0);
+  const skippedFailed = Number(checkpoint.skippedFailed || 0);
+  const retried = Number(checkpoint.retried || 0);
+  if (!failures.length && !skippedUnsupported && !skippedIgnored && !skippedFailed && !retried) {
+    return null;
+  }
+  return { failures, skippedUnsupported, skippedIgnored, skippedFailed, retried };
+}
+
+export function jobScanSkipSummary(report) {
+  if (!report) return '';
+  const parts = [];
+  if (report.skippedUnsupported) parts.push(`不支持格式 ${formatNumber(report.skippedUnsupported)}`);
+  if (report.skippedIgnored) parts.push(`垃圾文件 ${formatNumber(report.skippedIgnored)}`);
+  if (report.skippedFailed) parts.push(`已知失败 ${formatNumber(report.skippedFailed)}`);
+  if (report.retried) parts.push(`锁竞争重试 ${formatNumber(report.retried)}`);
+  return parts.join(' · ');
 }
 
 export function jobErrorMessage(message) {

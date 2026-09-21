@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
-use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::db::now_millis;
 
@@ -10,14 +10,12 @@ const SNAPSHOT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const SNAPSHOT_INSERT_BATCH_SIZE: usize = 4_000;
 pub const CHANGES_CURSOR_END: &str = "\u{10ffff}";
 
-pub async fn allocate_revision(
-    transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<i64, sqlx::Error> {
+pub async fn allocate_revision(transaction: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     sqlx::query("UPDATE change_revision SET revision = revision + 1 WHERE id = 1")
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
     sqlx::query_scalar::<_, i64>("SELECT revision FROM change_revision WHERE id = 1")
-        .fetch_one(&mut **transaction)
+        .fetch_one(&mut *transaction)
         .await
 }
 
@@ -342,7 +340,7 @@ async fn is_job_cancel_requested(pool: &SqlitePool, job_id: &str) -> Result<bool
 }
 
 async fn heartbeat_job(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transaction: &mut sqlx::SqliteConnection,
     job_id: &str,
     lease_owner: Option<&str>,
     last_heartbeat_at: &mut i64,
@@ -360,7 +358,7 @@ async fn heartbeat_job(
     .bind(now)
     .bind(job_id)
     .bind(lease_owner)
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await?
     .rows_affected();
     if updated != 1 {

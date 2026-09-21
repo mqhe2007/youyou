@@ -193,22 +193,34 @@ async function loadJobs() {
   jobs.value = result || { items: [] };
 }
 
-async function startScan(path = '') {
+async function startScan(path = '', options = {}) {
   if (actionBusy.value === 'scan-start') return;
   actionBusy.value = 'scan-start';
   try {
-    const job = await props.api.request(`/api/v1/admin/jobs/scan?path=${encodeURIComponent(path)}`, {
-      method: 'POST',
-    });
+    const retrySuffix = options.retryFailed ? '&retry_failed=true' : '';
+    const job = await props.api.request(
+      `/api/v1/admin/jobs/scan?path=${encodeURIComponent(path)}${retrySuffix}`,
+      { method: 'POST' },
+    );
     watchedScanId.value = job?.id || null;
     await loadJobs();
-    notify(`正在刷新「${path || '全部'}」，进度可在日志中查看。`, 'success');
+    notify(
+      options.retryFailed
+        ? `正在重试「${path || '全部'}」中的失败项，进度可在日志中查看。`
+        : `正在刷新「${path || '全部'}」，进度可在日志中查看。`,
+      'success',
+    );
     scheduleJobPoll();
   } catch (error) {
     handleError(error);
   } finally {
     actionBusy.value = '';
   }
+}
+
+function retryFailedScan(job) {
+  const scopePath = job?.checkpoint?.scopePath || '';
+  startScan(scopePath, { retryFailed: true });
 }
 
 function scheduleJobPoll() {
@@ -485,6 +497,7 @@ onUnmounted(() => {
             v-else-if="activeSection === 'logs'"
             :jobs="jobs"
             @cancel-job="cancelJob"
+            @retry-scan="retryFailedScan"
           />
         </template>
       </main>

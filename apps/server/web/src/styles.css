@@ -3133,3 +3133,32 @@ a {
 .admin-modal {
   position: relative;
 }
+
+/* 扫描失败明细：折叠列表保持任务表紧凑，展开后逐条给出路径与原因。 */
+.scan-failures {
+  margin: 0.25rem 0;
+  font-size: 0.78rem;
+}
+
+.scan-failures summary {
+  cursor: pointer;
+  color: var(--color-text-secondary, #6b7280);
+}
+
+.scan-failures ul {
+  margin: 0.35rem 0 0.35rem 1rem;
+  padding: 0;
+  list-style: disc;
+  max-height: 12rem;
+  overflow-y: auto;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.scan-failures code {
+  font-size: 0.75rem;
+}
+
+.scan-retry {
+  margin-top: 0.25rem;
+}
