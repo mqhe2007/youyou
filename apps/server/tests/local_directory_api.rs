@@ -14,6 +14,22 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 use youyou_server::{api::build_router, initialize, metadata};
 
+/// 可解码的最小 JPEG 夹具：图片必须能解析出尺寸才会入库。
+/// `seed` 追加在 JPEG 之后，用来让不同文件的内容哈希不同（解码器忽略尾部字节）。
+fn photo_bytes(seed: &[u8]) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2,
+        2,
+        image::Rgb([90, 140, 200]),
+    ))
+    .write_to(&mut buffer, image::ImageFormat::Jpeg)
+    .expect("encode fixture jpeg");
+    let mut bytes = buffer.into_inner();
+    bytes.extend_from_slice(seed);
+    bytes
+}
+
 async fn request(
     app: &axum::Router,
     method: Method,
@@ -648,7 +664,7 @@ async fn scans_local_directory_and_serves_paginated_media() {
     tokio::fs::create_dir_all(library.join("camera"))
         .await
         .expect("camera directory");
-    tokio::fs::write(library.join("camera/photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("camera/photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
     tokio::fs::write(library.join("camera/notes.txt"), b"ignore")
@@ -702,11 +718,14 @@ async fn scans_local_directory_and_serves_paginated_media() {
     assert_eq!(media_json["hasMore"], false);
     assert!(media_json["nextCursor"].as_str().is_some());
     assert_eq!(media_json["items"][0]["path"], "library/camera/photo.jpg");
-    assert_eq!(media_json["items"][0]["size"], 6);
+    assert_eq!(
+        media_json["items"][0]["size"],
+        photo_bytes(b"abcdef").len() as u64
+    );
     assert_eq!(media_json["items"][0]["isVideo"], false);
     assert_eq!(
         media_json["items"][0]["contentHash"],
-        hex::encode(Sha256::digest(b"abcdef"))
+        hex::encode(Sha256::digest(photo_bytes(b"abcdef")))
     );
     let media_id = media_json["items"][0]["id"].as_str().expect("media id");
     let folders = request(
@@ -869,7 +888,7 @@ async fn scans_local_directory_and_serves_paginated_media() {
     assert_eq!(snapshot_media_json["items"][0]["data"]["isVideo"], false);
     assert_eq!(
         snapshot_media_json["items"][0]["data"]["contentHash"],
-        hex::encode(Sha256::digest(b"abcdef"))
+        hex::encode(Sha256::digest(photo_bytes(b"abcdef")))
     );
 
     let detail = request(
@@ -895,12 +914,12 @@ async fn scans_local_directory_and_serves_paginated_media() {
     assert_eq!(content.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
         content.headers().get(header::CONTENT_RANGE).unwrap(),
-        "bytes 1-3/6"
+        &format!("bytes 1-3/{}", photo_bytes(b"abcdef").len())
     );
     let content_body = to_bytes(content.into_body(), usize::MAX)
         .await
         .expect("content body");
-    assert_eq!(&content_body[..], b"bcd");
+    assert_eq!(&content_body[..], &photo_bytes(b"abcdef")[1..4]);
 
     let changes = request(
         &app,
@@ -921,14 +940,14 @@ async fn scans_local_directory_and_serves_paginated_media() {
     assert!(changes_json["nextCursor"].as_str().is_some());
 
     // 客户端流式上传：落入用户媒体库的 uploads/YYYY/MM 目录。
-    let upload_bytes = b"uploaded";
+    let upload_bytes = photo_bytes(b"uploaded");
     let upload = stream_upload_request(
         &app,
         &device_token,
         "uploaded.jpg",
         Some("image/jpeg"),
         Some(1704067200000),
-        upload_bytes,
+        &upload_bytes,
     )
     .await;
     assert_eq!(upload.status(), StatusCode::OK);
@@ -965,7 +984,7 @@ async fn scans_local_directory_and_serves_paginated_media() {
         "uploaded.jpg",
         Some("image/jpeg"),
         Some(1704067200000),
-        upload_bytes,
+        &upload_bytes,
     )
     .await;
     assert_eq!(duplicate.status(), StatusCode::OK);
@@ -1039,12 +1058,15 @@ async fn folder_scan_reconciles_only_the_selected_subtree() {
     tokio::fs::create_dir_all(media.path().join("selected-sibling"))
         .await
         .expect("sibling directory");
-    tokio::fs::write(media.path().join("selected/nested/inside.jpg"), b"inside")
-        .await
-        .expect("selected photo");
+    tokio::fs::write(
+        media.path().join("selected/nested/inside.jpg"),
+        photo_bytes(b"inside"),
+    )
+    .await
+    .expect("selected photo");
     tokio::fs::write(
         media.path().join("selected-sibling/outside.jpg"),
-        b"outside",
+        photo_bytes(b"outside"),
     )
     .await
     .expect("sibling photo");
@@ -1149,7 +1171,7 @@ async fn scan_skips_internal_symlink_cycles() {
     tokio::fs::create_dir_all(library.join("nested"))
         .await
         .expect("nested directory");
-    tokio::fs::write(library.join("nested/photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("nested/photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
     symlink(library.join("nested"), library.join("nested/loop")).expect("internal symlink");
@@ -1188,7 +1210,7 @@ async fn scan_skips_internal_symlink_cycles() {
 async fn resumes_persisted_jobs_after_restart_recovery() {
     let data = tempdir().expect("data directory");
     let media = tempdir().expect("media directory");
-    tokio::fs::write(media.path().join("photo.jpg"), b"abcdef")
+    tokio::fs::write(media.path().join("photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
 
@@ -1231,7 +1253,7 @@ async fn resumes_persisted_bootstrap_with_its_snapshot_after_restart() {
     tokio::fs::create_dir_all(&library)
         .await
         .expect("library dir");
-    tokio::fs::write(library.join("photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
 
@@ -1314,7 +1336,7 @@ async fn full_scan_tombstones_media_removed_from_local_directory() {
         .await
         .expect("library dir");
     let photo_path = library.join("photo.jpg");
-    tokio::fs::write(&photo_path, b"abcdef")
+    tokio::fs::write(&photo_path, photo_bytes(b"abcdef"))
         .await
         .expect("photo");
 
@@ -1403,7 +1425,7 @@ async fn stale_location_is_not_readable_through_media_endpoints() {
     tokio::fs::create_dir_all(&library)
         .await
         .expect("library dir");
-    tokio::fs::write(library.join("photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
 
@@ -1715,6 +1737,218 @@ async fn pairing_code_attempts_are_consumed_by_invalid_device_names() {
     assert_eq!(attempts, 5);
 }
 
+/// 用 ffmpeg 生成一个极短的真实视频夹具（编码器/容器/尺寸按格式要求选择，
+/// 例如 H.263 只接受 128x96 / 176x144 等标准尺寸）。
+fn write_video_fixture(path: &std::path::Path, encoder: &str, format: &str, size: &str) {
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=size={size}:rate=25:duration=0.4"),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            encoder,
+            "-f",
+            format,
+        ])
+        .arg(path)
+        .status()
+        .expect("run ffmpeg for fixture");
+    assert!(
+        status.success(),
+        "ffmpeg fixture failed for {}",
+        path.display()
+    );
+}
+
+#[tokio::test]
+async fn indexes_legacy_formats_with_metadata_and_thumbnails() {
+    // 历史上被扫描白名单跳过的格式：MPG（家庭录像）、WMV、3GP、M4V 与 BMP。
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library)
+        .await
+        .expect("library dir");
+    write_video_fixture(
+        &library.join("jinggangshan.mpg"),
+        "mpeg1video",
+        "mpeg",
+        "160x120",
+    );
+    write_video_fixture(&library.join("college.wmv"), "wmv2", "asf", "160x120");
+    write_video_fixture(&library.join("college.3gp"), "h263", "3gp", "176x144");
+    write_video_fixture(&library.join("clip.m4v"), "mpeg4", "mp4", "160x120");
+    let mut bmp = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 3, image::Rgb([10, 20, 30])))
+        .write_to(&mut bmp, image::ImageFormat::Bmp)
+        .expect("encode bmp");
+    tokio::fs::write(library.join("old-photo.bmp"), bmp.into_inner())
+        .await
+        .expect("bmp");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let now0 = youyou_server::db::now_millis();
+    sqlx::query("INSERT INTO users (name, created_at, updated_at) VALUES ('owner', ?1, ?1)")
+        .bind(now0)
+        .execute(&state.db)
+        .await
+        .expect("create user");
+    youyou_server::users::bind_user_library(
+        &state.db,
+        state.storage.snapshot().await.root(),
+        1,
+        "library",
+    )
+    .await
+    .expect("bind library");
+    let summary = youyou_server::scan::scan_directory(&state.db, state.storage.clone(), "scan")
+        .await
+        .expect("scan");
+    assert_eq!(summary.discovered, 5, "全部历史格式都应被发现");
+    assert_eq!(summary.indexed, 5, "失败明细：{:?}", summary.failures);
+
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token2, csrf_token2) = establish_admin(&app, setup_token.trim()).await;
+    let device_token = pair_user_device(&app, &admin_token2, &csrf_token2, 1, "test-device").await;
+
+    let media_response = request(
+        &app,
+        Method::GET,
+        "/api/v1/media?limit=20",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    let body = to_bytes(media_response.into_body(), usize::MAX)
+        .await
+        .expect("media body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("media json");
+    let items = json["items"].as_array().expect("items");
+    assert_eq!(items.len(), 5);
+    for item in items {
+        let name = item["name"].as_str().expect("name").to_owned();
+        let is_video = item["isVideo"].as_bool().expect("isVideo");
+        assert!(
+            item["width"].as_i64().is_some() && item["height"].as_i64().is_some(),
+            "{name} 应解析出宽高：{item}"
+        );
+        assert_eq!(is_video, !name.ends_with(".bmp"), "{name} 的视频判定");
+        assert!(item["sortAt"].as_i64().is_some(), "{name} 应有媒体时间");
+        let sort_source = item["sortSource"].as_str().unwrap_or_default();
+        assert!(
+            matches!(sort_source, "filename" | "modified"),
+            "{name} 的时间来源应为文件名/mtime 回退，实际 {sort_source}"
+        );
+        let media_id = item["id"].as_str().expect("media id");
+        let thumbnail = request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/media/{media_id}/thumbnail?size=64"),
+            None,
+            Some(&device_token),
+            None,
+        )
+        .await;
+        assert_eq!(thumbnail.status(), StatusCode::OK, "{name} 缩略图应可用");
+        assert_eq!(thumbnail.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let bytes = to_bytes(thumbnail.into_body(), usize::MAX)
+            .await
+            .expect("thumbnail body");
+        assert!(!bytes.is_empty(), "{name} 缩略图不应为空");
+    }
+}
+
+#[tokio::test]
+async fn thumbnail_decode_failure_serves_placeholder() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library)
+        .await
+        .expect("library dir");
+    let mut pixel = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0])))
+        .write_to(&mut pixel, image::ImageFormat::Png)
+        .expect("encode pixel");
+    tokio::fs::write(library.join("pixel.png"), pixel.into_inner())
+        .await
+        .expect("pixel");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let now0 = youyou_server::db::now_millis();
+    sqlx::query("INSERT INTO users (name, created_at, updated_at) VALUES ('owner', ?1, ?1)")
+        .bind(now0)
+        .execute(&state.db)
+        .await
+        .expect("create user");
+    youyou_server::users::bind_user_library(
+        &state.db,
+        state.storage.snapshot().await.root(),
+        1,
+        "library",
+    )
+    .await
+    .expect("bind library");
+    youyou_server::scan::scan_directory(&state.db, state.storage.clone(), "scan")
+        .await
+        .expect("scan");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token2, csrf_token2) = establish_admin(&app, setup_token.trim()).await;
+    let device_token = pair_user_device(&app, &admin_token2, &csrf_token2, 1, "test-device").await;
+    let media_response = request(
+        &app,
+        Method::GET,
+        "/api/v1/media?limit=1",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    let body = to_bytes(media_response.into_body(), usize::MAX)
+        .await
+        .expect("media body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("media json");
+    let media_id = json["items"][0]["id"]
+        .as_str()
+        .expect("media id")
+        .to_owned();
+
+    // 源文件在索引后损坏：解码失败应回退为占位图，而不是 500。
+    tokio::fs::write(library.join("pixel.png"), b"broken-after-index")
+        .await
+        .expect("break source");
+    let thumbnail = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/media/{media_id}/thumbnail?size=64"),
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(thumbnail.status(), StatusCode::OK);
+    assert_eq!(thumbnail.headers()[header::CONTENT_TYPE], "image/jpeg");
+    let bytes = to_bytes(thumbnail.into_body(), usize::MAX)
+        .await
+        .expect("thumbnail body");
+    assert!(!bytes.is_empty());
+    let placeholder = image::load_from_memory(&bytes).expect("placeholder decodes");
+    assert_eq!(placeholder.width(), 64);
+    assert_eq!(placeholder.height(), 64);
+}
+
 #[tokio::test]
 async fn serves_and_caches_image_thumbnail() {
     let data = tempdir().expect("data directory");
@@ -1924,10 +2158,10 @@ async fn duplicate_content_is_one_media_with_a_deterministic_location() {
     tokio::fs::create_dir_all(&library)
         .await
         .expect("library dir");
-    tokio::fs::write(library.join("a.jpg"), b"same-content")
+    tokio::fs::write(library.join("a.jpg"), photo_bytes(b"same-content"))
         .await
         .expect("first photo");
-    tokio::fs::write(library.join("b.jpg"), b"same-content")
+    tokio::fs::write(library.join("b.jpg"), photo_bytes(b"same-content"))
         .await
         .expect("second photo");
 
@@ -2059,7 +2293,7 @@ async fn favorite_updates_propagate_to_snapshot_and_changes() {
     tokio::fs::create_dir_all(&library)
         .await
         .expect("library dir");
-    tokio::fs::write(library.join("photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
 
@@ -2240,7 +2474,7 @@ async fn user_data_is_isolated_between_libraries() {
     tokio::fs::create_dir_all(&library_b)
         .await
         .expect("bob dir");
-    tokio::fs::write(library_a.join("alice.jpg"), b"alice-content")
+    tokio::fs::write(library_a.join("alice.jpg"), photo_bytes(b"alice-content"))
         .await
         .expect("alice photo");
 
@@ -2395,7 +2629,7 @@ async fn user_data_is_isolated_between_libraries() {
         "bob.jpg",
         Some("image/jpeg"),
         None,
-        b"bob-upload",
+        &photo_bytes(b"bob-upload"),
     )
     .await;
     assert_eq!(upload.status(), StatusCode::OK);
@@ -2504,7 +2738,7 @@ async fn cascaded_metadata_changes_share_one_transaction_revision() {
     tokio::fs::create_dir_all(&library)
         .await
         .expect("library dir");
-    tokio::fs::write(library.join("photo.jpg"), b"abcdef")
+    tokio::fs::write(library.join("photo.jpg"), photo_bytes(b"abcdef"))
         .await
         .expect("photo");
     let state = initialize(data.path(), media.path()).await.expect("state");
@@ -2757,13 +2991,13 @@ async fn modern_upload_preserves_original_time_provenance() {
     let db = state.db.clone();
     let app = build_router(state);
     let (_, _, device) = establish_device(&app, token.trim()).await;
-    let bytes = b"time-provenance-contract";
+    let bytes = photo_bytes(b"time-provenance-contract");
     let mut req = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/media/upload")
         .header(header::AUTHORIZATION, format!("Bearer {device}"))
         .header("X-Expected-Size", bytes.len())
-        .header("X-Expected-SHA256", hex::encode(Sha256::digest(bytes)))
+        .header("X-Expected-SHA256", hex::encode(Sha256::digest(&bytes)))
         .header("X-File-Name", "IMG_20250101_000000.jpg")
         .header("X-Original-Name", "plain.jpg")
         .header("X-Youyou-Client-Version", "0.1.3")
@@ -3447,7 +3681,7 @@ async fn job_records_execution_start_and_resets_it_only_on_manual_retry() {
     tokio::fs::create_dir_all(media.path().join("album"))
         .await
         .expect("album directory");
-    tokio::fs::write(media.path().join("album/a.jpg"), b"a")
+    tokio::fs::write(media.path().join("album/a.jpg"), photo_bytes(b"a"))
         .await
         .expect("photo");
 

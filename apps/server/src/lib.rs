@@ -5,6 +5,7 @@ pub mod backup;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod media_format;
 pub mod media_library;
 pub mod metadata;
 pub mod runtime;

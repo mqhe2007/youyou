@@ -19,7 +19,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    api::AppState,
+    api::{AppState, ThumbnailRender, render_thumbnail},
     audit, auth,
     db::now_millis,
     error::{AppError, AppResult},
@@ -596,32 +596,31 @@ pub(crate) async fn library_media_thumbnail(
     }
 
     let storage = state.storage.snapshot().await;
-    let bytes = if row.is_video == 1 {
-        generate_video_thumbnail(storage.as_ref(), &row, size).await?
-    } else {
-        let source = storage.read_all(&row.normalized_path, None).await?;
-        let decoded = image::load_from_memory(&source).map_err(|error| {
-            AppError::Internal(anyhow::anyhow!("decode thumbnail source: {error}"))
-        })?;
-        let thumbnail = decoded.thumbnail(size, size);
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        thumbnail
-            .write_to(&mut encoded, image::ImageFormat::Jpeg)
-            .map_err(|error| AppError::Internal(anyhow::anyhow!("encode thumbnail: {error}")))?;
-        encoded.into_inner()
+    let render = render_thumbnail(
+        &storage,
+        &row.id,
+        &row.normalized_path,
+        row.is_video == 1,
+        size,
+    )
+    .await?;
+    let bytes = match render {
+        ThumbnailRender::Rendered(bytes) => {
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            let temporary = cache_dir.join(format!(".{}.tmp-{}", row.id, Uuid::new_v4()));
+            tokio::fs::write(&temporary, &bytes)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            if let Err(error) = tokio::fs::rename(&temporary, &cache_path).await {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(AppError::Internal(error.into()));
+            }
+            bytes
+        }
+        ThumbnailRender::Placeholder(bytes) => bytes,
     };
-
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .map_err(|error| AppError::Internal(error.into()))?;
-    let temporary = cache_dir.join(format!(".{}.tmp-{}", row.id, Uuid::new_v4()));
-    tokio::fs::write(&temporary, &bytes)
-        .await
-        .map_err(|error| AppError::Internal(error.into()))?;
-    if let Err(error) = tokio::fs::rename(&temporary, &cache_path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(AppError::Internal(error.into()));
-    }
     Ok(jpeg_response(bytes))
 }
 
@@ -738,41 +737,6 @@ fn exif_rational(value: &exif::Value, index: usize) -> Option<f64> {
         exif::Value::SRational(values) => values.get(index).map(exif::SRational::to_f64),
         _ => None,
     }
-}
-
-async fn generate_video_thumbnail(
-    storage: &LocalFilesystemStorageDriver,
-    row: &MediaServeRow,
-    size: u32,
-) -> AppResult<Vec<u8>> {
-    let filter = format!("scale={size}:{size}:force_original_aspect_ratio=decrease");
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-ss", "0", "-i"])
-            .arg(storage.root().join(&row.normalized_path))
-            .args([
-                "-frames:v",
-                "1",
-                "-vf",
-                &filter,
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "pipe:1",
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| AppError::Internal(anyhow::anyhow!("video thumbnail generation timed out")))?
-    .map_err(|error| AppError::Internal(anyhow::anyhow!("start ffmpeg: {error}")))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(AppError::Internal(anyhow::anyhow!(
-            "video thumbnail generation failed"
-        )));
-    }
-    Ok(output.stdout)
 }
 
 fn jpeg_response(bytes: Vec<u8>) -> Response {

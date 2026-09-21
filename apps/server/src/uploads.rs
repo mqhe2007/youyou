@@ -499,19 +499,11 @@ fn upload_file_extension(file_name: &str) -> String {
 }
 
 fn is_video_upload(upload: &UploadRow) -> bool {
-    if upload
+    upload
         .mime_type
         .as_deref()
         .is_some_and(|mime| mime.starts_with("video/"))
-    {
-        return true;
-    }
-    matches!(
-        upload_file_extension(&upload.file_name)
-            .to_ascii_lowercase()
-            .as_str(),
-        ".avi" | ".mkv" | ".mov" | ".mp4" | ".webm"
-    )
+        || crate::media_format::is_video_path(&upload.file_name)
 }
 
 pub(crate) fn parse_rule_name(file_name: &str) -> Option<(i32, u32, u32, u32, u32, u32, u32)> {

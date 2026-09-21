@@ -3,7 +3,6 @@ use std::{collections::HashSet, io::Cursor, sync::Arc, time::Instant};
 use anyhow::Context;
 use futures_util::StreamExt;
 use image::ImageReader;
-use mime_guess::MimeGuess;
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 use tokio::{
@@ -163,6 +162,46 @@ async fn discard_failed_pending(
     .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+/// 内容级失败（文件损坏或无法解码）：持久化原因与指纹（重扫不重复哈希），
+/// 清理本次预建的 pending 残留，并返回带原因的终结错误。
+async fn record_terminal_failure(
+    pool: &SqlitePool,
+    entry: &StorageEntry,
+    pending: &PendingIndex,
+    label: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    tracing::debug!(path = %entry.path, error = ?error, label, "media content could not be decoded");
+    let reason = format!("{label}：{error:#}");
+    if let Err(record_error) = record_index_failure(pool, entry, &reason).await {
+        tracing::warn!(
+            path = %entry.path,
+            error = ?record_error,
+            "failed to record index failure"
+        );
+    }
+    if pending.pending_media_id.is_none()
+        && let Err(mark_error) = mark_location_hash_state(pool, &entry.path, "failed").await
+    {
+        tracing::warn!(path = %entry.path, error = ?mark_error, "failed to mark location as failed");
+    }
+    if let Some(media_id) = pending.reconcile_media_id.as_deref()
+        && let Err(reconcile_error) = emit_reconcile_change(pool, media_id).await
+    {
+        tracing::warn!(path = %entry.path, error = ?reconcile_error, "failed to emit reconcile change");
+    }
+    if let Err(discard_error) =
+        discard_failed_pending(pool, entry, pending.pending_media_id.as_deref()).await
+    {
+        tracing::warn!(
+            path = %entry.path,
+            error = ?discard_error,
+            "failed to discard pending media after index failure"
+        );
+    }
+    anyhow::anyhow!(reason)
 }
 
 /// 单文件索引：SQLITE_BUSY 类错误退避重试，其余错误直接上抛。
@@ -705,9 +744,8 @@ pub(crate) async fn index_media_with_time(
     timeline: Option<crate::media_time::MediaTime>,
     original_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mime_type = MimeGuess::from_path(&entry.path)
-        .first_raw()
-        .map(str::to_owned);
+    let media_format = crate::media_format::from_path(&entry.path);
+    let mime_type = crate::media_format::mime_for_path(&entry.path);
     let effective_mime_type = mime_type_override
         .map(|value| value.map(str::to_owned))
         .unwrap_or_else(|| mime_type.clone());
@@ -724,21 +762,16 @@ pub(crate) async fn index_media_with_time(
         }
         return Ok(());
     }
-    let is_video = mime_type
-        .as_deref()
-        .map(|mime| mime.starts_with("video/"))
-        .unwrap_or_else(|| {
-            entry
-                .name
-                .rsplit_once('.')
-                .map(|(_, extension)| {
-                    matches!(
-                        extension.to_ascii_lowercase().as_str(),
-                        "avi" | "mkv" | "mov" | "mp4" | "webm"
-                    )
-                })
-                .unwrap_or(false)
-        });
+    // 显式覆盖（上传）优先信任调用方给出的 MIME；否则以格式注册表为准。
+    let is_video = match mime_type_override.flatten() {
+        Some(mime) => mime.starts_with("video/"),
+        None => {
+            media_format.is_some_and(|format| format.kind == crate::media_format::MediaKind::Video)
+                || mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("video/"))
+        }
+    };
     let owner_user_id = crate::users::resolve_owner_for_path(pool, &entry.path).await?;
     let pending =
         prepare_pending_index(pool, entry, &effective_mime_type, is_video, owner_user_id).await?;
@@ -795,40 +828,31 @@ pub(crate) async fn index_media_with_time(
         match extract_video_metadata(storage, &entry.path).await {
             Ok(metadata) => metadata,
             Err(error) => {
-                tracing::debug!(
-                    path = %entry.path,
-                    error = ?error,
-                    "video metadata extraction failed"
+                return Err(record_terminal_failure(
+                    pool,
+                    entry,
+                    &pending,
+                    "视频元数据解析失败",
+                    error,
+                )
+                .await);
+            }
+        }
+    } else if media_format
+        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Builtin)
+    {
+        match extract_image_metadata(storage, &entry.path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // 注册表内的图片格式必须能解析出尺寸才算入库：解码失败按内容级失败
+                // 处理，避免产生 0×0 的 verified 资产（其缩略图必然失败）。
+                return Err(
+                    record_terminal_failure(pool, entry, &pending, "图片解码失败", error).await,
                 );
-                // 内容级失败：持久化原因与指纹（重扫不重复哈希），且不再留下
-                // 无说明的 pending 残留。
-                let reason = format!("视频元数据解析失败：{error:#}");
-                if let Err(record_error) = record_index_failure(pool, entry, &reason).await {
-                    tracing::warn!(
-                        path = %entry.path,
-                        error = ?record_error,
-                        "failed to record index failure"
-                    );
-                }
-                if pending.pending_media_id.is_none() {
-                    mark_location_hash_state(pool, &entry.path, "failed").await?;
-                }
-                if let Some(media_id) = pending.reconcile_media_id.as_deref() {
-                    emit_reconcile_change(pool, media_id).await?;
-                }
-                if let Err(discard_error) =
-                    discard_failed_pending(pool, entry, pending.pending_media_id.as_deref()).await
-                {
-                    tracing::warn!(
-                        path = %entry.path,
-                        error = ?discard_error,
-                        "failed to discard pending media after index failure"
-                    );
-                }
-                return Err(anyhow::anyhow!(reason));
             }
         }
     } else {
+        // 注册表之外的格式（上传兜底）：元数据不可得不算失败，按未知尺寸入库。
         match extract_image_metadata(storage, &entry.path).await {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -1441,14 +1465,7 @@ fn parse_exif_datetime(value: &str) -> Option<i64> {
 }
 
 fn is_supported_media(entry: &StorageEntry) -> bool {
-    let extension = entry
-        .name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase());
-    matches!(
-        extension.as_deref(),
-        Some("gif" | "jpeg" | "jpg" | "mkv" | "mov" | "mp4" | "png" | "webm" | "webp" | "avi")
-    )
+    crate::media_format::is_supported(&entry.name)
 }
 
 #[cfg(test)]
@@ -1489,11 +1506,7 @@ mod tests {
         let state =
             crate::initialize(&root.path().join("data"), &root.path().join("media")).await?;
         let storage = state.storage.snapshot().await;
-        tokio::fs::write(
-            storage.root().join("IMG_20240101_000000.jpg"),
-            b"image-time-test",
-        )
-        .await?;
+        tokio::fs::write(storage.root().join("IMG_20240101_000000.jpg"), tiny_jpeg()).await?;
         let stat = storage.stat("IMG_20240101_000000.jpg").await?;
         let entry = StorageEntry {
             name: "IMG_20240101_000000.jpg".into(),
@@ -1529,11 +1542,7 @@ mod tests {
         .await?;
         assert_eq!(time, time2);
         // Generated upload name is not evidence: keep original unknown filename and inherited fallback.
-        tokio::fs::write(
-            storage.root().join("IMG_20250101_000000.jpg"),
-            b"second-content",
-        )
-        .await?;
+        tokio::fs::write(storage.root().join("IMG_20250101_000000.jpg"), tiny_png()).await?;
         let stat = storage.stat("IMG_20250101_000000.jpg").await?;
         let generated = StorageEntry {
             name: "IMG_20250101_000000.jpg".into(),
@@ -1574,7 +1583,7 @@ mod tests {
         let state = crate::initialize(&data_dir, &media_root).await?;
         let storage = state.storage.snapshot().await;
         let path = media_root.join("photo.jpg");
-        tokio::fs::write(&path, b"not-a-real-image").await?;
+        tokio::fs::write(&path, tiny_jpeg()).await?;
         let stat = storage.stat("photo.jpg").await?;
         let entry = StorageEntry {
             name: "photo.jpg".to_owned(),
@@ -1623,6 +1632,26 @@ mod tests {
         Ok(())
     }
 
+    /// 最小可用 JPEG：图片必须能解析出尺寸才算入库，测试夹具不能用任意字节。
+    fn tiny_jpeg() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([120, 80, 40]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Jpeg)
+            .expect("encode tiny jpeg");
+        bytes.into_inner()
+    }
+
+    /// 最小可用 PNG（内容与扩展名可不一致，用于「存在但不支持」的场景）。
+    fn tiny_png() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([10, 200, 30]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode tiny png");
+        bytes.into_inner()
+    }
+
     async fn write_test_entry(
         storage: &LocalFilesystemStorageDriver,
         path: &str,
@@ -1647,10 +1676,9 @@ mod tests {
         let state = crate::initialize(&root.path().join("data"), &media_root).await?;
         let storage = state.storage.snapshot().await;
 
-        write_test_entry(&storage, "IMG_20240101_000000.jpg", b"photo").await?;
+        write_test_entry(&storage, "IMG_20240101_000000.jpg", &tiny_jpeg()).await?;
         // 旧版本可能已收录的 AppleDouble 垃圾：本次扫描应对账墓碑。
-        let legacy_junk =
-            write_test_entry(&storage, "._1708264084494.jpg", b"apple-double").await?;
+        let legacy_junk = write_test_entry(&storage, "._1708264084494.jpg", &tiny_jpeg()).await?;
         index_media(&state.db, &storage, &legacy_junk).await?;
         // 新增垃圾：隐藏文件、同步缩略图目录、0 字节文件。
         write_test_entry(&storage, ".DS_Store", b"ds").await?;
@@ -1687,14 +1715,17 @@ mod tests {
         tokio::fs::create_dir_all(&media_root).await?;
         let state = crate::initialize(&root.path().join("data"), &media_root).await?;
         let storage = state.storage.snapshot().await;
-        let heic = write_test_entry(&storage, "IMG_20240102_000000.heic", b"heic-bytes").await?;
-        index_media(&state.db, &storage, &heic).await?;
+        // 上传/旧版本可写入注册表之外的格式；这里用「可用图片 + 未登记扩展名」模拟，
+        // 表示文件确实存在且已入库，只是当前格式不在扫描白名单里。
+        let unsupported =
+            write_test_entry(&storage, "IMG_20240102_000000.tiff", &tiny_png()).await?;
+        index_media(&state.db, &storage, &unsupported).await?;
 
         let summary = scan_directory(&state.db, state.storage.clone(), "scan").await?;
         assert_eq!(summary.skipped_unsupported, 1);
         assert_eq!(summary.discovered, 0);
         let location_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM media_locations WHERE normalized_path = 'IMG_20240102_000000.heic'",
+            "SELECT COUNT(*) FROM media_locations WHERE normalized_path = 'IMG_20240102_000000.tiff'",
         )
         .fetch_one(&state.db)
         .await?;

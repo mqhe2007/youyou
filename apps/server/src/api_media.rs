@@ -825,38 +825,102 @@ pub(crate) async fn media_thumbnail(
     }
 
     let storage = state.storage.snapshot().await;
-    let bytes = if row.is_video == 1 {
-        generate_video_thumbnail(&storage, &row, size).await?
-    } else {
-        let source = storage.read_all(&row.normalized_path, None).await?;
-        let decoded = image::load_from_memory(&source).map_err(|error| {
-            AppError::Internal(anyhow::anyhow!("decode thumbnail source: {error}"))
-        })?;
-        let thumbnail = decoded.thumbnail(size, size);
-        let mut bytes = Cursor::new(Vec::new());
-        thumbnail
-            .write_to(&mut bytes, ImageFormat::Jpeg)
-            .map_err(|error| AppError::Internal(anyhow::anyhow!("encode thumbnail: {error}")))?;
-        bytes.into_inner()
+    let render = render_thumbnail(
+        &storage,
+        &row.id,
+        &row.normalized_path,
+        row.is_video == 1,
+        size,
+    )
+    .await?;
+    let bytes = match render {
+        ThumbnailRender::Rendered(bytes) => {
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            let temporary = cache_dir.join(format!(".{}.tmp-{}", row.id, Uuid::new_v4()));
+            tokio::fs::write(&temporary, &bytes)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            if let Err(error) = tokio::fs::rename(&temporary, &cache_path).await {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(AppError::Internal(error.into()));
+            }
+            bytes
+        }
+        // 占位图不落缓存：文件修复/补上解码器后能自然恢复为真实缩略图。
+        ThumbnailRender::Placeholder(bytes) => bytes,
     };
-
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .map_err(|error| AppError::Internal(error.into()))?;
-    let temporary = cache_dir.join(format!(".{}.tmp-{}", row.id, Uuid::new_v4()));
-    tokio::fs::write(&temporary, &bytes)
-        .await
-        .map_err(|error| AppError::Internal(error.into()))?;
-    if let Err(error) = tokio::fs::rename(&temporary, &cache_path).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(AppError::Internal(error.into()));
-    }
     Ok(image_response(bytes))
+}
+
+/// 缩略图渲染结果：正常渲染进入磁盘缓存，占位图不缓存。
+pub(crate) enum ThumbnailRender {
+    Rendered(Vec<u8>),
+    Placeholder(Vec<u8>),
+}
+
+/// 渲染缩略图。解码失败（文件损坏或缺少解码器）时返回中性占位图并记录告警，
+/// 避免客户端因 500 出现破图（媒体本身仍是已索引状态）。
+pub(crate) async fn render_thumbnail(
+    storage: &LocalFilesystemStorageDriver,
+    media_id: &str,
+    normalized_path: &str,
+    is_video: bool,
+    size: u32,
+) -> AppResult<ThumbnailRender> {
+    if is_video {
+        return match generate_video_thumbnail(storage, normalized_path, size).await {
+            Ok(bytes) => Ok(ThumbnailRender::Rendered(bytes)),
+            Err(error) => {
+                tracing::warn!(
+                    media_id,
+                    path = %normalized_path,
+                    error = ?error,
+                    "video thumbnail unavailable; serving placeholder"
+                );
+                Ok(ThumbnailRender::Placeholder(placeholder_thumbnail(size)?))
+            }
+        };
+    }
+    // 源文件读不到是真实错误（仍报错）；能读到但解不开则给占位图。
+    let source = storage.read_all(normalized_path, None).await?;
+    match image::load_from_memory(&source) {
+        Ok(decoded) => {
+            let thumbnail = decoded.thumbnail(size, size);
+            let mut bytes = Cursor::new(Vec::new());
+            thumbnail
+                .write_to(&mut bytes, ImageFormat::Jpeg)
+                .map_err(|error| {
+                    AppError::Internal(anyhow::anyhow!("encode thumbnail: {error}"))
+                })?;
+            Ok(ThumbnailRender::Rendered(bytes.into_inner()))
+        }
+        Err(error) => {
+            tracing::warn!(
+                media_id,
+                path = %normalized_path,
+                error = %error,
+                "image thumbnail decode failed; serving placeholder"
+            );
+            Ok(ThumbnailRender::Placeholder(placeholder_thumbnail(size)?))
+        }
+    }
+}
+
+/// 中性占位缩略图（浅灰底 JPEG）。
+pub(crate) fn placeholder_thumbnail(size: u32) -> AppResult<Vec<u8>> {
+    let image = image::RgbImage::from_pixel(size, size, image::Rgb([232_u8, 234_u8, 238_u8]));
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, ImageFormat::Jpeg)
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("encode placeholder: {error}")))?;
+    Ok(bytes.into_inner())
 }
 
 pub(crate) async fn generate_video_thumbnail(
     storage: &LocalFilesystemStorageDriver,
-    row: &MediaRow,
+    normalized_path: &str,
     size: u32,
 ) -> AppResult<Vec<u8>> {
     let filter = format!("scale={size}:{size}:force_original_aspect_ratio=decrease");
@@ -864,7 +928,7 @@ pub(crate) async fn generate_video_thumbnail(
         Duration::from_secs(15),
         Command::new("ffmpeg")
             .args(["-v", "error", "-ss", "0", "-i"])
-            .arg(storage.root().join(&row.normalized_path))
+            .arg(storage.root().join(normalized_path))
             .args([
                 "-frames:v",
                 "1",
