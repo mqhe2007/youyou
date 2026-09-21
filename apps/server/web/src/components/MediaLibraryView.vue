@@ -19,6 +19,7 @@ import MediaFolderTree from './MediaFolderTree.vue';
 
 const props = defineProps({
   scanBusy: { type: Boolean, default: false },
+  scanReport: { type: Object, default: null },
   refreshVersion: { type: Number, default: 0 },
   api: {
     type: Object,
@@ -26,7 +27,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['notify', 'session-expired', 'refresh-folder']);
+const emit = defineEmits(['notify', 'session-expired', 'refresh-folder', 'retry-scan']);
 
 const iconStrokeWidth = 1.8;
 const loading = ref(true);
@@ -88,6 +89,11 @@ function refreshFolder(path) {
   if (props.scanBusy || busy.value) return;
   closeContextMenu();
   emit('refresh-folder', path);
+}
+
+function retryFailedItems() {
+  if (!props.scanReport) return;
+  emit('retry-scan', props.scanReport.scopePath || '');
 }
 
 watch(currentPath, () => {
@@ -653,6 +659,52 @@ function contextStyle() {
         <button class="media-crumb" type="button" @click="openPath(crumb.path)">{{ crumb.name }}</button>
       </template>
     </nav>
+
+    <aside v-if="scanReport" class="media-index-report" aria-label="最近扫描索引统计">
+      <div class="media-index-report-title">
+        <div>
+          <strong>最近扫描的索引统计</strong>
+          <p v-if="scanReport.resumedFromJobId">
+            从检查点续跑：此前已处理 {{ scanReport.resumedAtIndexed }} 项，累计 {{ scanReport.indexed }} 项。
+          </p>
+          <p v-else>统计来自最近一次该服务端扫描任务。</p>
+        </div>
+        <button
+          v-if="scanReport.failed || scanReport.skippedFailed || scanReport.failures.length"
+          class="btn btn-outline btn-sm"
+          type="button"
+          :disabled="scanBusy || Boolean(busy)"
+          @click="retryFailedItems"
+        >
+          重试失败项
+        </button>
+      </div>
+      <dl class="media-index-metrics">
+        <div>
+          <dt>未索引</dt>
+          <dd>{{ scanReport.skippedUnsupported }}</dd>
+          <small>不支持格式</small>
+        </div>
+        <div>
+          <dt>已跳过</dt>
+          <dd>{{ scanReport.skippedIgnored }}</dd>
+          <small>垃圾文件或 0 字节</small>
+        </div>
+        <div>
+          <dt>索引失败</dt>
+          <dd>{{ scanReport.failed + scanReport.skippedFailed }}</dd>
+          <small>可重试的内容解析失败</small>
+        </div>
+      </dl>
+      <details v-if="scanReport.failures.length" class="scan-failures">
+        <summary>查看失败原因（{{ scanReport.failures.length }} 项）</summary>
+        <ul>
+          <li v-for="failure in scanReport.failures" :key="failure.path">
+            <code>{{ failure.path }}</code> — {{ failure.reason }}
+          </li>
+        </ul>
+      </details>
+    </aside>
 
     <div v-if="loading" class="media-grid media-grid-loading" aria-label="正在加载媒体库">
       <div v-for="index in 8" :key="index" class="media-tile skeleton"></div>

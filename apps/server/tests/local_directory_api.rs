@@ -1160,6 +1160,147 @@ async fn folder_scan_reconciles_only_the_selected_subtree() {
     assert_eq!(outside_state, "verified");
 }
 
+#[tokio::test]
+async fn cancelled_scan_resumes_from_checkpoint_without_tombstoning_prior_paths() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let album = media.path().join("album");
+    tokio::fs::create_dir_all(&album)
+        .await
+        .expect("album directory");
+    tokio::fs::write(album.join("a.jpg"), photo_bytes(b"already-indexed"))
+        .await
+        .expect("first photo");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    // `a.jpg` 是取消前已经完成的条目。续跑必须从 b/c 开始，而不是重新遍历它。
+    youyou_server::scan::scan_directory(&state.db, state.storage.clone(), "initial-scan")
+        .await
+        .expect("initial scan");
+    let first_media_id = sqlx::query_scalar::<_, String>(
+        "SELECT a.id FROM media_assets a INNER JOIN media_locations l ON l.media_asset_id = a.id WHERE l.normalized_path = 'album/a.jpg'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("first media id");
+
+    tokio::fs::write(album.join("b.jpg"), photo_bytes(b"resume-b"))
+        .await
+        .expect("second photo");
+    tokio::fs::write(album.join("c.jpg"), photo_bytes(b"resume-c"))
+        .await
+        .expect("third photo");
+
+    let source_job_id = Uuid::new_v4().to_string();
+    let now = youyou_server::db::now_millis();
+    let interrupted_checkpoint = serde_json::json!({
+        "version": 2,
+        "kind": "scan",
+        "scopePath": "album",
+        "retryFailed": false,
+        "phase": "interrupted",
+        "discovered": 1,
+        "indexed": 1,
+        "failed": 0,
+        "skippedUnsupported": 0,
+        "skippedIgnored": 0,
+        "skippedFailed": 0,
+        "retried": 0,
+        "failures": [],
+        "resume": {
+            "currentDirectory": "album",
+            "lastEntryName": "a.jpg",
+            "pendingDirectories": []
+        }
+    });
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, status, current, total, checkpoint, created_at, updated_at, finished_at) VALUES (?1, 'scan', 'cancelled', 1, 1, ?2, ?3, ?3, ?3)",
+    )
+    .bind(&source_job_id)
+    .bind(interrupted_checkpoint.to_string())
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .expect("persist cancelled scan");
+
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token) = establish_admin(&app, setup_token.trim()).await;
+    let response = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan?path=album",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("scan response body");
+    let new_job_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .expect("scan response json")["id"]
+        .as_str()
+        .expect("new scan job id")
+        .to_owned();
+
+    let settled = wait_admin_job(&app, &admin_token, &new_job_id).await;
+    assert_eq!(settled["status"], "succeeded");
+    assert_eq!(settled["checkpoint"]["phase"], "completed");
+    assert_eq!(settled["checkpoint"]["resumedFromJobId"], source_job_id);
+    assert_eq!(settled["checkpoint"]["resumedAtIndexed"], 1);
+    assert_eq!(settled["checkpoint"]["indexed"], 3);
+    assert_eq!(settled["checkpoint"]["discovered"], 3);
+
+    let indexed_paths = sqlx::query_scalar::<_, String>(
+        "SELECT normalized_path FROM media_locations WHERE storage_id = 'local' AND hash_state = 'verified' ORDER BY normalized_path",
+    )
+    .fetch_all(&state.db)
+    .await
+    .expect("indexed paths");
+    assert_eq!(
+        indexed_paths,
+        vec!["album/a.jpg", "album/b.jpg", "album/c.jpg"]
+    );
+    let first_state =
+        sqlx::query_scalar::<_, String>("SELECT identity_state FROM media_assets WHERE id = ?1")
+            .bind(&first_media_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("prior media state");
+    assert_eq!(first_state, "verified", "续跑对账不得误墓碑取消前的路径");
+
+    // 已完成的续跑成为最新记录后，下一次普通刷新必须从头扫描，不能反复复用
+    // 更早已取消任务的游标。
+    let fresh = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan?path=album",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(fresh.status(), StatusCode::ACCEPTED);
+    let fresh_body = to_bytes(fresh.into_body(), usize::MAX)
+        .await
+        .expect("fresh scan response body");
+    let fresh_job_id = serde_json::from_slice::<serde_json::Value>(&fresh_body)
+        .expect("fresh scan response json")["id"]
+        .as_str()
+        .expect("fresh scan job id")
+        .to_owned();
+    let fresh_settled = wait_admin_job(&app, &admin_token, &fresh_job_id).await;
+    assert_eq!(fresh_settled["status"], "succeeded");
+    assert!(
+        fresh_settled["checkpoint"]["resumedFromJobId"].is_null(),
+        "已完成的续跑不能让后续普通扫描继续沿用过期游标"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn scan_skips_internal_symlink_cycles() {

@@ -3162,3 +3162,61 @@ a {
 .scan-retry {
   margin-top: 0.25rem;
 }
+
+/* 媒体库沿用任务检查点的同一份统计，避免把未索引文件伪装成媒体条目。 */
+.media-index-report {
+  margin: 0 0 1.25rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border, #dedbd5);
+  border-radius: 0.75rem;
+  background: var(--color-surface, #fff);
+}
+
+.media-index-report-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+}
+
+.media-index-report-title p {
+  margin: 0.2rem 0 0;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 0.82rem;
+}
+
+.media-index-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0.9rem 0 0;
+}
+
+.media-index-metrics > div {
+  padding: 0.7rem;
+  border-radius: 0.5rem;
+  background: var(--color-surface-muted, #f7f6f3);
+}
+
+.media-index-metrics dt,
+.media-index-metrics small {
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 0.76rem;
+}
+
+.media-index-metrics dd {
+  margin: 0.2rem 0;
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+@media (max-width: 640px) {
+  .media-index-report-title {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .media-index-metrics {
+    grid-template-columns: 1fr;
+  }
+}

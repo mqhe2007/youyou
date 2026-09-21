@@ -197,24 +197,43 @@ export function jobMessage(job) {
 // 扫描作业的跳过/失败明细（来自作业检查点；运行中的扫描还没有终态明细）。
 export function jobScanReport(job) {
   const checkpoint = job?.checkpoint;
-  if (!checkpoint || checkpoint.kind !== 'scan' || checkpoint.phase !== 'completed') return null;
+  if (!checkpoint || checkpoint.kind !== 'scan' || !['completed', 'interrupted'].includes(checkpoint.phase)) return null;
   const failures = Array.isArray(checkpoint.failures) ? checkpoint.failures : [];
   const skippedUnsupported = Number(checkpoint.skippedUnsupported || 0);
   const skippedIgnored = Number(checkpoint.skippedIgnored || 0);
   const skippedFailed = Number(checkpoint.skippedFailed || 0);
   const retried = Number(checkpoint.retried || 0);
-  if (!failures.length && !skippedUnsupported && !skippedIgnored && !skippedFailed && !retried) {
+  const failed = Number(checkpoint.failed || 0);
+  const resumedFromJobId = checkpoint.resumedFromJobId || null;
+  if (!failures.length && !failed && !skippedUnsupported && !skippedIgnored && !skippedFailed && !retried && !resumedFromJobId) {
     return null;
   }
-  return { failures, skippedUnsupported, skippedIgnored, skippedFailed, retried };
+  return {
+    failures,
+    failed,
+    skippedUnsupported,
+    skippedIgnored,
+    skippedFailed,
+    retried,
+    scopePath: checkpoint.scopePath || '',
+    resumedFromJobId,
+    resumedAtDiscovered: Number(checkpoint.resumedAtDiscovered || 0),
+    resumedAtIndexed: Number(checkpoint.resumedAtIndexed || 0),
+    discovered: Number(checkpoint.discovered || 0),
+    indexed: Number(checkpoint.indexed || 0),
+  };
 }
 
 export function jobScanSkipSummary(report) {
   if (!report) return '';
   const parts = [];
+  if (report.resumedFromJobId) {
+    parts.push(`检查点续跑：此前已处理 ${formatNumber(report.resumedAtIndexed)} 项，累计 ${formatNumber(report.indexed)} 项`);
+  }
   if (report.skippedUnsupported) parts.push(`不支持格式 ${formatNumber(report.skippedUnsupported)}`);
   if (report.skippedIgnored) parts.push(`垃圾文件 ${formatNumber(report.skippedIgnored)}`);
   if (report.skippedFailed) parts.push(`已知失败 ${formatNumber(report.skippedFailed)}`);
+  if (report.failed) parts.push(`本次失败 ${formatNumber(report.failed)}`);
   if (report.retried) parts.push(`锁竞争重试 ${formatNumber(report.retried)}`);
   return parts.join(' · ');
 }

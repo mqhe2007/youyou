@@ -75,13 +75,7 @@ pub(crate) async fn start_scan(
             "scan path must be a directory".to_owned(),
         ));
     }
-    let checkpoint = serde_json::json!({
-        "version": 1,
-        "kind": "scan",
-        "scopePath": path,
-        "retryFailed": query.retry_failed.unwrap_or(false),
-    })
-    .to_string();
+    let retry_failed = query.retry_failed.unwrap_or(false);
 
     let scan_active = sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind = 'scan' AND status IN ('queued', 'running', 'interrupted'))",
@@ -93,6 +87,43 @@ pub(crate) async fn start_scan(
             "a scan job is already queued or running".to_owned(),
         ));
     }
+    // 点击同一范围的「刷新」时优先续跑最近一次已取消扫描。取消任务本身仍保留在
+    // 日志中；新任务携带它的游标和累计统计，便于审计前后处理数。
+    let resumed_from = latest_cancelled_scan_checkpoint(&state.db, &path).await?;
+    let mut checkpoint = serde_json::json!({
+        "version": 2,
+        "kind": "scan",
+        "scopePath": path,
+        "retryFailed": retry_failed,
+        "phase": "queued",
+    });
+    if let Some((source_job_id, previous)) = resumed_from {
+        checkpoint["resumedFromJobId"] = serde_json::json!(source_job_id);
+        checkpoint["resumedAtDiscovered"] = previous
+            .get("discovered")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0));
+        checkpoint["resumedAtIndexed"] = previous
+            .get("indexed")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0));
+        for key in [
+            "resume",
+            "discovered",
+            "indexed",
+            "failed",
+            "skippedUnsupported",
+            "skippedIgnored",
+            "skippedFailed",
+            "retried",
+            "failures",
+        ] {
+            if let Some(value) = previous.get(key) {
+                checkpoint[key] = value.clone();
+            }
+        }
+    }
+    let checkpoint = checkpoint.to_string();
     let id = Uuid::new_v4().to_string();
     let now = now_millis();
     let insert_result = sqlx::query(
@@ -124,6 +155,34 @@ pub(crate) async fn start_scan(
                 .await?,
         )),
     ))
+}
+
+/// 找到同一范围最后一次由用户取消、且已落下目录游标的扫描。完成/失败任务以及旧版
+/// lastPath 检查点都不会被当成续跑来源，避免意外跳过文件。
+async fn latest_cancelled_scan_checkpoint(
+    pool: &SqlitePool,
+    scope_path: &str,
+) -> Result<Option<(String, Value)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, status, checkpoint FROM jobs WHERE kind = 'scan' AND checkpoint IS NOT NULL ORDER BY created_at DESC LIMIT 40",
+    )
+    .fetch_all(pool)
+    .await?;
+    // 只考察这个范围的最新扫描：若一次续跑已经完成，不能在之后的普通刷新中
+    // 又拾起更早的 cancelled checkpoint，造成永久跳过旧前缀。
+    for (id, status, checkpoint) in rows {
+        let Ok(value) = serde_json::from_str::<Value>(&checkpoint) else {
+            continue;
+        };
+        if value.get("scopePath").and_then(Value::as_str) != Some(scope_path) {
+            continue;
+        }
+        return Ok((status == "cancelled"
+            && value.get("phase").and_then(Value::as_str) == Some("interrupted")
+            && value.get("resume").is_some())
+        .then_some((id, value)));
+    }
+    Ok(None)
 }
 
 pub(crate) async fn run_scan_job(

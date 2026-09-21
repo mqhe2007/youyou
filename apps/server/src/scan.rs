@@ -3,7 +3,7 @@ use std::{collections::HashSet, io::Cursor, sync::Arc, time::Instant};
 use anyhow::Context;
 use futures_util::StreamExt;
 use image::ImageReader;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::{
     process::Command,
@@ -20,13 +20,17 @@ use crate::{
 
 /// 进度落库节流间隔：每文件一次 UPDATE 会与客户端写入争抢写锁。
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(1000);
+/// 即使扫描极快，也至少每 50 个目录项保存一次可恢复的游标。
+/// 这沿用 P0 的写入节流上限，不会为每个媒体文件额外写一行 job。
+const PROGRESS_UPDATE_ENTRY_INTERVAL: u64 = 50;
 /// 单文件索引的写锁重试退避（SQLITE_BUSY 类错误）。
 const INDEX_RETRY_BACKOFF_MS: [u64; 3] = [50, 150, 400];
 /// 作业检查点里保留的失败明细上限（避免长目录把 checkpoint 撑大）。
 const MAX_RECORDED_FAILURES: usize = 100;
 const MAX_FAILURE_REASON_CHARS: usize = 300;
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanSummary {
     pub discovered: u64,
     pub indexed: u64,
@@ -43,10 +47,29 @@ pub struct ScanSummary {
     pub cancelled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanFailure {
     pub path: String,
     pub reason: String,
+}
+
+/// 可持久化的目录遍历游标。`pending_directories` 按栈顺序保存，恢复时先回到
+/// `current_directory` 并跳过已处理的条目，再按原有的深度优先顺序继续。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanCursor {
+    current_directory: Option<String>,
+    last_entry_name: Option<String>,
+    #[serde(default)]
+    pending_directories: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScanResumeMetadata {
+    source_job_id: String,
+    discovered: u64,
+    indexed: u64,
 }
 
 impl ScanSummary {
@@ -274,7 +297,6 @@ pub(crate) async fn scan_directory_with_lease(
     job_id: &str,
     lease_owner: Option<&str>,
 ) -> anyhow::Result<ScanSummary> {
-    let mut summary = ScanSummary::default();
     let checkpoint =
         sqlx::query_scalar::<_, Option<String>>("SELECT checkpoint FROM jobs WHERE id = ?1")
             .bind(job_id)
@@ -296,71 +318,168 @@ pub(crate) async fn scan_directory_with_lease(
         .and_then(|value| value.get("retryFailed"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let mut directories = vec![scope_path.clone()];
+    let resume_cursor = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("resume"))
+        .and_then(|value| serde_json::from_value::<ScanCursor>(value.clone()).ok());
+    let resume_metadata = checkpoint.as_ref().and_then(|value| {
+        Some(ScanResumeMetadata {
+            source_job_id: value.get("resumedFromJobId")?.as_str()?.to_owned(),
+            discovered: value
+                .get("resumedAtDiscovered")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            indexed: value
+                .get("resumedAtIndexed")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+        })
+    });
+    // 只有携带游标的检查点才代表一次真正的续跑；普通运行中的检查点不能把
+    // 历史统计带进新扫描。
+    let resumed = resume_cursor.is_some();
+    let mut summary = if resumed {
+        scan_summary_from_checkpoint(checkpoint.as_ref())
+    } else {
+        ScanSummary::default()
+    };
+    let mut directories = match resume_cursor.as_ref() {
+        Some(cursor) => {
+            let mut pending = cursor.pending_directories.clone();
+            if let Some(current) = &cursor.current_directory {
+                pending.push(current.clone());
+            }
+            pending
+        }
+        None => vec![scope_path.clone()],
+    };
     let mut seen_directories = HashSet::new();
     let mut seen_paths = HashSet::new();
     let mut last_path: Option<String> = None;
     let mut last_progress_at = Instant::now();
+    let mut entries_since_progress = 0_u64;
+    let mut cursor_to_resume = resume_cursor;
 
     while let Some(directory) = directories.pop() {
         if is_cancel_requested(pool, job_id).await? {
+            let cursor = ScanCursor {
+                current_directory: None,
+                last_entry_name: None,
+                pending_directories: directories.clone(),
+            };
+            save_interrupted_checkpoint(
+                pool,
+                job_id,
+                &scope_path,
+                retry_failed,
+                &summary,
+                &cursor,
+                last_path.as_deref(),
+                resume_metadata.as_ref(),
+                lease_owner,
+            )
+            .await?;
             summary.cancelled = true;
             return Ok(summary);
         }
         if !seen_directories.insert(directory.clone()) {
             continue;
         }
-        let mut entries = storage
-            .list(&directory)
+        let entries = sorted_entries(&storage, &directory)
             .await
-            .with_context(|| format!("list directory {directory:?}"))?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-            if entry.is_directory {
-                // 垃圾目录（.Trash/@eaDir/__MACOSX 等）不遍历；库内历史条目由对账清理。
-                if !is_ignored_name(&entry.name) {
-                    directories.push(entry.path);
-                }
-                continue;
-            }
-            if is_ignored_name(&entry.name) || entry.size == Some(0) {
-                summary.skipped_ignored += 1;
-                continue;
-            }
-            // 文件确实存在：先登记，保证对账不会把「存在但暂不支持索引」的媒体
-            // 误判为已移除（例如上传入库的 HEIC）。
-            seen_paths.insert(entry.path.clone());
-            if !is_supported_media(&entry) {
-                summary.skipped_unsupported += 1;
-                continue;
-            }
+            // 作业终态会把 `Error::to_string()` 持久化为 lastError；把完整错误链
+            // 展开到顶层，既保留目录上下文，也保留诸如 symlink escape 的原因。
+            .map_err(|error| anyhow::anyhow!("list directory {directory:?}: {error:#}"))?;
+        let resume_entry_name = cursor_to_resume
+            .as_ref()
+            .filter(|cursor| cursor.current_directory.as_deref() == Some(directory.as_str()))
+            .and_then(|cursor| cursor.last_entry_name.clone());
+        let mut last_entry_name = resume_entry_name.clone();
 
+        for entry in entries {
+            // 恢复到同一目录时，仅跳过已经处理并落到检查点的前缀。排序保证
+            // 这个比较跨进程重启仍是确定的；子目录已在 pending 栈中，无需重走。
+            if resume_entry_name
+                .as_ref()
+                .is_some_and(|last| entry.name <= *last)
+            {
+                continue;
+            }
             if is_cancel_requested(pool, job_id).await? {
+                let cursor = ScanCursor {
+                    current_directory: Some(directory.clone()),
+                    last_entry_name,
+                    pending_directories: directories.clone(),
+                };
+                save_interrupted_checkpoint(
+                    pool,
+                    job_id,
+                    &scope_path,
+                    retry_failed,
+                    &summary,
+                    &cursor,
+                    last_path.as_deref(),
+                    resume_metadata.as_ref(),
+                    lease_owner,
+                )
+                .await?;
                 summary.cancelled = true;
                 return Ok(summary);
             }
-            if !retry_failed && is_unchanged_terminal_failure(pool, &entry).await? {
-                summary.skipped_failed += 1;
-                continue;
-            }
-            summary.discovered += 1;
-            match index_with_retry(pool, &storage, &entry, &mut summary).await {
-                Ok(()) => summary.indexed += 1,
-                Err(error) => {
-                    summary.failed += 1;
-                    tracing::warn!(
-                        job_id,
-                        path = %entry.path,
-                        error = ?error,
-                        "failed to index media"
-                    );
-                    summary.record_failure(&entry.path, &error);
+            if entry.is_directory {
+                // 垃圾目录（.Trash/@eaDir/__MACOSX 等）不遍历；库内历史条目由对账清理。
+                if !is_ignored_name(&entry.name) {
+                    directories.push(entry.path.clone());
+                }
+            } else if is_ignored_name(&entry.name) || entry.size == Some(0) {
+                summary.skipped_ignored += 1;
+            } else {
+                // 文件确实存在：先登记，保证对账不会把「存在但暂不支持索引」的媒体
+                // 误判为已移除（例如上传入库的 HEIC）。
+                seen_paths.insert(entry.path.clone());
+                if !is_supported_media(&entry) {
+                    summary.skipped_unsupported += 1;
+                } else if !retry_failed && is_unchanged_terminal_failure(pool, &entry).await? {
+                    summary.skipped_failed += 1;
+                } else {
+                    summary.discovered += 1;
+                    match index_with_retry(pool, &storage, &entry, &mut summary).await {
+                        Ok(()) => summary.indexed += 1,
+                        Err(error) => {
+                            summary.failed += 1;
+                            tracing::warn!(
+                                job_id,
+                                path = %entry.path,
+                                error = ?error,
+                                "failed to index media"
+                            );
+                            summary.record_failure(&entry.path, &error);
+                        }
+                    }
                 }
             }
+            last_entry_name = Some(entry.name);
             last_path = Some(entry.path.clone());
-            if last_progress_at.elapsed() >= PROGRESS_UPDATE_INTERVAL {
-                let checkpoint = scan_checkpoint(&scope_path, last_path.as_deref(), None);
+            entries_since_progress += 1;
+            if last_progress_at.elapsed() >= PROGRESS_UPDATE_INTERVAL
+                || entries_since_progress >= PROGRESS_UPDATE_ENTRY_INTERVAL
+            {
+                let cursor = ScanCursor {
+                    current_directory: Some(directory.clone()),
+                    last_entry_name: last_entry_name.clone(),
+                    pending_directories: directories.clone(),
+                };
+                let checkpoint = scan_checkpoint(
+                    &scope_path,
+                    retry_failed,
+                    "running",
+                    &summary,
+                    Some(&cursor),
+                    last_path.as_deref(),
+                    resume_metadata.as_ref(),
+                );
                 last_progress_at = Instant::now();
+                entries_since_progress = 0;
                 let progress_saved = update_scan_progress(
                     pool,
                     job_id,
@@ -376,14 +495,41 @@ pub(crate) async fn scan_directory_with_lease(
                 }
             }
         }
+        // 首次恢复所在的目录已处理完；后续目录不能继续使用其 entry 游标。
+        cursor_to_resume = None;
     }
 
     if is_cancel_requested(pool, job_id).await? {
+        let cursor = ScanCursor {
+            current_directory: None,
+            last_entry_name: None,
+            pending_directories: Vec::new(),
+        };
+        save_interrupted_checkpoint(
+            pool,
+            job_id,
+            &scope_path,
+            retry_failed,
+            &summary,
+            &cursor,
+            last_path.as_deref(),
+            resume_metadata.as_ref(),
+            lease_owner,
+        )
+        .await?;
         summary.cancelled = true;
         return Ok(summary);
     }
     // 收尾前落一次最终进度：节流窗口内的计数与 lastPath 不能丢。
-    let final_progress = scan_checkpoint(&scope_path, last_path.as_deref(), None);
+    let final_progress = scan_checkpoint(
+        &scope_path,
+        retry_failed,
+        "running",
+        &summary,
+        None,
+        last_path.as_deref(),
+        resume_metadata.as_ref(),
+    );
     let progress_saved = update_scan_progress(
         pool,
         job_id,
@@ -396,9 +542,24 @@ pub(crate) async fn scan_directory_with_lease(
     if lease_owner.is_some() && !progress_saved {
         return Err(anyhow::anyhow!("scan job lease was lost"));
     }
-    reconcile_missing_locations(pool, &seen_paths, &scope_path).await?;
+    // 续跑时内存里只保留本段已走过的路径。对账前无哈希地重收集整个范围，
+    // 避免把取消前已处理、恢复后未再次枚举的路径误判为缺失。
+    let reconciliation_paths = if resumed {
+        collect_reconciliation_paths(&storage, &scope_path).await?
+    } else {
+        seen_paths
+    };
+    reconcile_missing_locations(pool, &reconciliation_paths, &scope_path).await?;
     if let Some(lease_owner) = lease_owner {
-        let checkpoint = scan_checkpoint(&scope_path, last_path.as_deref(), Some(&summary));
+        let checkpoint = scan_checkpoint(
+            &scope_path,
+            retry_failed,
+            "completed",
+            &summary,
+            None,
+            last_path.as_deref(),
+            resume_metadata.as_ref(),
+        );
         if !update_scan_checkpoint(pool, job_id, &checkpoint, lease_owner).await? {
             return Err(anyhow::anyhow!("scan job lease was lost"));
         }
@@ -406,27 +567,161 @@ pub(crate) async fn scan_directory_with_lease(
     Ok(summary)
 }
 
-/// 扫描检查点 JSON：进度阶段只带 lastPath，完成阶段带跳过/失败明细。
+async fn sorted_entries(
+    storage: &LocalFilesystemStorageDriver,
+    directory: &str,
+) -> anyhow::Result<Vec<StorageEntry>> {
+    let mut stream = storage.list(directory).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        entries.push(entry?);
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+/// 扫描恢复后用于最终对账的轻量遍历：只识别「仍存在且不是垃圾」的路径，
+/// 从不读取内容、不提取元数据、不计算哈希。
+async fn collect_reconciliation_paths(
+    storage: &LocalFilesystemStorageDriver,
+    scope_path: &str,
+) -> anyhow::Result<HashSet<String>> {
+    let mut directories = vec![scope_path.to_owned()];
+    let mut seen_directories = HashSet::new();
+    let mut paths = HashSet::new();
+    while let Some(directory) = directories.pop() {
+        if !seen_directories.insert(directory.clone()) {
+            continue;
+        }
+        for entry in sorted_entries(storage, &directory)
+            .await
+            .with_context(|| format!("list directory {directory:?} for reconciliation"))?
+        {
+            if entry.is_directory {
+                if !is_ignored_name(&entry.name) {
+                    directories.push(entry.path);
+                }
+            } else if !is_ignored_name(&entry.name) && entry.size != Some(0) {
+                paths.insert(entry.path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn scan_summary_from_checkpoint(checkpoint: Option<&serde_json::Value>) -> ScanSummary {
+    let Some(value) = checkpoint else {
+        return ScanSummary::default();
+    };
+    ScanSummary {
+        discovered: value
+            .get("discovered")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        indexed: value
+            .get("indexed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        failed: value
+            .get("failed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        skipped_unsupported: value
+            .get("skippedUnsupported")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        skipped_ignored: value
+            .get("skippedIgnored")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        skipped_failed: value
+            .get("skippedFailed")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        retried: value
+            .get("retried")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        failures: value
+            .get("failures")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        cancelled: false,
+    }
+}
+
+async fn save_interrupted_checkpoint(
+    pool: &SqlitePool,
+    job_id: &str,
+    scope_path: &str,
+    retry_failed: bool,
+    summary: &ScanSummary,
+    cursor: &ScanCursor,
+    last_path: Option<&str>,
+    resume_metadata: Option<&ScanResumeMetadata>,
+    lease_owner: Option<&str>,
+) -> anyhow::Result<()> {
+    let checkpoint = scan_checkpoint(
+        scope_path,
+        retry_failed,
+        "interrupted",
+        summary,
+        Some(cursor),
+        last_path,
+        resume_metadata,
+    );
+    let saved = update_scan_progress(
+        pool,
+        job_id,
+        summary.discovered,
+        summary.indexed,
+        &checkpoint,
+        lease_owner,
+    )
+    .await?;
+    if lease_owner.is_some() && !saved {
+        anyhow::bail!("scan job lease was lost");
+    }
+    Ok(())
+}
+
+/// 扫描检查点 JSON：运行/取消阶段带可恢复的目录游标，完成阶段带分类统计与失败明细。
 fn scan_checkpoint(
     scope_path: &str,
+    retry_failed: bool,
+    phase: &str,
+    summary: &ScanSummary,
+    cursor: Option<&ScanCursor>,
     last_path: Option<&str>,
-    summary: Option<&ScanSummary>,
+    resume_metadata: Option<&ScanResumeMetadata>,
 ) -> String {
     let mut value = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "kind": "scan",
         "scopePath": scope_path,
+        "retryFailed": retry_failed,
+        "phase": phase,
+        "discovered": summary.discovered,
+        "indexed": summary.indexed,
+        "failed": summary.failed,
+        "skippedUnsupported": summary.skipped_unsupported,
+        "skippedIgnored": summary.skipped_ignored,
+        "skippedFailed": summary.skipped_failed,
+        "retried": summary.retried,
+        "failures": summary.failures,
     });
-    if let Some(summary) = summary {
-        value["phase"] = serde_json::json!("completed");
-        value["discovered"] = serde_json::json!(summary.discovered);
-        value["indexed"] = serde_json::json!(summary.indexed);
-        value["failed"] = serde_json::json!(summary.failed);
-        value["skippedUnsupported"] = serde_json::json!(summary.skipped_unsupported);
-        value["skippedIgnored"] = serde_json::json!(summary.skipped_ignored);
-        value["skippedFailed"] = serde_json::json!(summary.skipped_failed);
-        value["retried"] = serde_json::json!(summary.retried);
-        value["failures"] = serde_json::json!(summary.failures);
+    if let Some(cursor) = cursor {
+        value["resume"] = serde_json::json!(cursor);
+    }
+    if let Some(metadata) = resume_metadata {
+        value["resumedFromJobId"] = serde_json::json!(metadata.source_job_id);
+        value["resumedAtDiscovered"] = serde_json::json!(metadata.discovered);
+        value["resumedAtIndexed"] = serde_json::json!(metadata.indexed);
     }
     if let Some(last_path) = last_path {
         value["lastPath"] = serde_json::json!(last_path);

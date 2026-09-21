@@ -15,7 +15,7 @@ import {
   X,
 } from '@lucide/vue';
 import { getApiErrorMessage } from '../api';
-import { isActiveJob, isTerminalJob } from '../utils/formatters';
+import { isActiveJob, isTerminalJob, jobScanReport } from '../utils/formatters';
 import DashboardHome from './DashboardHome.vue';
 import MediaLibraryView from './MediaLibraryView.vue';
 import LogsView from './LogsView.vue';
@@ -65,6 +65,10 @@ const activeNavigation = computed(
 
 const activeJobs = computed(() =>
   (jobs.value.items || []).filter((job) => isActiveJob(job)),
+);
+
+const latestScanReport = computed(() =>
+  (jobs.value.items || []).find((job) => job.kind === 'scan' && jobScanReport(job)) || null,
 );
 
 function notify(message, type = 'info') {
@@ -218,8 +222,10 @@ async function startScan(path = '', options = {}) {
   }
 }
 
-function retryFailedScan(job) {
-  const scopePath = job?.checkpoint?.scopePath || '';
+function retryFailedScan(jobOrPath) {
+  const scopePath = typeof jobOrPath === 'string'
+    ? jobOrPath
+    : jobOrPath?.checkpoint?.scopePath || '';
   startScan(scopePath, { retryFailed: true });
 }
 
@@ -474,8 +480,10 @@ onUnmounted(() => {
             v-else-if="activeSection === 'storage'"
             :api="api"
             :scan-busy="actionBusy === 'scan-start' || activeJobs.some((job) => job.kind === 'scan')"
+            :scan-report="latestScanReport ? jobScanReport(latestScanReport) : null"
             :refresh-version="libraryRevision"
             @refresh-folder="startScan"
+            @retry-scan="retryFailedScan"
             @notify="(message, type) => notify(message, type)"
             @session-expired="emit('session-expired')"
           />
