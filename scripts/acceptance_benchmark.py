@@ -137,13 +137,18 @@ def populate_media(database: Path, owner_user_id: int) -> None:
                 """,
                 content_rows,
             )
+            # 合成媒体直接登记为「当前时间策略已生效」（time_version=1）：基准只度量
+            # bootstrap 与规模，不应触发历史回填；否则回填完成后会调度核验扫描，而合成
+            # 数据没有对应的磁盘文件，扫描对账会把 10 万条位置一次性删除/墓碑（单个大
+            # 事务长时间占用写锁），既不是基准要测的路径，也会让 bootstrap 启动超时。
+            # 回填本身的性能由 scripts/media_time_backfill_probe.sh 单独度量。
             connection.executemany(
                 """
                 INSERT INTO media_assets
                     (id, blob_id, identity_state, name, mime_type, is_video,
                      version, created_at, updated_at, sort_at, owner_user_id,
-                     is_favorite)
-                VALUES (?, ?, 'verified', ?, ?, 0, 1, ?, ?, ?, ?, 0)
+                     is_favorite, time_version)
+                VALUES (?, ?, 'verified', ?, ?, 0, 1, ?, ?, ?, ?, 0, 1)
                 """,
                 [
                     (row[0], row[1], row[2], row[3], row[5], row[5], row[5], row[4])
