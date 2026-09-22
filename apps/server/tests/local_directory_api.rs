@@ -1064,6 +1064,11 @@ async fn folder_scan_reconciles_only_the_selected_subtree() {
     )
     .await
     .expect("selected photo");
+    // 范围内保留一个存在的文件：本轮文件夹扫描不是「0 发现」，否则空卷保护会跳过
+    // 对账（见 scan.rs 的 RECONCILE 空范围保护）；本用例验证的是作用域隔离。
+    tokio::fs::write(media.path().join("selected/kept.jpg"), photo_bytes(b"kept"))
+        .await
+        .expect("kept photo");
     tokio::fs::write(
         media.path().join("selected-sibling/outside.jpg"),
         photo_bytes(b"outside"),
@@ -1480,6 +1485,11 @@ async fn full_scan_tombstones_media_removed_from_local_directory() {
     tokio::fs::write(&photo_path, photo_bytes(b"abcdef"))
         .await
         .expect("photo");
+    // 范围内保留一个存在的文件：本轮扫描不是「0 发现」，否则空卷保护会跳过对账
+    // （见 scan.rs 的 RECONCILE 空范围保护）。
+    tokio::fs::write(library.join("kept.jpg"), photo_bytes(b"kept"))
+        .await
+        .expect("kept photo");
 
     let state = initialize(data.path(), media.path()).await.expect("state");
     let now0 = youyou_server::db::now_millis();
@@ -1500,7 +1510,7 @@ async fn full_scan_tombstones_media_removed_from_local_directory() {
     .await
     .expect("bind library");
     let media_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM media_assets WHERE identity_state = 'verified'",
+        "SELECT media_asset_id FROM media_locations WHERE normalized_path = 'library/photo.jpg'",
     )
     .fetch_one(&state.db)
     .await

@@ -729,6 +729,15 @@ fn scan_checkpoint(
     value.to_string()
 }
 
+/// 对账分批大小：每批一个短事务提交，避免单个大事务长时间独占写锁——10 万条缺失
+/// 位置时原实现占锁 14s 以上，写请求等满 busy_timeout 后失败（缺陷 usKyTJguvfSX）。
+/// 批越大单次持锁越久但提交开销越省；2000 行（release 约 140ms/批）在两者间折中。
+const RECONCILE_BATCH_SIZE: usize = 2000;
+/// 批间让出窗口：批次连续提交时，等待写锁的请求会一次次输给立即重抢的下一批。
+/// SQLite 忙等退避最长约 100ms，让出窗口必须不小于它才能给出确定的等待上界
+/// （实测 50ms 时写者仍被饿住 1.6s，100ms 时上界降到约 0.4s）。
+const RECONCILE_BATCH_YIELD: Duration = Duration::from_millis(100);
+
 async fn reconcile_missing_locations(
     pool: &SqlitePool,
     seen_paths: &HashSet<String>,
@@ -743,72 +752,89 @@ async fn reconcile_missing_locations(
             .await?
             .into_iter()
             .collect::<HashSet<String>>();
-    let locations = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, media_asset_id FROM media_locations WHERE storage_id = 'local'",
+    // 一次取全（含路径）：原实现循环内逐行回查 normalized_path，10 万行就是 10 万次
+    // 额外查询，既慢又把写事务拖长。
+    let locations = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, media_asset_id, normalized_path FROM media_locations WHERE storage_id = 'local'",
     )
     .fetch_all(pool)
     .await?;
-    let mut transaction = begin_write(pool).await?;
-    let revision = sync::allocate_revision(&mut transaction).await?;
-    for (location_id, media_asset_id) in locations {
-        let path = sqlx::query_scalar::<_, String>(
-            "SELECT normalized_path FROM media_locations WHERE id = ?1",
-        )
-        .bind(&location_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(path) = path else {
-            continue;
-        };
-        if (!scope_path.is_empty() && !path.starts_with(&scope_prefix))
-            || seen_paths.contains(&path)
-            || pending_paths.contains(&path)
-        {
-            continue;
-        }
-        sqlx::query("DELETE FROM media_locations WHERE id = ?1")
-            .bind(&location_id)
-            .execute(&mut *transaction)
-            .await?;
-        let remaining = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM media_locations WHERE media_asset_id = ?1",
-        )
-        .bind(&media_asset_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if remaining != 0 {
-            continue;
-        }
-        metadata::tombstone_media_tx(
-            &mut transaction,
-            &media_asset_id,
-            "source_missing",
-            now_millis(),
-            revision,
-        )
-        .await?;
+    let missing = locations
+        .iter()
+        .filter(|(_, _, path)| {
+            (scope_path.is_empty() || path.starts_with(&scope_prefix))
+                && !seen_paths.contains(path)
+                && !pending_paths.contains(path)
+        })
+        .collect::<Vec<_>>();
+    // 保护：这个范围里一个存在的文件都没枚举到，却要把范围内位置全部判为缺失——
+    // 更像挂载丢失/空卷而不是真实删除。跳过本轮对账并把原因写进日志，避免把全库
+    // 墓碑同步给客户端（客户端会据此真删本机原件）。
+    if seen_paths.is_empty() && !missing.is_empty() {
+        tracing::warn!(
+            scope = scope_path,
+            locations = missing.len(),
+            "scan found no files in scope; skipping missing-location reconciliation"
+        );
+        return Ok(());
     }
-    // 已消失文件的失败记录一并清理：文件回来时会重新走一次索引。
+    for batch in missing.chunks(RECONCILE_BATCH_SIZE) {
+        let mut transaction = begin_write(pool).await?;
+        let revision = sync::allocate_revision(&mut transaction).await?;
+        for entry in batch {
+            let (location_id, media_asset_id, _) = *entry;
+            sqlx::query("DELETE FROM media_locations WHERE id = ?1")
+                .bind(location_id)
+                .execute(&mut *transaction)
+                .await?;
+            let remaining = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_locations WHERE media_asset_id = ?1",
+            )
+            .bind(media_asset_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if remaining != 0 {
+                continue;
+            }
+            metadata::tombstone_media_tx(
+                &mut transaction,
+                media_asset_id,
+                "source_missing",
+                now_millis(),
+                revision,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        sleep(RECONCILE_BATCH_YIELD).await;
+    }
+    // 已消失文件的失败记录一并清理：文件回来时会重新走一次索引。同样分批提交。
     let recorded_failures = sqlx::query_scalar::<_, String>(
         "SELECT normalized_path FROM media_index_failures WHERE storage_id = 'local'",
     )
-    .fetch_all(&mut *transaction)
+    .fetch_all(pool)
     .await?;
-    for path in recorded_failures {
-        if (!scope_path.is_empty() && !path.starts_with(&scope_prefix))
-            || seen_paths.contains(&path)
-            || pending_paths.contains(&path)
-        {
-            continue;
+    let stale_failures = recorded_failures
+        .iter()
+        .filter(|path| {
+            (scope_path.is_empty() || path.starts_with(&scope_prefix))
+                && !seen_paths.contains(*path)
+                && !pending_paths.contains(*path)
+        })
+        .collect::<Vec<_>>();
+    for batch in stale_failures.chunks(RECONCILE_BATCH_SIZE) {
+        let mut transaction = begin_write(pool).await?;
+        for path in batch {
+            sqlx::query(
+                "DELETE FROM media_index_failures WHERE storage_id = 'local' AND normalized_path = ?1",
+            )
+            .bind(*path)
+            .execute(&mut *transaction)
+            .await?;
         }
-        sqlx::query(
-            "DELETE FROM media_index_failures WHERE storage_id = 'local' AND normalized_path = ?1",
-        )
-        .bind(&path)
-        .execute(&mut *transaction)
-        .await?;
+        transaction.commit().await?;
+        sleep(RECONCILE_BATCH_YIELD).await;
     }
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -2116,5 +2142,379 @@ mod tests {
         )
         .fetch_one(pool)
         .await
+    }
+
+    // ------------------------------------------------------------------
+    // 对账锁占用探针（缺陷 usKyTJguvfSX）
+    // ------------------------------------------------------------------
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 探针与用例共用的缺失位置种子：确定性生成 count 条「磁盘上不存在」的位置。
+    async fn seed_missing_locations(pool: &SqlitePool, count: usize) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO storages(id,name,root_path,read_only,created_at,updated_at) VALUES ('local','Local','/probe',0,1,1)")
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO users(id,name,created_at,updated_at) VALUES (1,'probe',1,1)")
+            .execute(pool)
+            .await?;
+        for start in (0..count).step_by(200) {
+            let end = (start + 200).min(count);
+            let mut assets = Vec::new();
+            let mut locations = Vec::new();
+            for index in start..end {
+                let suffix = format!("{index:06}");
+                assets.push(format!(
+                    "('probe-media-{suffix}','verified','{suffix}.jpg',1,1,1,1,1)"
+                ));
+                locations.push(format!(
+                    "('probe-loc-{suffix}','probe-media-{suffix}','local','library/{suffix}.jpg','{suffix}.jpg',1,'verified',1,1,1)"
+                ));
+            }
+            sqlx::query(&format!(
+                "INSERT INTO media_assets(id,identity_state,name,version,created_at,updated_at,time_version,owner_user_id) VALUES {}",
+                assets.join(",")
+            ))
+            .execute(pool)
+            .await?;
+            sqlx::query(&format!(
+                "INSERT INTO media_locations(id,media_asset_id,storage_id,normalized_path,file_name,size,hash_state,observed_size,created_at,updated_at) VALUES {}",
+                locations.join(",")
+            ))
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn probe_percentile(values: &[u128], rank: f64) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let position = (sorted.len() - 1) as f64 * rank;
+        let lower = position.floor() as usize;
+        let upper = (lower + 1).min(sorted.len() - 1);
+        let fraction = position - lower as f64;
+        sorted[lower] as f64 + (sorted[upper] as f64 - sorted[lower] as f64) * fraction
+    }
+
+    /// 修复前形态（单事务 + 逐行回查路径）的参考实现：只给探针复现基线用，
+    /// 与缺陷 usKyTJguvfSX 记录（提交 e8ae7b9 及以前）的 `reconcile_missing_locations`
+    /// 等价。生产代码不得调用。
+    async fn legacy_reconcile_single_transaction(
+        pool: &SqlitePool,
+        seen_paths: &HashSet<String>,
+        scope_path: &str,
+    ) -> anyhow::Result<()> {
+        let scope_prefix = format!("{scope_path}/");
+        let pending_paths =
+            sqlx::query_scalar::<_, String>("SELECT normalized_path FROM media_pending_paths")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .collect::<HashSet<String>>();
+        let locations = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, media_asset_id FROM media_locations WHERE storage_id = 'local'",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut transaction = begin_write(pool).await?;
+        let revision = sync::allocate_revision(&mut transaction).await?;
+        for (location_id, media_asset_id) in locations {
+            let path = sqlx::query_scalar::<_, String>(
+                "SELECT normalized_path FROM media_locations WHERE id = ?1",
+            )
+            .bind(&location_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(path) = path else {
+                continue;
+            };
+            if (!scope_path.is_empty() && !path.starts_with(&scope_prefix))
+                || seen_paths.contains(&path)
+                || pending_paths.contains(&path)
+            {
+                continue;
+            }
+            sqlx::query("DELETE FROM media_locations WHERE id = ?1")
+                .bind(&location_id)
+                .execute(&mut *transaction)
+                .await?;
+            let remaining = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_locations WHERE media_asset_id = ?1",
+            )
+            .bind(&media_asset_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if remaining != 0 {
+                continue;
+            }
+            metadata::tombstone_media_tx(
+                &mut transaction,
+                &media_asset_id,
+                "source_missing",
+                now_millis(),
+                revision,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// 对账锁占用探针（显式调用才跑）：一边跑真实 `reconcile_missing_locations`，
+    /// 一边用另一连接反复申请写事务，报告写锁最长等待、写失败次数与对账总时长。
+    ///
+    /// ```text
+    /// cargo test --release --manifest-path apps/server/Cargo.toml \
+    ///   scan::tests::reconcile_lock_scale_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// 环境变量：`YOUYOU_RECONCILE_PROBE_LOCATIONS`（默认 20000）、
+    /// `YOUYOU_RECONCILE_PROBE_LEGACY=1` 复现修复前基线（单事务参考实现）、
+    /// `YOUYOU_RECONCILE_PROBE_OUTPUT`（JSON 落盘路径，可选）。
+    #[tokio::test]
+    #[ignore = "scale probe; run explicitly with --ignored"]
+    async fn reconcile_lock_scale_probe() -> anyhow::Result<()> {
+        let locations: usize = std::env::var("YOUYOU_RECONCILE_PROBE_LOCATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000);
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        seed_missing_locations(&pool, locations).await?;
+        // 有一个存在的文件，对账照常执行（0 发现时会走保护分支）。
+        let mut seen_paths = HashSet::new();
+        seen_paths.insert("library/present.jpg".to_owned());
+
+        let writer = ProbeWriter::spawn(pool.clone()).await?;
+        let legacy = std::env::var("YOUYOU_RECONCILE_PROBE_LEGACY").as_deref() == Ok("1");
+        let started = Instant::now();
+        if legacy {
+            legacy_reconcile_single_transaction(&pool, &seen_paths, "").await?;
+        } else {
+            reconcile_missing_locations(&pool, &seen_paths, "").await?;
+        }
+        let reconcile_ms = started.elapsed().as_millis();
+        let (writes, failures, samples) = writer.finish().await;
+
+        let report = serde_json::json!({
+            "locations": locations,
+            "legacy": legacy,
+            "reconcileMs": reconcile_ms,
+            "writerAttempts": writes.len(),
+            "writerFailures": failures.len(),
+            "writerMaxWaitMs": writes.iter().copied().max().unwrap_or_default(),
+            "writerP95WaitMs": probe_percentile(&writes, 0.95),
+            "failureSample": failures.first(),
+            "writerSamples": samples
+                .iter()
+                .map(|(at, wait, ok)| serde_json::json!([at, wait, ok]))
+                .collect::<Vec<_>>(),
+        });
+        let encoded = serde_json::to_string_pretty(&report)?;
+        println!("{encoded}");
+        if let Ok(output) = std::env::var("YOUYOU_RECONCILE_PROBE_OUTPUT") {
+            tokio::fs::write(output, format!("{encoded}\n")).await?;
+        }
+        pool.close().await;
+        Ok(())
+    }
+
+    /// 探针里的并发写者：反复用另一连接申请写事务，记录等待时长与失败。
+    struct ProbeWriter {
+        stop: Arc<AtomicBool>,
+        samples: Arc<Mutex<Vec<(u128, u128, bool)>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl ProbeWriter {
+        async fn spawn(pool: SqlitePool) -> anyhow::Result<Self> {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS probe_writes(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL)",
+            )
+            .execute(&pool)
+            .await?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let origin = Instant::now();
+            let samples = Arc::new(Mutex::new(Vec::<(u128, u128, bool)>::new()));
+            let handle = {
+                let stop = stop.clone();
+                let samples = samples.clone();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        let started = Instant::now();
+                        let result = async {
+                            let mut transaction = begin_write(&pool).await?;
+                            sqlx::query("INSERT INTO probe_writes(at) VALUES (?1)")
+                                .bind(now_millis())
+                                .execute(&mut *transaction)
+                                .await?;
+                            transaction.commit().await?;
+                            anyhow::Ok(())
+                        }
+                        .await;
+                        samples.lock().expect("probe samples lock").push((
+                            origin.elapsed().as_millis() - started.elapsed().as_millis(),
+                            started.elapsed().as_millis(),
+                            result.is_ok(),
+                        ));
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+            };
+            Ok(Self {
+                stop,
+                samples,
+                handle,
+            })
+        }
+
+        async fn finish(self) -> (Vec<u128>, Vec<String>, Vec<(u128, u128, bool)>) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.handle.await.expect("probe writer join");
+            let samples = self.samples.lock().expect("probe samples lock").clone();
+            let (writes, failures): (Vec<u128>, Vec<String>) = samples.iter().fold(
+                (Vec::new(), Vec::new()),
+                |(mut writes, mut failures), (_, wait, ok)| {
+                    if *ok {
+                        writes.push(*wait);
+                    } else {
+                        failures.push(format!("wait={wait}ms"));
+                    }
+                    (writes, failures)
+                },
+            );
+            (writes, failures, samples)
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_removes_missing_locations_and_tombstones_assets() -> anyhow::Result<()> {
+        // 语义不回归：缺失位置删除、无剩余位置的资产墓碑；仍在磁盘上的那条不受影响。
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        seed_missing_locations(&pool, 1_300).await?; // 跨 3 批，覆盖分批提交
+        let mut seen_paths = HashSet::new();
+        seen_paths.insert("library/000001.jpg".to_owned());
+        reconcile_missing_locations(&pool, &seen_paths, "").await?;
+
+        assert_eq!(location_count(&pool).await?, 1);
+        let tombstoned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_assets WHERE identity_state = 'tombstoned'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(tombstoned, 1_299);
+        let delete_events = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM change_log WHERE entity = 'media' AND operation = 'delete'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(delete_events, 1_299);
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_whole_scope_when_no_files_were_discovered() -> anyhow::Result<()> {
+        // 保护：本范围 0 发现却要清掉范围内全部位置——按挂载丢失/空卷处理，
+        // 本轮不删位置、不墓碑、不发删除事件，只告警。
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        seed_missing_locations(&pool, 600).await?;
+        reconcile_missing_locations(&pool, &HashSet::new(), "").await?;
+
+        assert_eq!(location_count(&pool).await?, 600);
+        let (tombstoned, delete_events) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM media_assets WHERE identity_state = 'tombstoned'),(SELECT COUNT(*) FROM change_log WHERE operation = 'delete')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(tombstoned, 0);
+        assert_eq!(delete_events, 0);
+
+        // 范围保护只作用到本轮：发现了一个存在的文件后，同一数据集照常对账。
+        let mut seen_paths = HashSet::new();
+        seen_paths.insert("library/000001.jpg".to_owned());
+        reconcile_missing_locations(&pool, &seen_paths, "").await?;
+        assert_eq!(location_count(&pool).await?, 1);
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_keeps_locations_when_the_volume_looks_empty() -> anyhow::Result<()> {
+        // 走真实扫描路径验证保护：范围内 0 发现时跳过对账（挂载丢失/空卷），
+        // 一旦范围里还有存在的文件，缺失位置照常清理。
+        let root = tempfile::tempdir()?;
+        let media_root = root.path().join("media");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let state = crate::initialize(&root.path().join("data"), &media_root).await?;
+        let storage = state.storage.snapshot().await;
+        let kept = write_test_entry(&storage, "IMG_20240101_000000.jpg", &tiny_jpeg()).await?;
+        let vanished = write_test_entry(&storage, "IMG_20240102_000000.jpg", &tiny_jpeg()).await?;
+        index_media(&state.db, &storage, &kept).await?;
+        index_media(&state.db, &storage, &vanished).await?;
+
+        // 只少了其中一个文件：范围内仍有存在的文件 → 正常对账删除并墓碑。
+        tokio::fs::remove_file(media_root.join("IMG_20240102_000000.jpg")).await?;
+        let summary = scan_directory(&state.db, state.storage.clone(), "scan").await?;
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(location_count(&state.db).await?, 1);
+        let tombstoned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_assets WHERE identity_state = 'tombstoned'",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        assert_eq!(tombstoned, 1);
+
+        // 范围里一个文件都不剩（磁盘上看像空卷）：本轮跳过对账，保留位置与资产。
+        tokio::fs::remove_file(media_root.join("IMG_20240101_000000.jpg")).await?;
+        let summary = scan_directory(&state.db, state.storage.clone(), "scan-again").await?;
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(location_count(&state.db).await?, 1);
+        let tombstoned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_assets WHERE identity_state = 'tombstoned'",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        assert_eq!(tombstoned, 1, "empty-scope protection must not tombstone");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_the_write_lock_to_other_writers() -> anyhow::Result<()> {
+        // 分批提交 + 批间让出：另一个连接的写事务最多等一批，而不是等整段对账。
+        // 原实现（单事务）会把写者挡到对账结束：1.2 万条实测占锁约 1.7s（10 万条 14.6s）。
+        // 用「最长等待必须远小于对账总时长」断言，避免依赖机器速度的绝对毫秒阈值。
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        seed_missing_locations(&pool, 12_000).await?;
+        let mut seen_paths = HashSet::new();
+        seen_paths.insert("library/present.jpg".to_owned());
+
+        let writer = ProbeWriter::spawn(pool.clone()).await?;
+        let started = Instant::now();
+        reconcile_missing_locations(&pool, &seen_paths, "").await?;
+        let reconcile_ms = started.elapsed().as_millis();
+        let (writes, failures, _samples) = writer.finish().await;
+
+        assert!(failures.is_empty(), "writer hit: {failures:?}");
+        assert_eq!(location_count(&pool).await?, 0);
+        let max_wait = writes.iter().copied().max().unwrap_or_default();
+        assert!(
+            max_wait < 2_000,
+            "writer waited {max_wait}ms for the write lock (reconcile {reconcile_ms}ms)"
+        );
+        assert!(
+            max_wait * 3 < reconcile_ms,
+            "writer waited {max_wait}ms of a {reconcile_ms}ms reconciliation; batching is not effective"
+        );
+        pool.close().await;
+        Ok(())
     }
 }
