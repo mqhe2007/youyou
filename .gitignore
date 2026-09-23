@@ -38,3 +38,5 @@ skills-lock.json
 
 # Python 脚本运行期字节码缓存
 __pycache__/
+
+tmp
