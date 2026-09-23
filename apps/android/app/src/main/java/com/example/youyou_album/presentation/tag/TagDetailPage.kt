@@ -90,31 +90,18 @@ fun TagDetailPage(
     }
 
     if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            title = { Text("删除原件") },
-            text = {
-                Text(
-                    deleteConfirmMessage(
-                        count = selectedIds.size,
-                        online = serverConnected && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(androidx.compose.ui.platform.LocalContext.current),
-                        hasLocal = selectedHasLocal,
-                        hasRemote = selectedHasRemote,
-                    )
-                )
-            },
-            confirmButton = {
-                AppTextButton(onClick = {
-                    showDeleteDialog = false
-                    viewModel.deletePhotos(selectedIds.toList())
-                    selecting = false
-                    selectedIds = emptySet()
-                }) {
-                    Text("删除", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                AppTextButton(onClick = { showDeleteDialog = false }) { Text("取消") }
+        val deletePreview by viewModel.mediaDelete.preview.collectAsStateWithLifecycle()
+        LaunchedEffect(selectedIds) { viewModel.mediaDelete.prepare(selectedIds.toList()) }
+        com.example.youyou_album.presentation.widgets.DeleteScopeDialog(
+            photos = photos.filter { it.id in selectedIds },
+            preview = deletePreview,
+            online = serverConnected && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(androidx.compose.ui.platform.LocalContext.current),
+            onDismiss = { showDeleteDialog = false },
+            onConfirm = { scope ->
+                showDeleteDialog = false
+                viewModel.deletePhotos(selectedIds.toList(), scope)
+                selecting = false
+                selectedIds = emptySet()
             },
         )
     }

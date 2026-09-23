@@ -43,4 +43,7 @@ interface TaskDao {
 
     @Query("DELETE FROM tasks_table WHERE status = 'completed' AND finished_at < :before")
     suspend fun cleanupCompleted(before: Long): Int
+
+    @Query("DELETE FROM tasks_table WHERE status IN ('completed', 'cancelled') AND (finished_at < :before OR id NOT IN (SELECT id FROM tasks_table WHERE status IN ('completed', 'cancelled') ORDER BY finished_at DESC LIMIT 50))")
+    suspend fun cleanupRecentResults(before: Long): Int
 }

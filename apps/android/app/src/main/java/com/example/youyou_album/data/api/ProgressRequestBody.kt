@@ -22,6 +22,10 @@ class ProgressRequestBody(
 
     override fun contentType(): MediaType? = contentType
 
+    // The InputStream is consumed once. Let the foreground service reopen it for each retry;
+    // OkHttp must not replay this body internally after a connection failure or redirect.
+    override fun isOneShot(): Boolean = true
+
     // 返回 -1 使用 chunked streaming mode，避免 Content-Length 不准确导致 Broken pipe
     override fun contentLength(): Long = -1
 

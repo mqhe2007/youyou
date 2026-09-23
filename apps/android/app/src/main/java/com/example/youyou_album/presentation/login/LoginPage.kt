@@ -27,11 +27,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.example.youyou_album.R
 import com.example.youyou_album.presentation.server.ServerConnectionViewModel
+import com.example.youyou_album.presentation.server.ConnectionStage
 
 /**
  * 首启登录页：扫码 = 登录 = 绑定远程媒体库（服务端为每位用户签发专属二维码）。
@@ -45,6 +47,7 @@ fun LoginPage(
     viewModel: ServerConnectionViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val uriHandler = LocalUriHandler.current
 
     // 监听扫码结果（与连接管理页一致的 savedStateHandle 协议）
     DisposableEffect(navController) {
@@ -62,8 +65,8 @@ fun LoginPage(
     }
 
     // 绑定成功 → 进入主框架（清空登录页，返回键不再回到登录）
-    LaunchedEffect(uiState.connection != null) {
-        if (uiState.connection != null) {
+    LaunchedEffect(uiState.connection, uiState.isConnecting, uiState.connectionStage) {
+        if (uiState.connection != null && !uiState.isConnecting && uiState.connectionStage == ConnectionStage.COMPLETE) {
             onEnterApp()
         }
     }
@@ -105,7 +108,17 @@ fun LoginPage(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(modifier = Modifier.height(48.dp))
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(
+                text = "受邀成员：向管理员索取自己的连接二维码。管理员：先部署服务，再到管理端为成员创建目录并生成二维码。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            AppTextButton(onClick = { uriHandler.openUri("https://youyou.mengqinghe.com/quickstart") }) {
+                Text("查看部署说明")
+            }
+            Spacer(modifier = Modifier.height(20.dp))
             Button(
                 onClick = { navController.navigate(com.example.youyou_album.presentation.navigation.Routes.QR_SCANNER) },
                 enabled = !uiState.isConnecting,

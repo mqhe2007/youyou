@@ -104,6 +104,7 @@ interface YouyouApiService {
     suspend fun openMediaContent(
         @Path("id") id: String,
         @Header("Range") range: String? = null,
+        @Header("Authorization") authorization: String? = null,
     ): ResponseBody
 
     @Streaming
@@ -130,6 +131,7 @@ interface YouyouApiService {
         @Header("X-Live-Photo-Embedded") livePhotoEmbedded: String? = null,
         @Header("X-Live-Photo-Motion-Duration-Ms") livePhotoMotionDurationMs: Long? = null,
         @Body body: RequestBody,
+        @Header("Authorization") authorization: String? = null,
     ): UploadResponseDto
 
     // Bootstrap sync

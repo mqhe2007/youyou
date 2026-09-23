@@ -70,6 +70,7 @@ import com.example.youyou_album.presentation.widgets.PhotoGrid
 import com.example.youyou_album.presentation.widgets.PhotoGridSkeleton
 import com.example.youyou_album.presentation.widgets.MediaDeleteLauncher
 import com.example.youyou_album.presentation.widgets.deleteConfirmMessage
+import com.example.youyou_album.presentation.widgets.DeleteScopeDialog
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.material.ExperimentalMaterialApi::class)
@@ -87,9 +88,11 @@ fun HomePage(
     val backupFilter by viewModel.backupFilter.collectAsStateWithLifecycle()
     val activityTaskCount by viewModel.activityTaskCount.collectAsStateWithLifecycle()
     val trustState by viewModel.trustState.collectAsStateWithLifecycle()
+    val firstConnectGuidePending by viewModel.firstConnectGuidePending.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     val deleteStep by viewModel.mediaDelete.step.collectAsStateWithLifecycle()
+    val deletePreview by viewModel.mediaDelete.preview.collectAsStateWithLifecycle()
     val deleteMessage by viewModel.mediaDelete.message.collectAsStateWithLifecycle()
     MediaDeleteLauncher(
         step = deleteStep,
@@ -179,36 +182,18 @@ fun HomePage(
     }
 
     val selectedPhotos = photos.filter { it.id in uiState.selectedPhotoIds }
-    val selectedHasLocal = selectedPhotos.any { it.sourceType != "server" }
-    val selectedHasRemote = selectedPhotos.any { it.syncDisplay != MediaSyncDisplay.LOCAL_ONLY }
     val deleteOnline = trustState.reachability == ServerReachability.ONLINE
 
     if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            title = { Text("删除原件") },
-            text = {
-                Text(
-                    deleteConfirmMessage(
-                        count = selectedCount,
-                        online = deleteOnline && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(context),
-                        hasLocal = selectedHasLocal,
-                        hasRemote = selectedHasRemote,
-                    )
-                )
-            },
-            confirmButton = {
-                AppTextButton(onClick = {
-                    showDeleteDialog = false
-                    viewModel.deleteSelected(uiState.selectedPhotoIds)
-                }) {
-                    Text("删除", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                AppTextButton(onClick = { showDeleteDialog = false }) {
-                    Text("取消")
-                }
+        LaunchedEffect(uiState.selectedPhotoIds) { viewModel.mediaDelete.prepare(uiState.selectedPhotoIds.toList()) }
+        DeleteScopeDialog(
+            photos = selectedPhotos,
+            preview = deletePreview,
+            online = deleteOnline && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(context),
+            onDismiss = { showDeleteDialog = false },
+            onConfirm = { scope ->
+                showDeleteDialog = false
+                viewModel.deleteSelected(uiState.selectedPhotoIds, scope)
             },
         )
     }
@@ -370,7 +355,7 @@ fun HomePage(
                         if (selectedPhotos.any { it.syncDisplay == MediaSyncDisplay.LOCAL_ONLY }) {
                             add(
                                 BatchAction(
-                                    label = "同步",
+                                    label = "上传",
                                     icon = R.drawable.lucide_ic_cloud_upload,
                                     primary = true,
                                     onClick = {
@@ -420,6 +405,52 @@ fun HomePage(
                     )
                 }
             }
+            if (firstConnectGuidePending && trustState.reachability == ServerReachability.ONLINE && !uiState.isInitialLoading) {
+                val remoteFirst = photos.firstOrNull { it.syncDisplay != MediaSyncDisplay.LOCAL_ONLY }
+                val localFirst = photos.firstOrNull { it.sourceType != "server" && it.sourceUri != null }
+                Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            when {
+                                remoteFirst != null -> "已接入照片库，看看第一张照片"
+                                localFirst != null -> "服务器照片库暂无内容，可以上传一张本机照片"
+                                uiState.isScanning -> "正在扫描本机照片，完成后可上传第一张"
+                                else -> "照片库暂无内容，扫描本机照片后可上传第一张"
+                            },
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        AppTextButton(
+                            enabled = !uiState.isScanning,
+                            onClick = {
+                                when {
+                                    remoteFirst != null -> {
+                                        viewModel.finishFirstConnectGuide()
+                                        onPhotoClick(remoteFirst.id)
+                                    }
+                                    localFirst != null -> {
+                                        viewModel.syncSelectedToServer(setOf(localFirst.id))
+                                        viewModel.finishFirstConnectGuide()
+                                    }
+                                    else -> requestMediaScan()
+                                }
+                            },
+                        ) {
+                            Text(when {
+                                remoteFirst != null -> "查看"
+                                localFirst != null -> "上传"
+                                else -> "扫描"
+                            })
+                        }
+                        IconButton(onClick = { viewModel.finishFirstConnectGuide() }) {
+                            Icon(painterResource(R.drawable.lucide_ic_x), contentDescription = "关闭首次接入引导")
+                        }
+                    }
+                }
+            }
             if (uiState.error != null) {
                 ErrorStateView(
                     error = uiState.error!!,
@@ -464,8 +495,8 @@ fun HomePage(
 private fun filterLabel(filter: MediaSyncDisplay?): String = when (filter) {
     null -> "全部"
     MediaSyncDisplay.LOCAL_ONLY -> "仅本机"
-    MediaSyncDisplay.REMOTE_ONLY -> "仅远程"
-    MediaSyncDisplay.SYNCED -> "已同步"
+    MediaSyncDisplay.REMOTE_ONLY -> "仅服务器"
+    MediaSyncDisplay.SYNCED -> "手机和服务器都有"
 }
 
 private fun filterIcon(filter: MediaSyncDisplay?): Int = when (filter) {
@@ -484,7 +515,7 @@ private fun ConnectionHint(state: HomeTrustState, onManage: () -> Unit, onDismis
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                Text(if (unbound) "连接服务端，备份本机照片" else "服务端暂不可用", style = MaterialTheme.typography.bodySmall)
+                Text(if (unbound) "连接服务端，按需上传照片" else "服务端暂不可用，本机照片仍可浏览", style = MaterialTheme.typography.bodySmall)
                 if (!unbound) Text(formatLastSyncedAt(state.lastSyncedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             AppTextButton(onClick = onManage, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)) { Text(if (unbound) "连接" else "查看") }

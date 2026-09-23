@@ -59,4 +59,5 @@ interface TaskRepository {
     suspend fun updateStatus(id: String, status: String, message: String?, updatedAt: Long)
     suspend fun updateProgress(id: String, current: Int, total: Int?, indeterminate: Boolean, phase: String?, updatedAt: Long)
     suspend fun deleteById(id: String)
+    suspend fun cleanupRecentResults(before: Long): Int
 }

@@ -25,10 +25,18 @@ class MediaDeleteController(
     private val _busy = MutableStateFlow(false)
     val busy: StateFlow<Boolean> = _busy.asStateFlow()
 
-    fun delete(photoIds: List<String>) {
+    private val _preview = MutableStateFlow<List<MediaDeletionService.DeletePreviewItem>?>(null)
+    val preview: StateFlow<List<MediaDeletionService.DeletePreviewItem>?> = _preview.asStateFlow()
+
+    fun prepare(photoIds: List<String>) {
+        _preview.value = null
+        scope.launch { _preview.value = service.preview(photoIds) }
+    }
+
+    fun delete(photoIds: List<String>, scope: MediaDeletionService.DeleteScope) {
         if (photoIds.isEmpty() || _busy.value) return
         _busy.value = true
-        scope.launch { handle(service.begin(photoIds)) }
+        this.scope.launch { handle(service.begin(photoIds, scope)) }
     }
 
     fun onSystemConfirmation(session: MediaDeletionService.DeleteSession, approved: Boolean) {

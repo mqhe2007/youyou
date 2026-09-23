@@ -14,6 +14,9 @@ interface ServerProjectionDao {
     @Query("SELECT * FROM server_media_projection WHERE local_photo_id = :localPhotoId")
     suspend fun getByLocalPhotoId(localPhotoId: String): ServerMediaProjectionEntity?
 
+    @Query("SELECT * FROM server_media_projection WHERE local_photo_id = :localPhotoId AND server_namespace = :namespace")
+    suspend fun getByLocalPhotoIdInNamespace(localPhotoId: String, namespace: String): ServerMediaProjectionEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(projection: ServerMediaProjectionEntity)
 
@@ -60,9 +63,9 @@ interface ServerProjectionDao {
         """
         SELECT p.server_media_id FROM server_media_projection p
         INNER JOIN photos_table ph ON ph.id = p.local_photo_id
-        WHERE ph.content_hash = :contentHash AND ph.source_type = 'server'
+        WHERE ph.content_hash = :contentHash AND ph.source_type = 'server' AND p.server_namespace = :namespace
         LIMIT 1
         """
     )
-    suspend fun getServerMediaIdForContentHash(contentHash: String): String?
+    suspend fun getServerMediaIdForContentHash(contentHash: String, namespace: String): String?
 }

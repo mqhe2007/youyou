@@ -345,8 +345,8 @@ internal fun PhotoTile(
             .semantics(mergeDescendants = true) {
                 contentDescription = "${photo.name}，" + when (photo.syncDisplay) {
                     MediaSyncDisplay.LOCAL_ONLY -> "仅本机"
-                    MediaSyncDisplay.REMOTE_ONLY -> "仅远程"
-                    MediaSyncDisplay.SYNCED -> "已同步，本机和远程都有"
+                    MediaSyncDisplay.REMOTE_ONLY -> "仅服务器"
+                    MediaSyncDisplay.SYNCED -> "手机和服务器都有"
                 }
             }
             .aspectRatio(1f)

@@ -48,13 +48,19 @@ class UploadService @Inject constructor(
          */
         livePhoto: com.example.youyou_album.domain.model.LivePhoto? = null,
         onProgress: (bytesWritten: Long, totalBytes: Long) -> Unit = { _, _ -> },
+        baseUrl: String? = null,
+        authorization: String? = null,
     ): UploadResult = withContext(Dispatchers.IO) {
-        val connection = serverConnectionStore.getConnection()
+        val url = baseUrl ?: serverConnectionStore.getConnection()?.baseUrl
             ?: throw IllegalStateException("未连接服务端")
-
-        val apiService = apiServiceFactory.create(connection.baseUrl)
+        val apiService = apiServiceFactory.create(url)
 
         val uri = Uri.parse(sourceUri)
+        // The scan index can lag behind a just-written MediaStore item. Read the current file
+        // length instead of sending a stale zero/old size that the server will reject.
+        val currentSize = context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize }
+            ?.takeIf { it > 0 } ?: size
+        check(currentSize > 0) { "文件大小尚未就绪，请刷新照片后重试" }
         val inputStream = context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("无法打开文件: $sourceUri")
 
@@ -80,13 +86,13 @@ class UploadService @Inject constructor(
 
         val requestBody = ProgressRequestBody(
             inputStream = countingInputStream,
-            contentLength = size,
+            contentLength = currentSize,
             contentType = mimeType?.toMediaTypeOrNull(),
             onProgress = onProgress,
         )
 
         val response: UploadResponseDto = apiService.uploadMedia(
-            expectedSize = size,
+            expectedSize = currentSize,
             expectedSha256 = expectedSha256,
             fileName = fileName,
             mimeType = mimeType,
@@ -100,6 +106,7 @@ class UploadService @Inject constructor(
             livePhotoEmbedded = if (livePhoto?.embedded == true) "1" else null,
             livePhotoMotionDurationMs = livePhoto?.motionDurationMs?.toLong(),
             body = requestBody,
+            authorization = authorization,
         )
 
         // 校验本地计算的 hash 与预期一致

@@ -37,16 +37,16 @@ class MediaDownloadService @Inject constructor(
     }
 
     /** 下载/转存单个媒体到系统相册，返回用户可读的结果消息。 */
-    suspend fun downloadToGallery(photo: Photo): String {
+    suspend fun downloadToGallery(photo: Photo, baseUrl: String? = null, authorization: String? = null): String {
         if (!mediaTaskCoordinator.tryRegisterActive(photo.id)) return "该媒体正在删除，已取消下载"
         return try {
-            val result = downloadInternal(photo)
+            val result = downloadInternal(photo, baseUrl, authorization)
             if (result != SAVED_MESSAGE) return result
             // FR-4 整体搬运：远程实况的静态帧与动态部分一起落盘，避免只落下半张实况。
             // 本机静态帧不走这里（动态部分本来就在本机）。
             val live = photo.livePhoto
             if (photo.sourceUri != null || live?.isStill != true || live.embedded) return result
-            val motion = downloadMotionPart(photo, live)
+            val motion = downloadMotionPart(photo, live, baseUrl, authorization)
             if (motion == SAVED_MESSAGE) {
                 "已保存到系统相册（实况照片：静态帧与动态部分）"
             } else {
@@ -61,13 +61,13 @@ class MediaDownloadService @Inject constructor(
      * 实况动态部分：按静态帧在服务端记录的配对媒体 id 下载为系统相册视频。
      * 落盘后由后台扫描按内容标识重新配对，本机两部分的配对关系随之收敛。
      */
-    private suspend fun downloadMotionPart(still: Photo, live: LivePhoto): String = withContext(Dispatchers.IO) {
+    private suspend fun downloadMotionPart(still: Photo, live: LivePhoto, baseUrl: String?, authorization: String?): String = withContext(Dispatchers.IO) {
         val motionMediaId = live.partnerMediaId ?: return@withContext "服务端未记录配对动态部分"
-        val connection = serverConnectionStore.getConnection() ?: return@withContext "未连接服务端"
+        val url = baseUrl ?: serverConnectionStore.getConnection()?.baseUrl ?: return@withContext "未连接服务端"
         val name = still.name.substringBeforeLast('.', still.name) + ".MOV"
         try {
-            val apiService = apiServiceFactory.create(connection.baseUrl)
-            apiService.openMediaContent(motionMediaId).byteStream().use { input ->
+            val apiService = apiServiceFactory.create(url)
+            apiService.openMediaContent(motionMediaId, authorization = authorization).byteStream().use { input ->
                 saveInputStreamToGallery(
                     inputStream = input,
                     displayName = name,
@@ -103,9 +103,9 @@ class MediaDownloadService @Inject constructor(
         }
     }
 
-    private suspend fun downloadInternal(photo: Photo): String = withContext(Dispatchers.IO) {
+    private suspend fun downloadInternal(photo: Photo, baseUrl: String?, authorization: String?): String = withContext(Dispatchers.IO) {
         try {
-            val input = resolveContent(photo) ?: return@withContext "无法读取照片内容"
+            val input = resolveContent(photo, baseUrl, authorization) ?: return@withContext "无法读取照片内容"
             input.use {
                 saveInputStreamToGallery(
                     inputStream = it,
@@ -122,16 +122,16 @@ class MediaDownloadService @Inject constructor(
         }
     }
 
-    private suspend fun resolveContent(photo: Photo): java.io.InputStream? {
+    private suspend fun resolveContent(photo: Photo, baseUrl: String?, authorization: String?): java.io.InputStream? {
         if (photo.sourceUri != null) {
             return context.contentResolver.openInputStream(Uri.parse(photo.sourceUri))
         }
         // 服务端媒体：投影解析出服务端媒体 ID（本地行走内容哈希找服务端孪生）
         val serverMediaId = photoRepository.resolveServerMediaId(photo)
             ?: return null
-        val connection = serverConnectionStore.getConnection() ?: return null
-        val apiService = apiServiceFactory.create(connection.baseUrl)
-        return apiService.openMediaContent(serverMediaId).byteStream()
+        val url = baseUrl ?: serverConnectionStore.getConnection()?.baseUrl ?: return null
+        val apiService = apiServiceFactory.create(url)
+        return apiService.openMediaContent(serverMediaId, authorization = authorization).byteStream()
     }
 
     private suspend fun saveInputStreamToGallery(

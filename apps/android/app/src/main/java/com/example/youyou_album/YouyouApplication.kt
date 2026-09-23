@@ -9,6 +9,12 @@ import coil.ImageLoaderFactory
 import okhttp3.OkHttpClient
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import com.example.youyou_album.domain.repository.TaskRepository
 import com.example.youyou_album.service.ServerConnectionStore
 import com.example.youyou_album.data.api.interceptor.TokenProvider
 import com.example.youyou_album.data.api.YouyouApiService
@@ -18,6 +24,7 @@ class YouyouApplication : BaseYouyouApplication(), ImageLoaderFactory {
 
     @Inject lateinit var connectionStore: ServerConnectionStore
     @Inject lateinit var tokenProvider: TokenProvider
+    @Inject lateinit var taskRepository: TaskRepository
 
     override fun newImageLoader(): ImageLoader {
         val client = OkHttpClient.Builder()
@@ -50,5 +57,21 @@ class YouyouApplication : BaseYouyouApplication(), ImageLoaderFactory {
         // 手动初始化 WorkManager（已在 Manifest 中禁用默认初始化器）
         // 必须在 super.onCreate() 之后，此时 Hilt 已注入 workerFactory
         WorkManager.initialize(this, workManagerConfiguration)
+        // Foreground transfers are START_NOT_STICKY. A fresh process cannot still own an old
+        // running transfer; keep its item checkpoint so the user can retry only unfinished items.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            taskRepository.observeAll().first()
+                .filter { it.kind in setOf("upload", "download") && it.status == "running" }
+                .forEach { task ->
+                    val now = System.currentTimeMillis()
+                    taskRepository.upsert(task.copy(
+                        status = "failed",
+                        message = "传输因进程重启中断，可重试未完成项",
+                        finishedAt = now,
+                        updatedAt = now,
+                    ))
+                }
+            taskRepository.cleanupRecentResults(System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000)
+        }
     }
 }

@@ -50,7 +50,10 @@ import com.example.youyou_album.R
 import com.example.youyou_album.domain.model.AppTask
 import com.example.youyou_album.presentation.widgets.AppSnackbarHost
 import com.example.youyou_album.presentation.widgets.AppTextButton
+import com.example.youyou_album.service.TransferTaskPayload
 import kotlinx.coroutines.launch
+import java.text.DateFormat
+import java.util.Date
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -61,6 +64,7 @@ fun TaskCenterPage(
 ) {
     val runningTasks by viewModel.runningTasks.collectAsStateWithLifecycle()
     val attentionTasks by viewModel.attentionTasks.collectAsStateWithLifecycle()
+    val recentTasks by viewModel.recentTasks.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
 
@@ -83,13 +87,13 @@ fun TaskCenterPage(
                 .padding(innerPadding),
         ) {
             Text(
-                text = "这里只显示正在进行和需要处理的任务",
+                text = "进行中与需处理优先显示；下方保留最近结果",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
 
-            if (runningTasks.isEmpty() && attentionTasks.isEmpty()) {
+            if (runningTasks.isEmpty() && attentionTasks.isEmpty() && recentTasks.isEmpty()) {
                 NoActivityState(modifier = Modifier.fillMaxSize())
             } else {
                 LazyColumn(
@@ -128,8 +132,8 @@ fun TaskCenterPage(
                             AttentionTaskRow(
                                 task = task,
                                 onRetry = {
-                                    val message = viewModel.retryTask(task)
                                     coroutineScope.launch {
+                                        val message = viewModel.retryTask(task)
                                         snackbarHostState.showSnackbar(message)
                                     }
                                 },
@@ -143,9 +147,22 @@ fun TaskCenterPage(
                         }
                     }
 
-                    item(key = "auto-remove-note") {
+                    if (recentTasks.isNotEmpty()) {
+                        item(key = "recent-header") {
+                            ActivitySectionHeader(
+                                title = "最近结果",
+                                count = recentTasks.size,
+                                modifier = Modifier.padding(top = if (runningTasks.isEmpty() && attentionTasks.isEmpty()) 0.dp else 28.dp),
+                            )
+                        }
+                        items(recentTasks, key = { "recent-${it.id}" }) { task ->
+                            RecentTaskRow(task)
+                        }
+                    }
+
+                    item(key = "recent-note") {
                         Text(
-                            text = "完成的任务会自动移除",
+                            text = "最近 7 天最多保留 50 条已结束记录；清理记录不会删除照片",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
@@ -212,8 +229,10 @@ private fun RunningTaskRow(
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
-            AppTextButton(onClick = onCancel) {
-                Text("取消")
+            if (task.kind != "scan") {
+                AppTextButton(onClick = onCancel) {
+                    Text("取消")
+                }
             }
         }
 
@@ -326,7 +345,7 @@ private fun AttentionTaskRow(
                     contentColor = MaterialTheme.colorScheme.error,
                 ),
             ) {
-                Text("重试")
+                Text(if (task.kind == "scan" || TransferTaskPayload.read(task.payload) == null) "查看补救办法" else "重试")
             }
             AppTextButton(onClick = onDismiss) {
                 Text("忽略")
@@ -337,6 +356,51 @@ private fun AttentionTaskRow(
             modifier = Modifier.padding(top = 4.dp),
             color = MaterialTheme.colorScheme.outlineVariant,
         )
+    }
+}
+
+@Composable
+private fun RecentTaskRow(task: AppTask) {
+    var expanded by remember(task.id) { mutableStateOf(false) }
+    val payload = TransferTaskPayload.read(task.payload)
+    val failures = payload?.items?.filter { it.status == "failed" || it.status == "pending" }.orEmpty()
+    Column(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TaskIcon(
+                painter = taskIcon(task.kind),
+                backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(task.title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    task.finishedAt?.let { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(it)) } ?: "已结束",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Text(
+            payload?.let { "成功 ${it.succeeded} · 失败 ${it.failed} · 取消 ${it.cancelled} · 未处理 ${it.unfinished}" }
+                ?: (task.message ?: task.status),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 60.dp, top = 4.dp),
+        )
+        if (failures.isNotEmpty()) {
+            AppTextButton(onClick = { expanded = !expanded }, modifier = Modifier.padding(start = 48.dp)) {
+                Text(if (expanded) "收起失败项" else "查看失败项")
+            }
+            if (expanded) failures.forEach { item ->
+                Text(
+                    "${item.name}: ${item.message ?: "未完成"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 60.dp, bottom = 4.dp),
+                )
+            }
+        }
+        HorizontalDivider(modifier = Modifier.padding(top = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 

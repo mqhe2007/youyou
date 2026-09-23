@@ -93,6 +93,13 @@ class HomeViewModel @Inject constructor(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeTrustState())
 
+    val firstConnectGuidePending: StateFlow<Boolean> = serverConnectionStore.firstConnectGuidePending
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    fun finishFirstConnectGuide() {
+        viewModelScope.launch { serverConnectionStore.finishFirstConnectGuide() }
+    }
+
     fun setBackupFilter(filter: MediaSyncDisplay?) {
         backupFilter.value = filter
     }
@@ -279,8 +286,8 @@ class HomeViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(selectedPhotoIds = emptySet(), isMultiSelect = false)
     }
 
-    fun deleteSelected(ids: Set<String>) {
-        mediaDelete.delete(ids.toList())
+    fun deleteSelected(ids: Set<String>, scope: com.example.youyou_album.service.MediaDeletionService.DeleteScope) {
+        mediaDelete.delete(ids.toList(), scope)
         clearSelection()
     }
 

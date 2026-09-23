@@ -135,31 +135,16 @@ fun PhotoDetailPage(
     }
 
     if (showDeleteDialog && currentPhoto != null) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            title = { Text("删除原件") },
-            text = {
-                Text(
-                    deleteConfirmMessage(
-                        count = 1,
-                        online = serverConnected && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(androidx.compose.ui.platform.LocalContext.current),
-                        hasLocal = currentPhoto.sourceType != "server",
-                        hasRemote = currentPhoto.syncDisplay != MediaSyncDisplay.LOCAL_ONLY,
-                    )
-                )
-            },
-            confirmButton = {
-                AppTextButton(onClick = {
-                    showDeleteDialog = false
-                    viewModel.deleteCurrentPhoto()
-                }) {
-                    Text("删除", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                AppTextButton(onClick = { showDeleteDialog = false }) {
-                    Text("取消")
-                }
+        val deletePreview by viewModel.mediaDelete.preview.collectAsStateWithLifecycle()
+        LaunchedEffect(currentPhoto.id) { viewModel.mediaDelete.prepare(listOf(currentPhoto.id)) }
+        com.example.youyou_album.presentation.widgets.DeleteScopeDialog(
+            photos = listOf(currentPhoto),
+            preview = deletePreview,
+            online = serverConnected && com.example.youyou_album.presentation.widgets.deleteNetworkAvailable(androidx.compose.ui.platform.LocalContext.current),
+            onDismiss = { showDeleteDialog = false },
+            onConfirm = { scope ->
+                showDeleteDialog = false
+                viewModel.deleteCurrentPhoto(scope)
             },
         )
     }
@@ -293,9 +278,9 @@ fun PhotoDetailPage(
                             },
                         ),
                         label = when (syncDisplay) {
-                            MediaSyncDisplay.LOCAL_ONLY -> "同步"
+                            MediaSyncDisplay.LOCAL_ONLY -> "上传"
                             MediaSyncDisplay.REMOTE_ONLY -> "下载"
-                            MediaSyncDisplay.SYNCED -> "已同步"
+                            MediaSyncDisplay.SYNCED -> "两端都有"
                         },
                         tint = if (synced) contentColor.copy(alpha = 0.38f) else contentColor,
                         enabled = !synced,
@@ -402,9 +387,9 @@ private fun PhotoInfoSheet(photo: Photo) {
         exifInfo["曝光时间"]?.let { InfoRow("曝光时间", it) }
 
         InfoRow("路径", photo.path)
-        InfoRow("同步状态", when (photo.syncDisplay) {
-            com.example.youyou_album.domain.model.MediaSyncDisplay.SYNCED -> "已同步 · 本机和远程都有"
-            com.example.youyou_album.domain.model.MediaSyncDisplay.REMOTE_ONLY -> "仅远程"
+        InfoRow("存放位置", when (photo.syncDisplay) {
+            com.example.youyou_album.domain.model.MediaSyncDisplay.SYNCED -> "手机和服务器都有"
+            com.example.youyou_album.domain.model.MediaSyncDisplay.REMOTE_ONLY -> "仅服务器"
             com.example.youyou_album.domain.model.MediaSyncDisplay.LOCAL_ONLY -> "仅本机"
         })
         if (photo.contentHash != null) InfoRow("内容哈希", photo.contentHash.take(16) + "...")

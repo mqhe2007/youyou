@@ -1,10 +1,13 @@
 package com.example.youyou_album.db
 
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.example.youyou_album.data.db.AppDatabase
 import com.example.youyou_album.data.db.entity.PhotoEntity
 import com.example.youyou_album.data.db.entity.PhotoTagEntity
 import com.example.youyou_album.data.db.entity.TagEntity
+import com.example.youyou_album.data.db.entity.TaskEntity
 import com.example.youyou_album.data.db.entity.ServerMediaProjectionEntity
 import com.example.youyou_album.data.db.entity.ServerMediaExportEntity
 import com.example.youyou_album.data.db.entity.ServerSyncStateEntity
@@ -12,6 +15,8 @@ import com.example.youyou_album.service.ContentHashService
 import com.example.youyou_album.service.OriginalPhotoCacheService
 import com.example.youyou_album.service.RemoteAccountCacheCleaner
 import com.example.youyou_album.service.ThumbnailCacheService
+import com.example.youyou_album.service.TransferTaskItem
+import com.example.youyou_album.service.TransferTaskPayload
 import com.example.youyou_album.util.TestDependencies
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -43,6 +48,61 @@ class DatabasePersistenceE2ETest {
     }
 
     // ─── Photo CRUD ───
+
+    @Test
+    fun recentResultCleanupKeepsLatestFiftyAndUnresolvedFailures() = runBlocking {
+        val taskDao = database.taskDao()
+        (1..55).forEach { index ->
+            taskDao.upsert(TaskEntity(
+                id = "done-$index", kind = "upload", title = "上传", status = "completed",
+                createdAt = index.toLong(), updatedAt = index.toLong(), finishedAt = index.toLong(),
+            ))
+        }
+        taskDao.upsert(TaskEntity(
+            id = "needs-attention", kind = "download", title = "下载", status = "failed",
+            createdAt = 1, updatedAt = 1, finishedAt = 1,
+        ))
+        taskDao.cleanupRecentResults(before = 0)
+        assertNull(taskDao.getById("done-1"))
+        assertNotNull(taskDao.getById("done-55"))
+        assertNotNull(taskDao.getById("needs-attention"))
+        taskDao.cleanupRecentResults(before = 50)
+        assertNull(taskDao.getById("done-49"))
+        assertNotNull(taskDao.getById("done-50"))
+        assertNotNull(taskDao.getById("needs-attention"))
+    }
+
+    @Test
+    fun transferCheckpointSurvivesDatabaseReopen() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val name = "transfer-reopen-${java.util.UUID.randomUUID()}.db"
+        val checkpoint = TransferTaskPayload(
+            identity = "server\ninstance\ndevice",
+            items = listOf(
+                TransferTaskItem("one", "one.png", status = "succeeded"),
+                TransferTaskItem("two", "two.png", status = "failed", message = "网络中断"),
+                TransferTaskItem("three", "three.png"),
+            ),
+        )
+        var disk = Room.databaseBuilder(context, AppDatabase::class.java, name).build()
+        try {
+            disk.taskDao().upsert(TaskEntity(
+                id = "transfer", kind = "upload", title = "上传", status = "failed",
+                createdAt = 1, updatedAt = 2, finishedAt = 2,
+                payload = TransferTaskPayload.write(checkpoint),
+            ))
+            disk.close()
+            disk = Room.databaseBuilder(context, AppDatabase::class.java, name).build()
+            val restored = TransferTaskPayload.read(disk.taskDao().getById("transfer")?.payload)
+            assertNotNull(restored)
+            assertEquals(setOf("two", "three"), restored!!.retryIds)
+            assertEquals(1, restored.succeeded)
+            assertEquals(1, restored.failed)
+        } finally {
+            disk.close()
+            context.deleteDatabase(name)
+        }
+    }
 
     @Test
     fun photo_upsertAndGetById() = runBlocking {

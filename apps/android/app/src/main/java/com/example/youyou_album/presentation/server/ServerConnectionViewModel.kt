@@ -179,17 +179,12 @@ class ServerConnectionViewModel @Inject constructor(
             try {
                 val apiService = apiServiceFactory.create(normalizedUrl)
                 val credentials = apiService.pair(PairRequestDto(code = code, deviceName = deviceName))
-                secureStorageService.saveDeviceToken(credentials.token)
-                secureStorageService.saveDeviceId(credentials.deviceId)
-                tokenProvider.setToken(credentials.token)
-
                 _uiState.update { it.copy(connectionStage = ConnectionStage.VERIFYING) }
-                val serverInfo = apiService.serverInfo()
+                val serverInfo = apiService.serverInfo("Bearer ${credentials.token}")
                 if (serverInfo.storage?.writable != true) {
                     throw IllegalStateException("服务端媒体目录不可写，请联系管理员检查存储目录和权限。")
                 }
                 // 配对成功后才切换身份；切换前清空旧身份的远程投影与缓存。
-                remoteAccountCacheCleaner.clear()
                 val connection = ServerConnection(
                     baseUrl = normalizedUrl,
                     serverInstanceId = serverInfo.serverInstanceId,
@@ -197,7 +192,13 @@ class ServerConnectionViewModel @Inject constructor(
                     deviceName = deviceName,
                     serverVersion = serverInfo.serverVersion.ifBlank { null },
                 )
-                serverConnectionStore.saveConnection(connection)
+                serverSyncService.prepareAccountSwitch {
+                    remoteAccountCacheCleaner.clear()
+                    secureStorageService.saveDeviceToken(credentials.token)
+                    secureStorageService.saveDeviceId(credentials.deviceId)
+                    tokenProvider.setToken(credentials.token)
+                    serverConnectionStore.saveConnection(connection)
+                }
                 _uiState.update {
                     it.copy(
                         connection = connection,

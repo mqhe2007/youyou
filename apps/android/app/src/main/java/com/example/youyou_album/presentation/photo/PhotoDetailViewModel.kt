@@ -117,9 +117,9 @@ class PhotoDetailViewModel @Inject constructor(
             token = tokenProvider.getToken(),
         )
 
-    fun deleteCurrentPhoto() {
+    fun deleteCurrentPhoto(scope: com.example.youyou_album.service.MediaDeletionService.DeleteScope) {
         val photo = currentPhoto() ?: return
-        mediaDelete.delete(listOf(photo.id))
+        mediaDelete.delete(listOf(photo.id), scope)
     }
 
     fun toggleFavorite() {
@@ -163,7 +163,7 @@ class PhotoDetailViewModel @Inject constructor(
             return "未连接服务端，请先在设置中完成连接"
         }
         UploadForegroundService.start(context, setOf(photo.id))
-        return "正在同步到远程…"
+        return "正在上传到服务器…"
     }
 }
 

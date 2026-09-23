@@ -33,11 +33,10 @@ class PhotoRepositoryImpl @Inject constructor(
         }
 
     /** 远程地址只用于展示，避免把 HTTP 地址写进本机媒体 URI。 */
-    private suspend fun Photo.withRemotePreview(): Photo {
-        if (sourceType != "server") return this
-        val connection = connectionStore.getConnection() ?: return this
-        val projection = serverProjectionDao.getByLocalPhotoId(id) ?: return this
-        val mediaUrl = "${connection.baseUrl.trimEnd('/')}/api/v1/media/${projection.serverMediaId}"
+    private suspend fun Photo.withRemotePreview(namespace: String, baseUrl: String?): Photo {
+        if (sourceType != "server" || namespace.isBlank() || baseUrl == null) return this
+        val projection = serverProjectionDao.getByLocalPhotoIdInNamespace(id, namespace) ?: return this
+        val mediaUrl = "${baseUrl.trimEnd('/')}/api/v1/media/${projection.serverMediaId}"
         return copy(
             remoteThumbnailUrl = "$mediaUrl/thumbnail?size=512&v=${projection.serverVersion}",
             remoteContentUrl = "$mediaUrl/content?v=${projection.serverVersion}",
@@ -45,12 +44,25 @@ class PhotoRepositoryImpl @Inject constructor(
     }
 
     override fun observeAll(): Flow<List<Photo>> =
-        photoDao.observeAll().map { list -> list.map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview() } }
+        activeNamespace().flatMapLatest { namespace ->
+            photoDao.observeAll().map { list ->
+                val baseUrl = connectionStore.getConnection()?.baseUrl
+                val visibleRemoteIds = if (namespace.isBlank()) emptySet() else serverProjectionDao.listLocalPhotoIds(namespace).toSet()
+                list.filter { it.sourceType != "server" || it.id in visibleRemoteIds }
+                    .map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview(namespace, baseUrl) }
+            }
+        }
 
-    override suspend fun getAll(): List<Photo> = photoDao.getAll().map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview() }
+    override suspend fun getAll(): List<Photo> {
+        val namespace = activeNamespace().first()
+        val baseUrl = connectionStore.getConnection()?.baseUrl
+        val visibleRemoteIds = if (namespace.isBlank()) emptySet() else serverProjectionDao.listLocalPhotoIds(namespace).toSet()
+        return photoDao.getAll().filter { it.sourceType != "server" || it.id in visibleRemoteIds }
+            .map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview(namespace, baseUrl) }
+    }
 
     override suspend fun getById(id: String): Photo? =
-        photoDao.getById(id)?.toDomain()?.withRemotePreview()
+        photoDao.getById(id)?.toDomain()?.withRemotePreview(activeNamespace().first(), connectionStore.getConnection()?.baseUrl)
 
     override suspend fun getBySourceUri(sourceUri: String): Photo? =
         photoDao.getBySourceUri(sourceUri)?.toDomain()
@@ -94,13 +106,19 @@ class PhotoRepositoryImpl @Inject constructor(
     override fun observeFavorites(): Flow<List<Photo>> =
         activeNamespace().flatMapLatest { namespace ->
             photoDao.observeFavorites(namespace)
-                .map { list -> list.map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview() } }
+                .map { list ->
+                    val baseUrl = connectionStore.getConnection()?.baseUrl
+                    list.map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview(namespace, baseUrl) }
+                }
         }
 
     override fun observeTimeline(filter: MediaSyncDisplay?): Flow<List<Photo>> =
         activeNamespace().flatMapLatest { namespace ->
             photoDao.observeTimeline(filter?.name ?: "ALL", namespace)
-                .map { list -> list.map { it.toDomain().withRemotePreview() } }
+                .map { list ->
+                    val baseUrl = connectionStore.getConnection()?.baseUrl
+                    list.map { it.toDomain().withRemotePreview(namespace, baseUrl) }
+                }
         }
 
     /**
@@ -111,16 +129,18 @@ class PhotoRepositoryImpl @Inject constructor(
      */
     override suspend fun getTimeline(): List<Photo> {
         val namespace = activeNamespace().first()
+        val baseUrl = connectionStore.getConnection()?.baseUrl
         return photoDao.getTimelineOnce("ALL", namespace)
-            .map { it.toDomain().withRemotePreview() }
+            .map { it.toDomain().withRemotePreview(namespace, baseUrl) }
     }
 
     override suspend fun resolveServerMediaId(photo: Photo): String? {
+        val namespace = activeNamespace().first().takeIf { it.isNotBlank() } ?: return null
         if (photo.sourceType == "server") {
-            return serverProjectionDao.getByLocalPhotoId(photo.id)?.serverMediaId
+            return serverProjectionDao.getByLocalPhotoIdInNamespace(photo.id, namespace)?.serverMediaId
         }
         val hash = photo.contentHash ?: return null
-        return serverProjectionDao.getServerMediaIdForContentHash(hash)
+        return serverProjectionDao.getServerMediaIdForContentHash(hash, namespace)
     }
 
     override suspend fun getVideos(): List<Photo> =

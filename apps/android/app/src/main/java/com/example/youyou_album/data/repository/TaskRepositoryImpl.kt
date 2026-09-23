@@ -31,4 +31,6 @@ class TaskRepositoryImpl @Inject constructor(
     ) = taskDao.updateProgress(id, current, total, indeterminate, phase, updatedAt)
 
     override suspend fun deleteById(id: String) = taskDao.deleteById(id)
+
+    override suspend fun cleanupRecentResults(before: Long): Int = taskDao.cleanupRecentResults(before)
 }

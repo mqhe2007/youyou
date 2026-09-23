@@ -230,7 +230,7 @@ fun ServerConnectionPage(
                     onManualUrlChange = { manualUrl = it },
                     onManualCodeChange = { manualCode = it },
                     onManualDeviceNameChange = { manualDeviceName = it },
-                    onSubmitManual = submitManual,
+                    onSubmitManual = onSubmitManual,
                     manualReady = manualReady,
                 )
             }
@@ -254,6 +254,7 @@ private fun UnconnectedContent(
     onSubmitManual: () -> Unit,
     manualReady: Boolean,
 ) {
+    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     NoticeLayout(
         primaryLabel = if (manualExpanded) "连接" else "扫码连接",
         onPrimary = if (manualExpanded) onSubmitManual else onScan,
@@ -271,7 +272,7 @@ private fun UnconnectedContent(
                 Text("手动输入连接", style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "在管理端「用户」页生成配对码，填入下方。",
+                    text = "受邀成员向管理员索取配对码；管理员在管理端「用户」页生成。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -297,12 +298,15 @@ private fun UnconnectedContent(
             )
             Spacer(modifier = Modifier.height(12.dp))
             Text(
-                text = "在管理端「用户」页生成二维码，用它扫码即可完成连接。",
+                text = "受邀成员向管理员索取自己的二维码；管理员先部署服务，再到管理端「用户」页生成。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.widthIn(max = 320.dp),
             )
+            AppTextButton(onClick = { uriHandler.openUri("https://youyou.mengqinghe.com/quickstart") }) {
+                Text("查看部署说明")
+            }
         }
     }
 }

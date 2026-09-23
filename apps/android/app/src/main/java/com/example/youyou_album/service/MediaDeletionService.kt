@@ -14,6 +14,8 @@ import com.example.youyou_album.data.db.dao.PhotoDao
 import com.example.youyou_album.data.db.dao.ServerProjectionDao
 import com.example.youyou_album.data.db.entity.PendingLocalDeletionEntity
 import com.example.youyou_album.data.db.entity.PendingMediaOperationEntity
+import com.example.youyou_album.domain.model.AppTask
+import com.example.youyou_album.domain.repository.TaskRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.UUID
 import javax.inject.Inject
@@ -45,7 +47,12 @@ class MediaDeletionService @Inject constructor(
     private val thumbnailCacheService: ThumbnailCacheService,
     private val mediaTaskCoordinator: MediaTaskCoordinator,
     private val remoteDeletionIdentity: RemoteDeletionIdentity,
+    private val taskRepository: TaskRepository,
 ) {
+    enum class DeleteScope(val local: Boolean, val remote: Boolean) {
+        PHONE(true, false), SERVER(false, true), BOTH(true, true),
+    }
+
     companion object {
         /** targetSdk 37 下单批最多 2000 个 URI，超出必须串行分批。 */
         private const val MAX_URIS_PER_REQUEST = 2000
@@ -58,8 +65,24 @@ class MediaDeletionService @Inject constructor(
         val serverVersion: Int?,
     )
 
+    data class DeletePreviewItem(val photoId: String, val hasLocal: Boolean, val hasRemote: Boolean)
+
+    /** Read current local index and current-namespace projection before showing a destructive choice. */
+    suspend fun preview(photoIds: List<String>): List<DeletePreviewItem> {
+        val connection = connectionStore.getConnection()
+        val namespace = connection?.let { "server_" + contentHashService.sha256HexForString(it.baseUrl).substring(0, 16) }
+        return photoDao.getByIds(photoIds.distinct()).map { photo ->
+            val remote = namespace?.let { ns ->
+                serverProjectionDao.getByLocalPhotoIdInNamespace(photo.id, ns)?.serverMediaId
+                    ?: photo.contentHash?.let { serverProjectionDao.getServerMediaIdForContentHash(it, ns) }
+            }
+            DeletePreviewItem(photo.id, photo.sourceType != "server" && photo.sourceUri != null, remote != null)
+        }
+    }
+
     /** 一次删除流程的跨回调状态；由调用方在系统回调后原样回传。 */
     data class DeleteSession internal constructor(
+        val scope: DeleteScope,
         internal val online: Boolean,
         internal val namespace: String?,
         internal val remoteSession: RemoteDeletionSession? = null,
@@ -93,13 +116,13 @@ class MediaDeletionService @Inject constructor(
     ) {
         fun message(): String {
             val parts = mutableListOf<String>()
-            if (deletedLocal > 0) parts += "本机已删除 $deletedLocal 项"
-            if (remoteTrashed > 0) parts += "远程已移入回收站 $remoteTrashed 项"
-            if (remoteRetained > 0) parts += "远程副本保留 $remoteRetained 项"
-            if (remoteFailed > 0) parts += "远程删除失败 $remoteFailed 项"
-            if (remotePending > 0) parts += "远程删除结果待确认 $remotePending 项"
-            if (remoteUnavailable > 0) parts += "仅远程 $remoteUnavailable 项未删除，请连接服务端后重试"
-            if (localFailed > 0) parts += "本机删除失败 $localFailed 项，远程未删除"
+            if (deletedLocal > 0) parts += "手机已移入系统回收机制 $deletedLocal 项"
+            if (remoteTrashed > 0) parts += "服务器已移入回收站 $remoteTrashed 项"
+            if (remoteRetained > 0) parts += "服务器原件保留 $remoteRetained 项"
+            if (remoteFailed > 0) parts += "服务器移除失败 $remoteFailed 项"
+            if (remotePending > 0) parts += "服务器移除结果待确认 $remotePending 项"
+            if (remoteUnavailable > 0) parts += "服务器 $remoteUnavailable 项未移除，请连接后重试"
+            if (localFailed > 0) parts += "手机移除失败 $localFailed 项，服务器未移除"
             if (notDeleted > 0) parts += "已取消/未授权 $notDeleted 项，未删除"
             if (parts.isEmpty()) return "没有可删除的项目"
             return parts.joinToString("；")
@@ -115,13 +138,13 @@ class MediaDeletionService @Inject constructor(
     /**
      * 开始删除。进程上次遗留的本机异步删除先核对真实状态，绝不把丢失回调当失败重复执行。
      */
-    suspend fun begin(photoIds: List<String>): DeleteStep {
+    suspend fun begin(photoIds: List<String>, scope: DeleteScope): DeleteStep {
         reconcilePendingLocalDeletions()
         // 阻断新任务，并等待在途上传/下载达到可确认状态后再决定删除目标。
         mediaTaskCoordinator.beginDelete(photoIds)
         if (!mediaTaskCoordinator.awaitIdle(photoIds)) {
             mediaTaskCoordinator.endDelete(photoIds)
-            return DeleteStep.Finished(DeleteSummary(localFailed = photoIds.distinct().size))
+            return finish(scope, photoIds.distinct().size, DeleteSummary(localFailed = photoIds.distinct().size))
         }
         val selected = photoDao.getByIds(photoIds)
         // FR-5 实况整体删除：静态帧与动态部分一起删，避免留下「半张实况」。
@@ -136,9 +159,9 @@ class MediaDeletionService @Inject constructor(
         val namespace = connection?.let { "server_" + contentHashService.sha256HexForString(it.baseUrl).substring(0, 16) }
         val targets = entities.map { entity ->
             // 同步态按内容哈希派生，投影可能挂在另一条 server 行上；优先本行投影，回退按哈希解析。
-            val direct = serverProjectionDao.getByLocalPhotoId(entity.id)
+            val direct = namespace?.let { serverProjectionDao.getByLocalPhotoIdInNamespace(entity.id, it) }
             val serverMediaId = direct?.serverMediaId
-                ?: entity.contentHash?.let { serverProjectionDao.getServerMediaIdForContentHash(it) }
+                ?: entity.contentHash?.let { hash -> namespace?.let { serverProjectionDao.getServerMediaIdForContentHash(hash, it) } }
             val serverVersion = direct?.serverVersion
                 ?: serverMediaId?.let { mediaId ->
                     namespace?.let { serverProjectionDao.getByMediaId(it, mediaId)?.serverVersion }
@@ -167,19 +190,24 @@ class MediaDeletionService @Inject constructor(
         val allTargets = targets + extraRemoteTargets
         if (allTargets.isEmpty()) {
             mediaTaskCoordinator.endDelete(photoIds)
-            return DeleteStep.Finished(DeleteSummary())
+            return finish(scope, photoIds.distinct().size, DeleteSummary())
         }
         // 仅本机无需探测服务端；连接不可达时及时按离线策略继续本机授权。
-        val remoteSession = if (allTargets.any { it.serverMediaId != null } && connection != null && networkAvailable()) {
+        val remoteSession = if (scope.remote && allTargets.any { it.serverMediaId != null } && connection != null && networkAvailable()) {
             withTimeoutOrNull(3_000L) { remoteDeletionIdentity.capture() }
         } else null
+        if (scope.remote && remoteSession == null) {
+            mediaTaskCoordinator.endDelete(photoIds)
+            return finish(scope, photoIds.distinct().size, DeleteSummary(remoteUnavailable = allTargets.count { it.serverMediaId != null }))
+        }
         val session = DeleteSession(
+            scope = scope,
             // 离线判定以真实网络可用为准：仍绑定但断网时只删本机、不请求远程。
             online = remoteSession != null,
             remoteSession = remoteSession,
             namespace = namespace,
             targets = allTargets,
-            localPending = allTargets.filter { it.sourceUri != null },
+            localPending = allTargets.filter { scope.local && it.sourceUri != null },
             localDone = emptySet(),
         )
         return advanceLocal(session)
@@ -248,21 +276,28 @@ class MediaDeletionService @Inject constructor(
 
         for (target in session.targets) {
             val hasLocal = target.sourceUri != null
-            val localDeleted = !hasLocal || target.photoId in session.localDone
-            if (hasLocal && !localDeleted) {
+            val localRequested = session.scope.local && hasLocal
+            val localDeleted = !localRequested || target.photoId in session.localDone
+            if (localRequested && !localDeleted) {
                 decisions += Decision.Retain(target.photoId)
                 continue
             }
-            if (hasLocal) deletedLocal++
+            if (localRequested) deletedLocal++
             val serverMediaId = target.serverMediaId
-            if (serverMediaId == null) {
-                decisions += Decision.DeleteLocal(target.photoId)
+            if (serverMediaId == null || !session.scope.remote) {
+                decisions += when {
+                    !localRequested -> Decision.Retain(target.photoId)
+                    serverMediaId != null -> Decision.ConvertToRemote(target.photoId)
+                    else -> Decision.DeleteLocal(target.photoId)
+                }
+                if (localRequested && serverMediaId != null) remoteRetained++
                 continue
             }
             if (remoteSession == null || !remoteDeletionIdentity.isCurrent(remoteSession)) {
-                if (hasLocal) {
+                if (localRequested) {
                     decisions += Decision.ConvertToRemote(target.photoId)
                     remoteRetained++
+                    remoteUnavailable++
                 } else {
                     decisions += Decision.Retain(target.photoId)
                     remoteUnavailable++
@@ -273,7 +308,7 @@ class MediaDeletionService @Inject constructor(
             // 未知版本不能省略并发保护，保留远程供同步取得版本后显性重试。
             val expectedVersion = target.serverVersion?.takeIf { it > 0 }
             if (expectedVersion == null) {
-                decisions += if (hasLocal) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
+                decisions += if (localRequested) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
                 remoteFailed++
                 continue
             }
@@ -301,30 +336,30 @@ class MediaDeletionService @Inject constructor(
                     "succeeded" -> {
                         mediaOperationDao.updateOperationState(operationId, "succeeded", null, now)
                         mediaTaskCoordinator.markRemoteDeleted(session.namespace ?: "", serverMediaId, target.serverVersion)
-                        decisions += Decision.DeleteLocal(target.photoId)
+                        decisions += if (localRequested || !hasLocal) Decision.DeleteLocal(target.photoId) else Decision.Retain(target.photoId)
                         remoteDeletedIds += serverMediaId
                         remoteTrashed++
                     }
                     "not_found" -> {
                         mediaOperationDao.updateOperationState(operationId, "failed", response.message, now)
                         mediaTaskCoordinator.markRemoteDeleted(session.namespace ?: "", serverMediaId, target.serverVersion)
-                        decisions += Decision.DeleteLocal(target.photoId)
+                        decisions += if (localRequested || !hasLocal) Decision.DeleteLocal(target.photoId) else Decision.Retain(target.photoId)
                     }
                     "conflict" -> {
                         mediaOperationDao.updateOperationState(operationId, "conflict", response.message, now)
-                        decisions += if (hasLocal) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
+                        decisions += if (localRequested) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
                         remoteFailed++
                     }
                     else -> {
                         mediaOperationDao.updateOperationState(operationId, "failed", response.message, now)
-                        decisions += if (hasLocal) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
+                        decisions += if (localRequested) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
                         remoteFailed++
                     }
                 }
             } catch (error: Exception) {
                 // 超时/连接丢失：只标记结果待确认，真实远程状态由正常同步校正，不自动重放。
                 mediaOperationDao.updateOperationState(operationId, "unknown", error.message, now)
-                decisions += if (hasLocal) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
+                decisions += if (localRequested) Decision.ConvertToRemote(target.photoId) else Decision.Retain(target.photoId)
                 remotePending++
             }
         }
@@ -362,7 +397,9 @@ class MediaDeletionService @Inject constructor(
 
         mediaTaskCoordinator.endDelete(session.targets.map { it.photoId })
 
-        return DeleteStep.Finished(
+        return finish(
+            session.scope,
+            session.targets.count { !it.photoId.startsWith("live-motion:") },
             DeleteSummary(
                 deletedLocal = deletedLocal,
                 remoteTrashed = remoteTrashed,
@@ -374,6 +411,37 @@ class MediaDeletionService @Inject constructor(
                 localFailed = session.localFailed,
             )
         )
+    }
+
+    private suspend fun finish(scope: DeleteScope, count: Int, summary: DeleteSummary): DeleteStep.Finished {
+        val now = System.currentTimeMillis()
+        val failed = summary.remoteFailed + summary.remotePending + summary.remoteUnavailable + summary.localFailed
+        val status = when {
+            failed > 0 -> "failed"
+            summary.notDeleted > 0 -> "cancelled"
+            else -> "completed"
+        }
+        taskRepository.upsert(
+            AppTask(
+                id = UUID.randomUUID().toString(),
+                kind = "delete",
+                title = when (scope) {
+                    DeleteScope.PHONE -> "从手机移除 $count 项"
+                    DeleteScope.SERVER -> "从服务器移除 $count 项"
+                    DeleteScope.BOTH -> "从手机和服务器移除 $count 项"
+                },
+                status = status,
+                message = summary.message(),
+                current = count,
+                total = count,
+                indeterminate = false,
+                createdAt = now,
+                updatedAt = now,
+                finishedAt = now,
+            )
+        )
+        taskRepository.cleanupRecentResults(now - 7L * 24 * 60 * 60 * 1000)
+        return DeleteStep.Finished(summary)
     }
 
     /**

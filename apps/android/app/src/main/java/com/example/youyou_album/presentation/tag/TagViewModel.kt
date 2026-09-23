@@ -70,7 +70,7 @@ class TagViewModel @Inject constructor(
         }
     }
 
-    fun deletePhotos(photoIds: List<String>) {
-        mediaDelete.delete(photoIds)
+    fun deletePhotos(photoIds: List<String>, scope: com.example.youyou_album.service.MediaDeletionService.DeleteScope) {
+        mediaDelete.delete(photoIds, scope)
     }
 }

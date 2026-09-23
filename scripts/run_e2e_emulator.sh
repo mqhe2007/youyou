@@ -189,7 +189,7 @@ if [[ -n "$TEST_FILTER" ]]; then
     GRADLE_ARGS+=("-Pandroid.testInstrumentationRunnerArguments.class=$TEST_FILTER")
 fi
 
-log "执行: ./gradlew ${GRADLE_ARGS[*]}（ANDROID_SERIAL=$TARGET_SERIAL）"
+log "执行: ./gradlew ${GRADLE_ARGS[*]}（ANDROID_SERIAL=${TARGET_SERIAL}）"
 
 # 打时间戳：结果目录里会残留上一次（甚至别的设备）的 XML，
 # 统计时必须只算本次运行新写出的文件，否则会打印出与退出码矛盾的「失败: 0」。

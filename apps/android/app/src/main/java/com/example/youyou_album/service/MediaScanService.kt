@@ -84,7 +84,12 @@ class MediaScanService @Inject constructor(
         while(true) {
             val batch = photoDao.localScanBatch(after,128)
             if(batch.isEmpty()) break
-            val removed=batch.filter { it.sourceUri !in seenUris && !mediaTaskCoordinator.isDeleting(it.id) }.map { it.id }
+            // A download can insert into MediaStore after this scan's query snapshot. Confirm
+            // absence before pruning its freshly indexed local row.
+            val removed=batch.filter {
+                it.sourceUri !in seenUris && !mediaTaskCoordinator.isDeleting(it.id) &&
+                    !localMediaStillExists(it.sourceUri)
+            }.map { it.id }
             if(removed.isNotEmpty()) { photoDao.deleteByIds(removed); removedCount+=removed.size }
             after=batch.last().id
         }
@@ -98,6 +103,17 @@ class MediaScanService @Inject constructor(
             updatedPhotos = updatedCount,
             removedPhotos = removedCount,
         )
+    }
+
+    private fun localMediaStillExists(sourceUri: String?): Boolean {
+        if (sourceUri == null) return false
+        return try {
+            context.contentResolver.query(
+                Uri.parse(sourceUri), arrayOf(MediaStore.MediaColumns._ID), null, null, null,
+            )?.use { it.moveToFirst() } ?: true
+        } catch (_: SecurityException) {
+            true
+        }
     }
 
 

@@ -20,6 +20,8 @@ import com.example.youyou_album.domain.model.Tag
 import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TagRepository
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
@@ -59,7 +61,8 @@ class ServerSyncService @Inject constructor(
         private const val RECONCILE_CHUNK = 400
     }
 
-    private var running = false
+    // ponytail: one active account needs one lock; use per-account locks only if concurrent accounts arrive.
+    private val syncMutex = Mutex()
     private lateinit var serverNamespace: String
     private var apiService: YouyouApiService? = null
 
@@ -121,10 +124,10 @@ class ServerSyncService @Inject constructor(
         }.onFailure { Log.d(TAG, "upload version fetch skipped: ${it.javaClass.simpleName}") }
     }
 
-    suspend fun sync(baseUrl: String): ServerSyncReport? {
-        if (running) return null
-        running = true
-        try {
+    /** Wait for an in-flight sync before replacing its account and clearing its projections. */
+    suspend fun prepareAccountSwitch(change: suspend () -> Unit) = syncMutex.withLock { change() }
+
+    suspend fun sync(baseUrl: String): ServerSyncReport? = syncMutex.withLock {
             val service = apiService?.takeIf {
                 ::serverNamespace.isInitialized && serverNamespace == computeServerNamespace(baseUrl)
             } ?: apiServiceFactory.create(baseUrl)
@@ -147,10 +150,7 @@ class ServerSyncService @Inject constructor(
             // 同步失败时不动旧数据。
             purgeOtherNamespaces()
             remoteDeletionIdentity.reconcile()
-            return report
-        } finally {
-            running = false
-        }
+            report
     }
 
     /**

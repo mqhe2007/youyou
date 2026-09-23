@@ -61,7 +61,8 @@ class ServerConnectionUiE2ETest {
     fun serverConnectionPage_scanCardIsDisplayed() {
         navigateToServerConnection()
         composeRule.onNodeWithText("扫码连接").assertIsDisplayed()
-        composeRule.onNodeWithText("在管理端「用户」页生成二维码，用它扫码即可完成连接。").assertIsDisplayed()
+        composeRule.onNodeWithText("受邀成员向管理员索取自己的二维码；管理员先部署服务，再到管理端「用户」页生成。").assertIsDisplayed()
+        composeRule.onNodeWithText("查看部署说明").assertIsDisplayed()
     }
 
     @Test
