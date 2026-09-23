@@ -142,6 +142,34 @@ pub(crate) async fn delete_media(
         .as_deref()
         .map(|value| format!("device:{value}"))
         .unwrap_or_else(|| "device".to_owned());
+    // FR-5 实况整体删除：删静态帧时级联删掉配对动态部分。若让客户端分两次删，
+    // 客户端投影滞后就拿不到动态部分的媒体 id，会留下半张实况。
+    if let Some(motion_id) =
+        crate::live_photo::paired_motion_id(&state.db, &id, Some(user_id)).await?
+    {
+        // 操作 id 必须逐次唯一：固定 id 会让第二次删除被当成重放而静默跳过级联。
+        let parent_operation = request.operation_id.trim();
+        let cascade_operation = format!(
+            "{}:motion",
+            &parent_operation[..parent_operation.len().min(120)]
+        );
+        if let Err(error) = trash::delete_media(
+            &state.db,
+            storage.as_ref(),
+            &state.trash,
+            &motion_id,
+            Some(user_id),
+            &deleted_by,
+            &scope_key,
+            &cascade_operation,
+            None,
+            device_id.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!(media_id = %motion_id, error = ?error, "级联删除实况动态部分失败，静态帧删除继续");
+        }
+    }
     let outcome: DeleteOutcome = trash::delete_media(
         &state.db,
         storage.as_ref(),

@@ -655,6 +655,7 @@ fn scan_summary_from_checkpoint(checkpoint: Option<&serde_json::Value>) -> ScanS
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn save_interrupted_checkpoint(
     pool: &SqlitePool,
     job_id: &str,
@@ -1052,10 +1053,12 @@ pub(crate) async fn index_media_with_metadata(
         taken_at_override,
         None,
         None,
+        crate::live_photo::DeclaredLive::default(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn index_media_with_time(
     pool: &SqlitePool,
     storage: &LocalFilesystemStorageDriver,
@@ -1064,6 +1067,7 @@ pub(crate) async fn index_media_with_time(
     taken_at_override: Option<Option<i64>>,
     timeline: Option<crate::media_time::MediaTime>,
     original_name: Option<&str>,
+    declared: crate::live_photo::DeclaredLive,
 ) -> anyhow::Result<()> {
     let media_format = crate::media_format::from_path(&entry.path);
     let mime_type = crate::media_format::mime_for_path(&entry.path);
@@ -1108,10 +1112,27 @@ pub(crate) async fn index_media_with_time(
     } else {
         true
     };
+    // 实况识别按探测版本增量补做：升级识别逻辑后已索引行会在下一次扫描重新探测一次；
+    // `failed` 表示上次识别失败，可重试（识别失败一律降级为普通媒体）。
+    let needs_live_probe = if let Some(id) = pending.media_id_hint.as_deref() {
+        sqlx::query_as::<_, (i64, String)>(
+            "SELECT live_probe_version, live_probe_state FROM media_assets WHERE id=?1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .is_none_or(|(version, state)| {
+            version != crate::live_photo::PROBE_VERSION || state == "failed"
+        })
+    } else {
+        true
+    };
     if pending.skip_hash
         && !metadata_override_requested
         && !owner_changed
         && !needs_time_verification
+        && !needs_live_probe
+        && declared.is_empty()
     {
         return Ok(());
     }
@@ -1185,6 +1206,20 @@ pub(crate) async fn index_media_with_time(
                 ExtractedMetadata::default()
             }
         }
+    };
+    // 实况识别：探测单文件动态照片（XMP 声明 + 视频字节确认）与 iOS 内容标识。
+    // 只在新行、内容变化、探测版本落后或调用方带声明时执行，避免每次重扫都读文件。
+    let live_probe = if needs_live_probe || !declared.is_empty() {
+        match crate::live_photo::probe_path(storage, &entry.path, current_stat.size, is_video).await
+        {
+            Ok(probe) => Some(probe),
+            Err(error) => {
+                tracing::warn!(path = %entry.path, error = ?error, "实况探测失败，降级为普通媒体");
+                None
+            }
+        }
+    } else {
+        None
     };
     let content_size = i64::try_from(content_size).context("media file is too large")?;
     let modified_at = entry.modified_at;
@@ -1438,6 +1473,26 @@ pub(crate) async fn index_media_with_time(
         .await?;
     }
 
+    // 实况识别结果落库并完成配对：配对从任一侧到达都能建立，第二侧入库即配对，
+    // 不依赖下一次扫描（FR-1）。
+    let live_probe_applied = needs_live_probe || !declared.is_empty();
+    let live = if live_probe_applied {
+        Some(
+            crate::live_photo::apply_probe(
+                &mut transaction,
+                &media_id,
+                &entry.path,
+                is_video,
+                owner_user_id,
+                live_probe.as_ref(),
+                &declared,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     if let Some(previous) = existing_location.as_ref() {
         if previous.media_asset_id != media_id {
             let still_referenced = sqlx::query_scalar::<_, i64>(
@@ -1522,13 +1577,24 @@ pub(crate) async fn index_media_with_time(
     .bind(&media_id)
     .execute(&mut *transaction)
     .await?;
-    if location_changed || metadata_override_requested || time_changed {
+    if let Some(live) = live.as_ref()
+        && let Some(partner_id) = live.partner_id.as_deref()
+    {
+        // 配对对手的投影也变了：为它单独发一次 upsert，客户端才能收敛。
+        crate::live_photo::emit(&mut transaction, revision, partner_id, now).await?;
+    }
+
+    if location_changed
+        || metadata_override_requested
+        || time_changed
+        || live.as_ref().is_some_and(|live| live.own_changed)
+    {
         let media_version =
             sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
                 .bind(&media_id)
                 .fetch_one(&mut *transaction)
                 .await?;
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "id": media_id,
             "name": entry.name,
             "path": entry.path,
@@ -1547,6 +1613,9 @@ pub(crate) async fn index_media_with_time(
             "sortAt": sort_at,
             "sortSource": time.source, "timeVersion": 1, "originalName": original_name,
         });
+        payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
+            .await?
+            .unwrap_or(serde_json::Value::Null);
         sqlx::query(
             r#"
             INSERT INTO change_log
@@ -1869,6 +1938,7 @@ mod tests {
                 source: "modified".into(),
             }),
             None,
+            crate::live_photo::DeclaredLive::default(),
         )
         .await?;
         let time2 = sqlx::query_as::<_, (Option<i64>, String)>(
@@ -1898,6 +1968,7 @@ mod tests {
                 source: "modified".into(),
             }),
             Some("plain.jpg"),
+            crate::live_photo::DeclaredLive::default(),
         )
         .await?;
         index_media_with_metadata(&state.db, &storage, &generated, Some(None), None).await?;

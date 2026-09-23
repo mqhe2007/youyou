@@ -250,6 +250,7 @@ pub(crate) async fn list_user_favorites(
         SELECT id, name, is_video, taken_at
         FROM media_assets
         WHERE owner_user_id = ?1 AND is_favorite = 1 AND identity_state = 'verified'
+          AND live_role != 'motion'
         ORDER BY (sort_at IS NULL) ASC, sort_at DESC, id DESC
         LIMIT 500
         "#,

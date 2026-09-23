@@ -478,6 +478,7 @@ pub(crate) async fn upload_library(
         taken_at,
         None,
         None,
+        crate::live_photo::DeclaredLive::default(),
         body,
     )
     .await?;
@@ -1031,6 +1032,9 @@ async fn rewrite_media_location(pool: &SqlitePool, from: &str, to: &str) -> AppR
     payload["sortSource"] = serde_json::json!(time.0);
     payload["timeVersion"] = serde_json::json!(time.1);
     payload["originalName"] = serde_json::json!(time.2);
+    payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
+        .await?
+        .unwrap_or(serde_json::Value::Null);
     sqlx::query(
         r#"
         INSERT INTO change_log
@@ -1167,6 +1171,9 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
         payload["sortSource"] = serde_json::json!(time.0);
         payload["timeVersion"] = serde_json::json!(time.1);
         payload["originalName"] = serde_json::json!(time.2);
+        payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
+            .await?
+            .unwrap_or(serde_json::Value::Null);
         sqlx::query(
             r#"
             INSERT INTO change_log

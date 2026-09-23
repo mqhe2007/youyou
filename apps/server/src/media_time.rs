@@ -74,15 +74,21 @@ pub fn choose(old: MediaTime, new: MediaTime) -> MediaTime {
 /// replaced by a generated one, so the current name must not be trusted as the original).
 const BATCH_SELECT_SQL: &str = "SELECT a.id,a.name,a.sort_at,EXISTS(SELECT 1 FROM media_locations l WHERE l.media_asset_id=a.id AND l.normalized_path LIKE '%/uploads/%') FROM media_assets a WHERE a.time_version=0 ORDER BY a.id LIMIT 256";
 const BACKFILL_UPDATE_SQL: &str = "UPDATE media_assets SET sort_at=?1,sort_source=?2,original_name=?4,time_version=-1,version=version+1 WHERE id=?3 AND time_version=0";
-const EMIT_SQL: &str = r#"INSERT INTO change_log(revision,event_id,entity,operation,entity_id,version,payload,created_at,owner_user_id)
+fn emit_sql() -> String {
+    format!(
+        r#"INSERT INTO change_log(revision,event_id,entity,operation,entity_id,version,payload,created_at,owner_user_id)
       SELECT ?1,?2,'media','upsert',a.id,a.version,json_object(
       'id',a.id,'name',a.name,'path',l.normalized_path,'size',l.size,'contentHash',b.content_hash,
       'mimeType',a.mime_type,'isVideo',json(CASE WHEN a.is_video=1 THEN 'true' ELSE 'false' END),
       'storageId',l.storage_id,'identityState',a.identity_state,'hashState',l.hash_state,
       'width',a.width,'height',a.height,'durationMs',a.duration_ms,'takenAt',a.taken_at,
-      'sortAt',a.sort_at,'sortSource',a.sort_source,'timeVersion',a.time_version,'originalName',a.original_name),?3,a.owner_user_id
+      'sortAt',a.sort_at,'sortSource',a.sort_source,'timeVersion',a.time_version,'originalName',a.original_name,
+      {live}),?3,a.owner_user_id
       FROM media_assets a JOIN media_locations l ON l.media_asset_id=a.id LEFT JOIN content_blobs b ON b.id=a.blob_id
-      WHERE a.id=?4 ORDER BY l.normalized_path LIMIT 1"#;
+      WHERE a.id=?4 ORDER BY l.normalized_path LIMIT 1"#,
+        live = crate::live_photo::PAYLOAD_FRAGMENT,
+    )
+}
 
 /// Bounded, restartable historical correction, with ordinary change events for existing clients.
 pub async fn backfill(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -135,7 +141,7 @@ async fn run_backfill(
     Ok(count)
 }
 pub async fn emit(tx: &mut sqlx::SqliteConnection, id: &str, revision: i64) -> anyhow::Result<()> {
-    sqlx::query(EMIT_SQL)
+    sqlx::query(&emit_sql())
         .bind(revision)
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(crate::db::now_millis())
@@ -757,13 +763,13 @@ mod tests {
     async fn query_plans(database: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         let mut plans = serde_json::Map::new();
         for (label, sql) in [
-            ("batch", BATCH_SELECT_SQL),
-            ("emit", EMIT_SQL),
-            ("update", BACKFILL_UPDATE_SQL),
+            ("batch", BATCH_SELECT_SQL.to_owned()),
+            ("emit", emit_sql()),
+            ("update", BACKFILL_UPDATE_SQL.to_owned()),
         ] {
             plans.insert(
                 label.to_string(),
-                serde_json::json!(explain(database, sql).await?.lines().collect::<Vec<_>>()),
+                serde_json::json!(explain(database, &sql).await?.lines().collect::<Vec<_>>()),
             );
         }
         Ok(serde_json::Value::Object(plans))

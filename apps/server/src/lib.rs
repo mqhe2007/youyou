@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod heif;
+pub mod live_photo;
 pub mod media_format;
 pub mod media_library;
 pub mod metadata;
@@ -67,6 +68,14 @@ pub async fn initialize(
     let health = storage_driver.health_check().await?;
     ensure_local_storage(&db, storage_driver.root(), health.read_only).await?;
     let setup_token_path = auth::prepare_setup_token(data_dir, &db).await?;
+
+    // 实况照片历史收敛（FR-7）：对已分别索引的成对文件补配对并清理失效配对。
+    // 只做库内可判定的部分，有界且幂等；失败不阻断启动（下次启动或扫描继续收敛）。
+    match crate::live_photo::backfill_pairs(&db).await {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "实况照片历史配对已收敛"),
+        Err(error) => tracing::error!(error = ?error, "实况照片历史配对收敛失败"),
+    }
 
     // 回收站：先校验配置（同文件系统 + 位于扫描树之外），再恢复未完成文件操作，
     // 最后补一次到期清理。扫描任务在 HTTP 服务起来之后才可能被触发，因此

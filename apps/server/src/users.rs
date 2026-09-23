@@ -46,7 +46,8 @@ const USER_SUMMARY_SELECT: &str = r#"
            (SELECT COUNT(*) FROM devices d
             WHERE d.user_id = u.id AND d.revoked_at IS NULL) AS device_count,
            (SELECT COUNT(*) FROM media_assets a
-            WHERE a.owner_user_id = u.id AND a.identity_state = 'verified') AS media_count,
+            WHERE a.owner_user_id = u.id AND a.identity_state = 'verified'
+              AND a.live_role != 'motion') AS media_count,
            u.created_at
     FROM users u
     LEFT JOIN user_libraries ul ON ul.user_id = u.id
@@ -438,7 +439,7 @@ pub(crate) async fn append_media_upsert_change(
     let Some(row) = row else {
         return Ok(());
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "id": row.id,
         "name": row.name,
         "path": row.normalized_path,
@@ -458,6 +459,9 @@ pub(crate) async fn append_media_upsert_change(
         "sortAt": row.sort_at,
         "sortSource": row.sort_source, "timeVersion": row.time_version, "originalName": row.original_name,
     });
+    payload["livePhoto"] = crate::live_photo::payload_json(&mut *transaction, media_id)
+        .await?
+        .unwrap_or(serde_json::Value::Null);
     sqlx::query(
         r#"
         INSERT INTO change_log

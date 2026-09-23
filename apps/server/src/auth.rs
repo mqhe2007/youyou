@@ -422,7 +422,16 @@ fn require_client_version(headers: &HeaderMap) -> AppResult<()> {
     let Some(value) = value else {
         return Err(AppError::UpgradeRequired);
     };
-    let mut parts = value.split('.');
+    // 只比较版本号核心：debug 等构建变体的 `-debug` 后缀、以及 semver 的预发布/构建元数据
+    // 都不参与比较。否则调试包（versionName = "0.3.1-debug"）会被误判成低于下限，
+    // 所有需要鉴权的接口一律 426。
+    let core = value
+        .trim()
+        .split(['-', '+'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let mut parts = core.split('.');
     let Some(major) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
         return Err(AppError::UpgradeRequired);
     };
@@ -705,4 +714,39 @@ fn write_secret_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     file.write_all(content)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod client_version_tests {
+    use super::*;
+
+    fn headers(version: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-youyou-client-version",
+            axum::http::HeaderValue::from_str(version).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn accepts_build_variant_suffix_and_rejects_real_old_versions() {
+        // debug 变体的 versionName 带 `-debug` 后缀，不能被误判成低于下限。
+        require_client_version(&headers("0.3.1-debug")).expect("debug 包应通过");
+        require_client_version(&headers("0.3.1")).expect("正式包应通过");
+        require_client_version(&headers("1.0.0+build.7")).expect("构建元数据应通过");
+        require_client_version(&headers("0.1.3")).expect("恰好等于下限应通过");
+        assert!(
+            require_client_version(&headers("0.0.1")).is_err(),
+            "低于下限应拒绝"
+        );
+        assert!(
+            require_client_version(&headers("dev")).is_err(),
+            "非法格式应拒绝"
+        );
+        assert!(
+            require_client_version(&headers("0.1.3.4")).is_err(),
+            "多段版本应拒绝"
+        );
+    }
 }

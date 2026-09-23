@@ -71,6 +71,7 @@ pub async fn stream_upload_for_user(
     taken_at: Option<i64>,
     timeline: Option<crate::media_time::MediaTime>,
     original_name: Option<&str>,
+    declared: crate::live_photo::DeclaredLive,
     body: Body,
 ) -> AppResult<StreamUploadResponse> {
     stream_upload_with_destination(
@@ -84,6 +85,7 @@ pub async fn stream_upload_for_user(
         taken_at,
         timeline,
         original_name,
+        declared,
         UploadDestination::UserLibrary(library_root.to_owned()),
         body,
     )
@@ -104,6 +106,7 @@ pub async fn stream_upload_to_directory(
     taken_at: Option<i64>,
     timeline: Option<crate::media_time::MediaTime>,
     original_name: Option<&str>,
+    declared: crate::live_photo::DeclaredLive,
     body: Body,
 ) -> AppResult<StreamUploadResponse> {
     let directory = LocalFilesystemStorageDriver::normalize_relative(directory)?;
@@ -118,6 +121,7 @@ pub async fn stream_upload_to_directory(
         taken_at,
         timeline,
         original_name,
+        declared,
         UploadDestination::AdminDirectory(Some(directory)),
         body,
     )
@@ -136,6 +140,7 @@ async fn stream_upload_with_destination(
     taken_at: Option<i64>,
     timeline: Option<crate::media_time::MediaTime>,
     original_name: Option<&str>,
+    declared: crate::live_photo::DeclaredLive,
     destination: UploadDestination,
     body: Body,
 ) -> AppResult<StreamUploadResponse> {
@@ -244,6 +249,7 @@ async fn stream_upload_with_destination(
         upload.taken_at.map(Some),
         timeline,
         Some(original_name.unwrap_or(file_name)),
+        declared,
     )
     .await
     {

@@ -388,6 +388,18 @@ pub(crate) async fn tombstone_media_tx(
     }
 
     detach_media_relations_tx(transaction, media_id, now, revision).await?;
+    // 实况配对是派生态：一侧消失即整体降级为普通媒体（FR-8），对手的投影同步更新。
+    for id in crate::live_photo::degrade_pair_tx(transaction, media_id, now).await? {
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT identity_state FROM media_assets WHERE id = ?1",
+        )
+        .bind(&id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if state == "verified" {
+            crate::live_photo::emit(transaction, revision, &id, now).await?;
+        }
+    }
     let version = sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
         .bind(media_id)
         .fetch_one(&mut *transaction)

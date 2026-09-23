@@ -1366,6 +1366,11 @@ async fn commit_restore_tx(
     .execute(&mut *transaction)
     .await?;
 
+    // 实况配对是派生态：恢复后立即尝试重建配对（两侧都恢复时即重新成为完整实况，
+    // 仅恢复一侧时按普通媒体展示，见 FR-5/FR-8）。
+    crate::live_photo::repair_pairing_tx(&mut *transaction, &payload.media_id, revision, now)
+        .await?;
+
     // 标签关系随回收保存，恢复时按 tag_id 重新关联；已删除的标签跳过而不重建。
     let tags = sqlx::query_as::<_, (String, Option<String>)>(
         r#"

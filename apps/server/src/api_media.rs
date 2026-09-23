@@ -29,6 +29,27 @@ pub(crate) struct MediaRow {
     original_name: Option<String>,
     version: i64,
     is_favorite: i64,
+    live_role: String,
+    live_embedded: i64,
+    live_group_key: Option<String>,
+    live_partner_id: Option<String>,
+    live_partner_hash: Option<String>,
+    live_motion_duration_ms: Option<i64>,
+}
+
+/// 实况照片标记（服务端投影即权威）。
+///
+/// `role = "motion"` 表示该行只是某段实况的动态部分，不作为独立媒体项展示；
+/// `role = "still"` 且 `partnerMediaId` 为空表示动态部分尚未入库（半态）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LivePhotoItem {
+    role: String,
+    embedded: bool,
+    group_key: Option<String>,
+    partner_media_id: Option<String>,
+    partner_content_hash: Option<String>,
+    motion_duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -55,6 +76,7 @@ pub(crate) struct MediaItem {
     original_name: Option<String>,
     version: i64,
     is_favorite: bool,
+    live_photo: Option<LivePhotoItem>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -449,12 +471,15 @@ pub(crate) async fn list_media(
             a.taken_at,
             a.sort_at, a.sort_source, a.time_version, a.original_name,
             a.version,
-            a.is_favorite
+            a.is_favorite,
+            a.live_role, a.live_embedded, a.live_group_key, a.live_partner_id,
+            a.live_partner_hash, a.live_motion_duration_ms
         FROM media_assets a
         INNER JOIN ranked_locations l
             ON l.media_asset_id = a.id AND l.location_rank = 1
         LEFT JOIN content_blobs b ON b.id = a.blob_id
         WHERE a.identity_state = 'verified' AND a.owner_user_id = ?3
+          AND a.live_role != 'motion'
         ORDER BY (a.sort_at IS NULL) ASC, a.sort_at DESC, a.id DESC
         LIMIT ?1 OFFSET ?2
         "#,
@@ -604,7 +629,9 @@ pub(crate) async fn find_media(pool: &SqlitePool, user_id: i64, id: &str) -> App
             a.taken_at,
             a.sort_at, a.sort_source, a.time_version, a.original_name,
             a.version,
-            a.is_favorite
+            a.is_favorite,
+            a.live_role, a.live_embedded, a.live_group_key, a.live_partner_id,
+            a.live_partner_hash, a.live_motion_duration_ms
         FROM media_assets a
         INNER JOIN ranked_locations l
             ON l.media_asset_id = a.id AND l.location_rank = 1
@@ -623,6 +650,18 @@ pub(crate) async fn find_media(pool: &SqlitePool, user_id: i64, id: &str) -> App
 pub(crate) fn media_item(row: MediaRow) -> AppResult<MediaItem> {
     let size = u64::try_from(row.size)
         .map_err(|_| AppError::Internal(anyhow::anyhow!("media size is negative")))?;
+    let live_photo = if row.live_role == "none" {
+        None
+    } else {
+        Some(LivePhotoItem {
+            role: row.live_role,
+            embedded: row.live_embedded == 1,
+            group_key: row.live_group_key,
+            partner_media_id: row.live_partner_id,
+            partner_content_hash: row.live_partner_hash,
+            motion_duration_ms: row.live_motion_duration_ms,
+        })
+    };
     Ok(MediaItem {
         id: row.id,
         name: row.name,
@@ -645,6 +684,7 @@ pub(crate) fn media_item(row: MediaRow) -> AppResult<MediaItem> {
         original_name: row.original_name,
         version: row.version,
         is_favorite: row.is_favorite == 1,
+        live_photo,
     })
 }
 
@@ -1258,7 +1298,11 @@ pub(crate) async fn remove_tag_media(
         ("X-Time-Version" = Option<i32>, Header, description = "Media time contract version, currently 1"),
         ("X-Sort-At" = Option<i64>, Header, description = "Stable media timestamp in milliseconds"),
         ("X-Sort-Source" = Option<String>, Header, description = "capture, filename, added, modified, legacy or unknown"),
-        ("X-Original-Name" = Option<String>, Header, description = "Original source filename; empty means unrecoverable")
+        ("X-Original-Name" = Option<String>, Header, description = "Original source filename; empty means unrecoverable"),
+        ("X-Live-Photo-Role" = Option<String>, Header, description = "still or motion; declares the file as part of a live photo"),
+        ("X-Live-Photo-Group" = Option<String>, Header, description = "Opaque live photo group key shared by both parts"),
+        ("X-Live-Photo-Embedded" = Option<String>, Header, description = "1 when the still carries an embedded motion part"),
+        ("X-Live-Photo-Motion-Duration-Ms" = Option<i64>, Header, description = "Declared duration of the motion part in milliseconds")
     ),
     request_body(content_type = "application/octet-stream", content = [u8], description = "File binary stream"),
     responses(
@@ -1332,10 +1376,45 @@ pub(crate) async fn stream_upload(
                 })
             }),
         headers.get("x-original-name").and_then(|v| v.to_str().ok()),
+        parse_live_photo_headers(&headers),
         body,
     )
     .await?;
     Ok(Json(result))
+}
+
+/// 实况照片声明：客户端在上传时把本地识别结果交给服务端（上传会改名，基名配对不可用）。
+///
+/// 服务端不因此免于自证：单文件动态照片仍要由服务端确认视频字节真实存在，内容标识
+/// 仍以服务端读取为准。这里只是让「静态帧先到、动态部分后到」也能立即配对。
+fn parse_live_photo_headers(headers: &HeaderMap) -> crate::live_photo::DeclaredLive {
+    let role = headers
+        .get("x-live-photo-role")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "still" | "motion"))
+        .map(str::to_owned);
+    let group_key = headers
+        .get("x-live-photo-group")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned);
+    let embedded = headers
+        .get("x-live-photo-embedded")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.trim() == "1");
+    let motion_duration_ms = headers
+        .get("x-live-photo-motion-duration-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0);
+    crate::live_photo::DeclaredLive {
+        role,
+        group_key,
+        embedded,
+        motion_duration_ms,
+    }
 }
 
 pub(crate) fn parse_range(value: Option<&HeaderValue>) -> AppResult<Option<(u64, Option<u64>)>> {

@@ -318,6 +318,20 @@ async fn stream_upload_request(
     taken_at: Option<i64>,
     body: &[u8],
 ) -> axum::response::Response {
+    stream_upload_request_with_headers(app, device_token, file_name, mime_type, taken_at, &[], body)
+        .await
+}
+
+/// 与 [`stream_upload_request`] 相同，但可追加额外请求头（实况照片声明等）。
+async fn stream_upload_request_with_headers(
+    app: &axum::Router,
+    device_token: &str,
+    file_name: &str,
+    mime_type: Option<&str>,
+    taken_at: Option<i64>,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> axum::response::Response {
     let sha256 = hex::encode(Sha256::digest(body));
     let mut builder = Request::builder()
         .method(Method::POST)
@@ -333,6 +347,9 @@ async fn stream_upload_request(
     }
     if let Some(taken_at) = taken_at {
         builder = builder.header("X-Taken-At", taken_at.to_string());
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
     }
     let mut request = builder
         .body(Body::from(body.to_vec()))
@@ -4027,5 +4044,612 @@ async fn job_records_execution_start_and_resets_it_only_on_manual_retry() {
     assert!(
         retry_json["startedAt"].is_null(),
         "人工重试应清空执行起点，重新计时"
+    );
+}
+
+// ── 实况照片（iOS 成对 / Android 单文件）──────────────────────────
+
+/// 触发一次扫描并等到终态。
+async fn run_scan(app: &axum::Router, admin_token: &str, csrf_token: &str) -> serde_json::Value {
+    let scan = request(
+        app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan",
+        None,
+        Some(admin_token),
+        Some(csrf_token),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(scan.into_body(), usize::MAX)
+        .await
+        .expect("scan body");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&body).expect("scan json")["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    wait_admin_job(app, admin_token, &job_id).await
+}
+
+/// 设备侧媒体清单（默认一条足够大的分页）。
+async fn media_list(app: &axum::Router, device_token: &str) -> serde_json::Value {
+    let response = request(
+        app,
+        Method::GET,
+        "/api/v1/media?limit=50",
+        None,
+        Some(device_token),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("media body");
+    serde_json::from_slice(&body).expect("media json")
+}
+
+async fn media_detail(app: &axum::Router, device_token: &str, media_id: &str) -> serde_json::Value {
+    let response = request(
+        app,
+        Method::GET,
+        &format!("/api/v1/media/{media_id}"),
+        None,
+        Some(device_token),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("detail body");
+    serde_json::from_slice(&body).expect("detail json")
+}
+
+fn media_by_name<'a>(list: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("/api/v1/media 里应当能找到 {name}：{list}"))
+}
+
+/// 构造单文件动态照片（Android Motion Photo format 1.0）：真实 JPEG + XMP + 末尾追加视频。
+fn motion_photo_fixture(video: &[u8]) -> Vec<u8> {
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([7, 8, 9])))
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+    let jpeg = jpeg.into_inner();
+    let xmp = format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:Camera="http://ns.google.com/photos/1.0/camera/" xmlns:Container="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/" Camera:MotionPhoto="1" Camera:MotionPhotoVersion="1"><Container:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Length="{}" Item:Semantic="Primary" Item:Padding="0"/></rdf:li><rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Length="{}" Item:Semantic="MotionPhoto" Item:Padding="0"/></rdf:li></rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>"#,
+        jpeg.len(),
+        video.len(),
+    );
+    let mut payload = b"http://ns.adobe.com/xap/1.0/".to_vec();
+    payload.push(0);
+    payload.extend_from_slice(xmp.as_bytes());
+    let mut file = Vec::new();
+    file.extend_from_slice(&jpeg[..2]);
+    file.push(0xFF);
+    file.push(0xE1);
+    file.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+    file.extend_from_slice(&payload);
+    file.extend_from_slice(&jpeg[2..]);
+    file.extend_from_slice(video);
+    file
+}
+
+fn mp4_bytes(directory: &std::path::Path) -> Vec<u8> {
+    let path = directory.join(format!("fixture-{}.mp4", Uuid::new_v4()));
+    write_video_fixture(&path, "libx264", "mp4", "160x120");
+    std::fs::read(&path).expect("read mp4 fixture")
+}
+
+/// iOS 成对实况：同目录同基名（辅助线索）配对，配对视频不再作为独立媒体项出现。
+#[tokio::test]
+async fn live_photo_pair_merges_and_hides_paired_motion() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(library.join("camera"))
+        .await
+        .expect("camera directory");
+    // 静态帧先入库（jpg 名字序在前）与动态部分先入库（MOV 大写序在前）两种到达顺序都要能配对。
+    // 两个视频夹具的尺寸不同，避免相同内容被按同哈希合并成一条媒体。
+    write_jpeg(&library.join("camera/IMG_0001.jpg"), [10, 20, 30]);
+    write_video_fixture(
+        &library.join("camera/IMG_0001.mov"),
+        "libx264",
+        "mov",
+        "160x120",
+    );
+    write_video_fixture(
+        &library.join("camera/IMG_0003.MOV"),
+        "libx264",
+        "mov",
+        "176x144",
+    );
+    write_jpeg(&library.join("camera/IMG_0003.jpg"), [70, 80, 90]);
+    // 普通媒体：绝不允许出现实况标记。
+    write_jpeg(&library.join("camera/IMG_0002.jpg"), [40, 50, 60]);
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+
+    let job = run_scan(&app, &admin_token, &csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+
+    // 3 个媒体项：2 个实况静态帧 + 1 张普通照片；配对的动态视频不出现。
+    let list = media_list(&app, &device_token).await;
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3, "配对视频不得作为独立媒体项出现：{list}");
+    assert!(
+        items.iter().all(|item| item["isVideo"] == false),
+        "清单里不应再有独立视频项：{list}"
+    );
+
+    for name in ["IMG_0001.jpg", "IMG_0003.jpg"] {
+        let still = media_by_name(&list, name);
+        let live = &still["livePhoto"];
+        assert_eq!(live["role"], "still", "{name} 应携带实况标记");
+        assert_eq!(live["embedded"], false);
+        let partner_id = live["partnerMediaId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} 应已配对出动态部分：{still}"));
+        assert!(
+            live["partnerContentHash"].as_str().is_some(),
+            "{name} 的实况载荷应带对手内容哈希，供客户端派生三态：{still}"
+        );
+        assert!(
+            live["motionDurationMs"].as_i64().is_some(),
+            "{name} 的动态时长应作为元数据带出：{still}"
+        );
+
+        // 动态部分按 id 仍可读取（下载与播放都要用它），只是不进清单投影。
+        let motion = media_detail(&app, &device_token, partner_id).await;
+        assert_eq!(motion["livePhoto"]["role"], "motion");
+        assert_eq!(motion["isVideo"], true);
+        assert_eq!(
+            motion["livePhoto"]["partnerContentHash"], still["contentHash"],
+            "动态部分反向指向静态帧"
+        );
+    }
+
+    // 普通照片不得被误判。
+    let plain = media_by_name(&list, "IMG_0002.jpg");
+    assert_eq!(
+        plain["livePhoto"],
+        serde_json::Value::Null,
+        "普通 JPEG 不得出现实况标记"
+    );
+
+    // bootstrap 投影同样不含配对视频。
+    let bootstrap = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/sync/bootstrap",
+        serde_json::json!({}),
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(bootstrap.status(), StatusCode::ACCEPTED);
+    let bootstrap_body = to_bytes(bootstrap.into_body(), usize::MAX)
+        .await
+        .expect("bootstrap body");
+    let snapshot_id = serde_json::from_slice::<serde_json::Value>(&bootstrap_body)
+        .expect("bootstrap json")["snapshotId"]
+        .as_str()
+        .expect("snapshot id")
+        .to_owned();
+    let mut snapshot_media = 0_usize;
+    let mut last_status = serde_json::Value::Null;
+    for _ in 0..120 {
+        let status = request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/sync/bootstrap/{snapshot_id}"),
+            None,
+            Some(&device_token),
+            None,
+        )
+        .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), usize::MAX)
+            .await
+            .expect("bootstrap status body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("bootstrap status");
+        last_status = json.clone();
+        if json["state"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        last_status["state"], "ready",
+        "bootstrap 快照必须就绪：{last_status}"
+    );
+    let page = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/sync/bootstrap/{snapshot_id}/media?limit=50"),
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = to_bytes(page.into_body(), usize::MAX)
+        .await
+        .expect("snapshot items body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("snapshot items json");
+    let mut live_stills = 0_usize;
+    for item in json["items"].as_array().expect("snapshot items") {
+        snapshot_media += 1;
+        let role = item["data"]["livePhoto"]["role"].clone();
+        assert_ne!(
+            role, "motion",
+            "bootstrap 投影不得包含配对的动态视频：{item}"
+        );
+        if role == "still" {
+            assert!(
+                item["data"]["livePhoto"]["partnerMediaId"]
+                    .as_str()
+                    .is_some(),
+                "投影里的静态帧应携带已配对的动态部分：{item}"
+            );
+            live_stills += 1;
+        }
+    }
+    assert_eq!(snapshot_media, 3, "bootstrap 投影应只含 3 个媒体项");
+    assert_eq!(live_stills, 2, "bootstrap 投影应含 2 段实况的静态帧");
+
+    // 单边缺失即整体降级：删掉动态部分并重扫，静态帧回到普通图片。
+    tokio::fs::remove_file(library.join("camera/IMG_0001.mov"))
+        .await
+        .expect("remove motion");
+    let job = run_scan(&app, &admin_token, &csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+    let list = media_list(&app, &device_token).await;
+    let degraded = media_by_name(&list, "IMG_0001.jpg");
+    assert_eq!(
+        degraded["livePhoto"],
+        serde_json::Value::Null,
+        "动态部分消失后静态帧必须降级为普通图片：{degraded}"
+    );
+    // 另一对不受影响。
+    assert_eq!(
+        media_by_name(&list, "IMG_0003.jpg")["livePhoto"]["role"],
+        "still"
+    );
+}
+
+/// 上传路径：客户端显式声明实况分组（上传会改名，基名配对不可用），第二侧入库即配对。
+#[tokio::test]
+async fn live_photo_declared_upload_pairs_immediately_and_degrades() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (_admin_token, _csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+
+    let group = format!("group-{}", Uuid::new_v4());
+    let mut still = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(6, 4, image::Rgb([1, 2, 3])))
+        .write_to(&mut still, image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+    let still = still.into_inner();
+    let video = mp4_bytes(media.path());
+
+    // 只上传静态帧：半态（有实况标记，但动态部分尚未入库）。
+    let response = stream_upload_request_with_headers(
+        &app,
+        &device_token,
+        "IMG_7777.jpg",
+        Some("image/jpeg"),
+        Some(1700000000000),
+        &[
+            ("X-Live-Photo-Role", "still"),
+            ("X-Live-Photo-Group", group.as_str()),
+            ("X-Live-Photo-Motion-Duration-Ms", "1500"),
+        ],
+        &still,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("upload body");
+    let uploaded: serde_json::Value = serde_json::from_slice(&body).expect("upload json");
+    let still_id = uploaded["mediaId"].as_str().expect("still id").to_owned();
+
+    let list = media_list(&app, &device_token).await;
+    assert_eq!(list["items"].as_array().expect("items").len(), 1);
+    let item = media_detail(&app, &device_token, &still_id).await;
+    assert_eq!(item["livePhoto"]["role"], "still");
+    assert_eq!(
+        item["livePhoto"]["partnerMediaId"],
+        serde_json::Value::Null,
+        "动态部分尚未入库时保持半态"
+    );
+    assert_eq!(item["livePhoto"]["motionDurationMs"], 1500);
+
+    // 上传动态部分：第二侧入库即完成配对，不等下一次扫描。
+    let response = stream_upload_request_with_headers(
+        &app,
+        &device_token,
+        "IMG_7777.mov",
+        Some("video/quicktime"),
+        Some(1700000000000),
+        &[
+            ("X-Live-Photo-Role", "motion"),
+            ("X-Live-Photo-Group", group.as_str()),
+        ],
+        &video,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("upload body");
+    let uploaded: serde_json::Value = serde_json::from_slice(&body).expect("upload json");
+    let motion_id = uploaded["mediaId"].as_str().expect("motion id").to_owned();
+
+    let list = media_list(&app, &device_token).await;
+    assert_eq!(
+        list["items"].as_array().expect("items").len(),
+        1,
+        "配对后动态视频不得作为独立媒体项出现：{list}"
+    );
+    let item = media_detail(&app, &device_token, &still_id).await;
+    assert_eq!(item["livePhoto"]["partnerMediaId"], motion_id);
+    assert_eq!(item["livePhoto"]["role"], "still");
+    assert_eq!(
+        media_detail(&app, &device_token, &motion_id).await["livePhoto"]["role"],
+        "motion"
+    );
+
+    // 动态部分消失 → 整体降级，静态帧回到普通图片。
+    let motion_path = uploaded["path"].as_str().expect("motion path");
+    tokio::fs::remove_file(media.path().join(motion_path))
+        .await
+        .expect("remove motion");
+    let job = run_scan(&app, &_admin_token, &_csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+    let item = media_detail(&app, &device_token, &still_id).await;
+    assert_eq!(
+        item["livePhoto"],
+        serde_json::Value::Null,
+        "动态部分被移除后静态帧必须降级：{item}"
+    );
+}
+
+/// Android 单文件动态照片：XMP 声明 + 视频字节真实存在才算，普通图片不误判。
+#[tokio::test]
+async fn live_photo_embedded_motion_photo_is_detected_from_xmp() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library).await.expect("library");
+    let video = mp4_bytes(media.path());
+    let motion_photo = motion_photo_fixture(&video);
+    tokio::fs::write(library.join("MVIMG_0001.jpg"), &motion_photo)
+        .await
+        .expect("motion photo");
+    // 声明了动态照片但尾部没有视频字节：必须降级为普通图片。
+    let mut declared_without_video = motion_photo_fixture(&video);
+    declared_without_video.truncate(declared_without_video.len() - video.len());
+    tokio::fs::write(library.join("MVIMG_0002.jpg"), &declared_without_video)
+        .await
+        .expect("declared without video");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+    let job = run_scan(&app, &admin_token, &csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+
+    let list = media_list(&app, &device_token).await;
+    let item = media_by_name(&list, "MVIMG_0001.jpg");
+    assert_eq!(
+        item["livePhoto"]["role"], "still",
+        "应识别为单文件动态照片：{item}"
+    );
+    assert_eq!(item["livePhoto"]["embedded"], true);
+    assert_eq!(item["livePhoto"]["partnerMediaId"], serde_json::Value::Null);
+
+    // 不误判：XMP 声明了动态照片但视频字节已被截断 → 普通图片。
+    assert_eq!(
+        media_by_name(&list, "MVIMG_0002.jpg")["livePhoto"],
+        serde_json::Value::Null,
+        "只有标记没有视频字节时必须降级为普通图片"
+    );
+    // 不误判：合成文件里没有 XMP 的普通 JPEG 不是实况。
+    tokio::fs::write(library.join("IMG_0009.jpg"), photo_bytes(b"ordinary-photo"))
+        .await
+        .expect("ordinary photo");
+    let job = run_scan(&app, &admin_token, &csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+    let list = media_list(&app, &device_token).await;
+    assert_eq!(
+        media_by_name(&list, "IMG_0009.jpg")["livePhoto"],
+        serde_json::Value::Null
+    );
+}
+
+/// FR-7 历史收敛：已分别索引的成对文件由一次性配对过程合并，排序时间与收藏不丢。
+#[tokio::test]
+async fn live_photo_history_backfill_pairs_existing_rows() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library).await.expect("library");
+    write_jpeg(&library.join("IMG_5001.jpg"), [11, 22, 33]);
+    write_video_fixture(&library.join("IMG_5001.mov"), "libx264", "mov", "160x120");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (_admin_token, _csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+    let job = run_scan(&app, &_admin_token, &_csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+
+    // 还原成「旧版本已分别索引、尚无任何实况标记」的历史状态：这正是迁移给历史行的状态。
+    sqlx::query(
+        r#"
+        UPDATE media_assets
+        SET live_role = 'none', live_embedded = 0, live_group_key = NULL,
+            live_partner_id = NULL, live_partner_hash = NULL, live_motion_duration_ms = NULL,
+            live_probe_state = 'pending', live_probe_version = 0
+        "#,
+    )
+    .execute(&state.db)
+    .await
+    .expect("reset to legacy state");
+    let still_id = media_by_name(&media_list(&app, &device_token).await, "IMG_5001.jpg")["id"]
+        .as_str()
+        .expect("still id")
+        .to_owned();
+    sqlx::query("UPDATE media_assets SET is_favorite = 1 WHERE id = ?1")
+        .bind(&still_id)
+        .execute(&state.db)
+        .await
+        .expect("favorite the still");
+    let sort_at_before: Option<i64> =
+        sqlx::query_scalar("SELECT sort_at FROM media_assets WHERE id = ?1")
+            .bind(&still_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("sort_at before");
+
+    let paired = youyou_server::live_photo::backfill_pairs(&state.db)
+        .await
+        .expect("backfill pairs");
+    assert!(paired >= 2, "收敛应当把两侧都标记为实况：{paired}");
+
+    let list = media_list(&app, &device_token).await;
+    assert_eq!(
+        list["items"].as_array().expect("items").len(),
+        1,
+        "收敛后动态部分不得作为独立媒体项出现：{list}"
+    );
+    let still = media_by_name(&list, "IMG_5001.jpg");
+    assert_eq!(still["id"], still_id, "收敛不得更换媒体身份");
+    assert_eq!(still["livePhoto"]["role"], "still");
+    assert!(
+        still["livePhoto"]["partnerMediaId"].as_str().is_some(),
+        "收敛应建立到动态部分的配对：{still}"
+    );
+    assert_eq!(still["isFavorite"], true, "收敛不得丢失收藏");
+    let sort_at_after: Option<i64> =
+        sqlx::query_scalar("SELECT sort_at FROM media_assets WHERE id = ?1")
+            .bind(&still_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("sort_at after");
+    assert_eq!(
+        sort_at_before, sort_at_after,
+        "配对不触发时间重选：静态帧的规范时间必须保持不变"
+    );
+}
+
+/// FR-1 / 验收 1：真实 iPhone 实况（HEIC + MOV）导入后合并为一项。
+///
+/// 两个文件故意用**不同基名**：证明配对依据是内容标识（HEIC Apple MakerNote tag 17 与
+/// MOV `com.apple.quicktime.content.identifier` 共享的 UUID），不是文件名。
+/// 真实样本含个人位置 EXIF，因此不入库；样本不在时跳过该用例。
+#[tokio::test]
+async fn live_photo_real_iphone_pair_pairs_by_content_identifier() {
+    let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+    let heic = std::fs::read(sample.join("IMG_0440.HEIC"));
+    let mov = std::fs::read(sample.join("IMG_0440.MOV"));
+    let (Ok(heic), Ok(mov)) = (heic, mov) else {
+        eprintln!("跳过：tmp/ 下没有真实 iPhone 实况样本（HEIC + MOV 对）");
+        return;
+    };
+
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(&library).await.expect("library");
+    tokio::fs::write(library.join("alpha.still.heic"), &heic)
+        .await
+        .expect("still");
+    tokio::fs::write(library.join("zzz.motion.mov"), &mov)
+        .await
+        .expect("motion");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+    let job = run_scan(&app, &admin_token, &csrf_token).await;
+    assert_eq!(job["status"], "succeeded");
+
+    // 时间线只出现一个实况项（静态帧），配对视频不作为独立媒体项。
+    let list = media_list(&app, &device_token).await;
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(
+        items.len(),
+        1,
+        "iPhone 成对实况导入后必须合并为一项：{list}"
+    );
+    let still = &items[0];
+    assert_eq!(still["name"], "alpha.still.heic");
+    assert_eq!(still["livePhoto"]["role"], "still");
+    assert_eq!(still["livePhoto"]["embedded"], false);
+    assert_eq!(
+        still["livePhoto"]["groupKey"], "cid:3e11e513-3be9-49a1-8ada-c64b2c2eeec7",
+        "配对键必须是两侧共享的内容标识"
+    );
+    let partner_id = still["livePhoto"]["partnerMediaId"]
+        .as_str()
+        .expect("已配对到动态部分");
+    assert_eq!(
+        still["livePhoto"]["partnerContentHash"],
+        hex::encode(Sha256::digest(&mov)),
+        "实况载荷应携带动态部分的内容哈希，供客户端派生三态"
+    );
+    assert!(
+        still["livePhoto"]["motionDurationMs"].as_i64().is_some(),
+        "动态时长应作为元数据带出：{still}"
+    );
+
+    // 动态部分按 id 可读取（下载与播放要用），只是不进清单投影。
+    let motion = media_detail(&app, &device_token, partner_id).await;
+    assert_eq!(motion["livePhoto"]["role"], "motion");
+    assert_eq!(motion["isVideo"], true);
+    assert_eq!(motion["name"], "zzz.motion.mov");
+    assert_eq!(
+        motion["contentHash"],
+        hex::encode(Sha256::digest(&mov)),
+        "动态部分的内容身份不因配对而改变"
+    );
+
+    // 合并项沿用静态帧的规范时间：不因 MOV 时间戳更早而改变位置（验收 11）。
+    assert_eq!(
+        still["sortAt"], still["takenAt"],
+        "实况项排序时间应来自静态帧的拍摄时间"
     );
 }

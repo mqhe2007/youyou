@@ -100,7 +100,7 @@ pub async fn build_snapshot_with_lease(
     )
     .fetch_one(&mut *read_transaction)
     .await?;
-    let media_rows = sqlx::query_as::<_, SnapshotPayloadRow>(
+    let media_rows = sqlx::query_as::<_, SnapshotPayloadRow>(&format!(
         r#"
         WITH ranked_locations AS (
             SELECT media_asset_id, storage_id, normalized_path, size, hash_state,
@@ -131,16 +131,20 @@ pub async fn build_snapshot_with_lease(
                    'sortAt', a.sort_at,
                    'sortSource', a.sort_source, 'timeVersion', a.time_version, 'originalName', a.original_name,
                    'version', a.version,
-                   'isFavorite', CASE WHEN a.is_favorite = 1 THEN json('true') ELSE json('false') END
+                   'isFavorite', CASE WHEN a.is_favorite = 1 THEN json('true') ELSE json('false') END,
+                   {live}
                ) AS payload
         FROM media_assets a
         INNER JOIN ranked_locations l
             ON l.media_asset_id = a.id AND l.location_rank = 1
         LEFT JOIN content_blobs b ON b.id = a.blob_id
         WHERE a.identity_state = 'verified' AND a.owner_user_id = ?1
+          AND {visible}
         ORDER BY (a.sort_at IS NULL) ASC, a.sort_at DESC, a.id DESC
         "#,
-    )
+        live = crate::live_photo::PAYLOAD_FRAGMENT,
+        visible = crate::live_photo::VISIBLE_PREDICATE,
+    ))
     .bind(user_id)
     .fetch_all(&mut *read_transaction)
     .await?;
