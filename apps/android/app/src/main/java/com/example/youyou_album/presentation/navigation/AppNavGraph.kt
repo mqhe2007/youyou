@@ -353,11 +353,18 @@ fun AppNavGraph(navController: NavHostController, startOnLogin: Boolean) {
                         )
                     }
                     composable(
-                        Routes.SERVER_CONNECTION,
-                    ) {
+                        Routes.SERVER_CONNECTION + "?manual={manual}",
+                        arguments = listOf(
+                            navArgument("manual") {
+                                type = androidx.navigation.NavType.StringType
+                                defaultValue = "0"
+                            },
+                        ),
+                    ) { entry ->
                         ServerConnectionPage(
                             navController = navController,
                             onBack = { navController.popBackStack() },
+                            expandManual = entry.arguments?.getString("manual") == "1",
                         )
                     }
                     composable(
@@ -368,6 +375,12 @@ fun AppNavGraph(navController: NavHostController, startOnLogin: Boolean) {
                             onCodeScanned = { code ->
                                 navController.previousBackStackEntry?.savedStateHandle?.set("qr_code", code)
                                 navController.popBackStack()
+                            },
+                            onManualInput = {
+                                // 关掉扫码页，再进连接页并直接展开手动输入表单
+                                navController.navigate(Routes.SERVER_CONNECTION + "?manual=1") {
+                                    popUpTo(Routes.QR_SCANNER) { inclusive = true }
+                                }
                             },
                         )
                     }

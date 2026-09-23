@@ -20,6 +20,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -70,6 +77,7 @@ import com.example.youyou_album.ui.theme.ErrorFill
 fun ServerConnectionPage(
     navController: NavController,
     onBack: () -> Unit,
+    expandManual: Boolean = false,
     viewModel: ServerConnectionViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -98,14 +106,23 @@ fun ServerConnectionPage(
 
     val connected = uiState.connection != null
     var showDisconnectDialog by remember { mutableStateOf(false) }
-    var manualExpanded by rememberSaveable { mutableStateOf(false) }
+    // 从扫码页「改用手动输入」进来时直接展开表单，不再让人多点一次
+    var manualExpanded by rememberSaveable { mutableStateOf(expandManual) }
 
     var manualUrl by rememberSaveable { mutableStateOf("") }
     var manualCode by rememberSaveable { mutableStateOf("") }
     var manualDeviceName by rememberSaveable { mutableStateOf("") }
 
-    // 连接状态一变（连上 / 断开）就收起手动输入，避免表单滞留在页面上
-    LaunchedEffect(connected) { manualExpanded = false }
+    // 连接状态一变（连上 / 断开）就收起手动输入，避免表单滞留在页面上。
+    // 注意只在「变化」时收起：首次组合也要收起的话，会把「改用手动输入」刚展开的表单立刻关掉。
+    var lastConnectionState by remember { mutableStateOf(connected) }
+    LaunchedEffect(connected) {
+        if (lastConnectionState != connected) {
+            manualExpanded = false
+            lastConnectionState = connected
+        }
+    }
+
 
     if (showDisconnectDialog) {
         AlertDialog(
@@ -132,6 +149,31 @@ fun ServerConnectionPage(
             code = manualCode,
             deviceName = manualDeviceName.ifBlank { "Android Device" },
         )
+    }
+
+    // API 37 起未授予本地网络权限时系统会直接拦掉局域网请求，表现为「无法连接服务器」，
+    // 与地址不可达混淆。手动输入路径必须和扫码路径一样先申请该权限，并在被拒时给出
+    // 明确原因（体验设计 §3.4：权限缺失必须给出不同原因）。
+    val context = LocalContext.current
+    var localNetworkDenied by remember { mutableStateOf(false) }
+    val localNetworkLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        localNetworkDenied = !granted
+        if (granted) submitManual()
+    }
+    LaunchedEffect(localNetworkDenied) {
+        if (localNetworkDenied) {
+            snackbarHostState.showAppSnackbar("未获得本地网络权限，无法连接局域网服务端", isError = true)
+            localNetworkDenied = false
+        }
+    }
+    val onSubmitManual = {
+        val granted = Build.VERSION.SDK_INT < 37 || ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_LOCAL_NETWORK,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) submitManual() else localNetworkLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
     }
     val manualReady = manualUrl.isNotBlank() && manualCode.isNotBlank()
 
@@ -174,7 +216,7 @@ fun ServerConnectionPage(
                     onManualUrlChange = { manualUrl = it },
                     onManualCodeChange = { manualCode = it },
                     onManualDeviceNameChange = { manualDeviceName = it },
-                    onSubmitManual = submitManual,
+                    onSubmitManual = onSubmitManual,
                     manualReady = manualReady,
                 )
 

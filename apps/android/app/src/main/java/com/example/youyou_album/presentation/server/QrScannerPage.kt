@@ -55,6 +55,7 @@ import java.util.concurrent.Executors
 fun QrScannerPage(
     onBack: () -> Unit,
     onCodeScanned: (String) -> Unit,
+    onManualInput: () -> Unit,
 ) {
     val context = LocalContext.current
     var hasCameraPermission by remember {
@@ -148,7 +149,7 @@ fun QrScannerPage(
                         )
                     },
                     secondaryLabel = "改用手动输入",
-                    onSecondary = onBack,
+                    onSecondary = onManualInput,
                 )
 
                 hasCameraPermission -> {
@@ -178,7 +179,7 @@ fun QrScannerPage(
                         )
                     },
                     secondaryLabel = "改用手动输入",
-                    onSecondary = onBack,
+                    onSecondary = onManualInput,
                 )
 
                 // 权限弹窗正在拉起；保持底页空白，避免闪现额外确认页面。
