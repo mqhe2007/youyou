@@ -65,6 +65,8 @@ fun VideoPlayer(
     onControlsVisibleChange: (Boolean) -> Unit,
     bottomControlsPadding: Dp,
     modifier: Modifier = Modifier,
+    /** 播放到结尾时回调（实况动态部分播完要回到静态封面）。 */
+    onPlaybackEnded: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val exoPlayer = remember(uri, requestHeaders) {
@@ -103,6 +105,11 @@ fun VideoPlayer(
             override fun onPlayerError(error: PlaybackException) {
                 playbackError = error.errorCodeName
                 onControlsVisibleChange(true)
+            }
+
+            override fun onPlaybackStateChanged(state: Int) {
+                // 只在真正播到结尾时收尾：缓冲、暂停都不退回封面。
+                if (state == Player.STATE_ENDED) onPlaybackEnded?.invoke()
             }
         }
         exoPlayer.addListener(listener)

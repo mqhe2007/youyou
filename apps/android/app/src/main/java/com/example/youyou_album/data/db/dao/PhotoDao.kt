@@ -147,6 +147,7 @@ interface PhotoDao {
             ON tt.hash = p.content_hash
            AND tt.namespace = ''
         WHERE p.source_type != 'server'
+          AND COALESCE(p.live_role, 'none') != 'motion'
           AND (:filter = 'ALL' OR :filter = 'LOCAL_ONLY')
         ORDER BY timelineAt DESC, timelineKey ASC, p.id ASC
         """,
@@ -166,6 +167,7 @@ interface PhotoDao {
             ON tt.hash = p.content_hash
            AND tt.namespace = ''
         WHERE p.source_type != 'server'
+          AND COALESCE(p.live_role, 'none') != 'motion'
           AND (:filter = 'ALL' OR :filter = 'LOCAL_ONLY')
         ORDER BY timelineAt DESC, timelineKey ASC, p.id ASC
         LIMIT :limit
@@ -211,24 +213,37 @@ interface PhotoDao {
             WHERE :namespace != '' AND source_type != 'server' AND content_hash IS NOT NULL
             GROUP BY content_hash
         ),
-        synced_hashes AS (
-            SELECT DISTINCT lh.hash AS hash
-            FROM local_hashes lh
-            INNER JOIN photos_table s
-                ON s.content_hash = lh.hash
-               AND s.source_type = 'server'
-            INNER JOIN server_media_projection sp
-                ON sp.local_photo_id = s.id
-               AND sp.server_namespace = :namespace
+        -- 远程存在的部分（FR-4）：服务端投影行的自身哈希 + 其已入库的动态部分。
+        -- 服务端清单不投影动态部分，「动态部分已在服务端」只能由 live_partner_id 非空推出。
+        present_remote AS (
+            SELECT DISTINCT s.content_hash AS hash
+            FROM photos_table s
+            WHERE s.source_type = 'server' AND s.content_hash IS NOT NULL
+              AND EXISTS(
+                  SELECT 1 FROM server_media_projection sp
+                  WHERE sp.local_photo_id = s.id AND sp.server_namespace = :namespace
+              )
+            UNION
+            SELECT DISTINCT s.live_partner_hash AS hash
+            FROM photos_table s
+            WHERE s.source_type = 'server'
+              AND s.live_partner_id IS NOT NULL
+              AND s.live_partner_hash IS NOT NULL
+              AND EXISTS(
+                  SELECT 1 FROM server_media_projection sp
+                  WHERE sp.local_photo_id = s.id AND sp.server_namespace = :namespace
+              )
         ),
         visible AS (
             SELECT p.*
             FROM photos_table p
             WHERE p.source_type != 'server'
+              AND COALESCE(p.live_role, 'none') != 'motion'
             UNION ALL
             SELECT p.*
             FROM photos_table p
             WHERE p.source_type = 'server'
+              AND COALESCE(p.live_role, 'none') != 'motion'
               AND EXISTS(
                   SELECT 1 FROM server_media_projection own
                   WHERE own.local_photo_id = p.id
@@ -241,23 +256,40 @@ interface PhotoDao {
                       WHERE lh.hash = p.content_hash
                   )
               )
+        ),
+        -- 三态按「实况整体」派生：任一部分仅本机→仅本机；无仅本机部分且任一部分仅远程→仅远程；
+        -- 全部部分两端同哈希→已同步。普通媒体退化为只看自身哈希。
+        unit_hashes AS (
+            SELECT v.id AS row_id, v.content_hash AS hash FROM visible v WHERE v.content_hash IS NOT NULL
+            UNION ALL
+            SELECT v.id AS row_id, v.live_partner_hash AS hash FROM visible v WHERE v.live_partner_hash IS NOT NULL
+        ),
+        unit_state AS (
+            SELECT uh.row_id AS row_id,
+                   MAX(CASE WHEN lh.hash IS NULL THEN 1 ELSE 0 END) AS any_missing_local,
+                   MAX(CASE WHEN pr.hash IS NULL THEN 1 ELSE 0 END) AS any_missing_remote
+            FROM unit_hashes uh
+            LEFT JOIN local_hashes lh ON lh.hash = uh.hash
+            LEFT JOIN present_remote pr ON pr.hash = uh.hash
+            GROUP BY uh.row_id
         )
         SELECT v.id AS id,
             COALESCE(NULLIF(tt.sortKey,''), v.id) AS timelineKey,
             CASE WHEN tt.hash IS NOT NULL THEN tt.at ELSE v.sort_at END AS timelineAt,
             CASE WHEN tt.hash IS NOT NULL THEN tt.source ELSE v.sort_source END AS timelineSource,
             CASE
-                WHEN v.source_type = 'server' THEN 'REMOTE_ONLY'
-                WHEN v.content_hash IS NULL THEN 'LOCAL_ONLY'
-                WHEN sh.hash IS NOT NULL THEN 'SYNCED'
-                ELSE 'LOCAL_ONLY'
+                WHEN us.row_id IS NULL THEN
+                    CASE WHEN v.source_type = 'server' THEN 'REMOTE_ONLY' ELSE 'LOCAL_ONLY' END
+                WHEN us.any_missing_remote = 1 THEN 'LOCAL_ONLY'
+                WHEN us.any_missing_local = 1 THEN 'REMOTE_ONLY'
+                ELSE 'SYNCED'
             END AS backupState
         FROM visible v
         LEFT JOIN timeline_times tt
             ON tt.hash = v.content_hash
            AND tt.namespace = :namespace
-        LEFT JOIN synced_hashes sh
-            ON sh.hash = v.content_hash
+        LEFT JOIN unit_state us
+            ON us.row_id = v.id
         WHERE :filter = 'ALL' OR backupState = :filter
         ORDER BY timelineAt DESC, timelineKey ASC, id ASC
         """,
@@ -273,24 +305,37 @@ interface PhotoDao {
             WHERE :namespace != '' AND source_type != 'server' AND content_hash IS NOT NULL
             GROUP BY content_hash
         ),
-        synced_hashes AS (
-            SELECT DISTINCT lh.hash AS hash
-            FROM local_hashes lh
-            INNER JOIN photos_table s
-                ON s.content_hash = lh.hash
-               AND s.source_type = 'server'
-            INNER JOIN server_media_projection sp
-                ON sp.local_photo_id = s.id
-               AND sp.server_namespace = :namespace
+        -- 远程存在的部分（FR-4）：服务端投影行的自身哈希 + 其已入库的动态部分。
+        -- 服务端清单不投影动态部分，「动态部分已在服务端」只能由 live_partner_id 非空推出。
+        present_remote AS (
+            SELECT DISTINCT s.content_hash AS hash
+            FROM photos_table s
+            WHERE s.source_type = 'server' AND s.content_hash IS NOT NULL
+              AND EXISTS(
+                  SELECT 1 FROM server_media_projection sp
+                  WHERE sp.local_photo_id = s.id AND sp.server_namespace = :namespace
+              )
+            UNION
+            SELECT DISTINCT s.live_partner_hash AS hash
+            FROM photos_table s
+            WHERE s.source_type = 'server'
+              AND s.live_partner_id IS NOT NULL
+              AND s.live_partner_hash IS NOT NULL
+              AND EXISTS(
+                  SELECT 1 FROM server_media_projection sp
+                  WHERE sp.local_photo_id = s.id AND sp.server_namespace = :namespace
+              )
         ),
         visible AS (
             SELECT p.*
             FROM photos_table p
             WHERE p.source_type != 'server'
+              AND COALESCE(p.live_role, 'none') != 'motion'
             UNION ALL
             SELECT p.*
             FROM photos_table p
             WHERE p.source_type = 'server'
+              AND COALESCE(p.live_role, 'none') != 'motion'
               AND EXISTS(
                   SELECT 1 FROM server_media_projection own
                   WHERE own.local_photo_id = p.id
@@ -303,23 +348,40 @@ interface PhotoDao {
                       WHERE lh.hash = p.content_hash
                   )
               )
+        ),
+        -- 三态按「实况整体」派生：任一部分仅本机→仅本机；无仅本机部分且任一部分仅远程→仅远程；
+        -- 全部部分两端同哈希→已同步。普通媒体退化为只看自身哈希。
+        unit_hashes AS (
+            SELECT v.id AS row_id, v.content_hash AS hash FROM visible v WHERE v.content_hash IS NOT NULL
+            UNION ALL
+            SELECT v.id AS row_id, v.live_partner_hash AS hash FROM visible v WHERE v.live_partner_hash IS NOT NULL
+        ),
+        unit_state AS (
+            SELECT uh.row_id AS row_id,
+                   MAX(CASE WHEN lh.hash IS NULL THEN 1 ELSE 0 END) AS any_missing_local,
+                   MAX(CASE WHEN pr.hash IS NULL THEN 1 ELSE 0 END) AS any_missing_remote
+            FROM unit_hashes uh
+            LEFT JOIN local_hashes lh ON lh.hash = uh.hash
+            LEFT JOIN present_remote pr ON pr.hash = uh.hash
+            GROUP BY uh.row_id
         )
         SELECT v.id AS id,
             COALESCE(NULLIF(tt.sortKey,''), v.id) AS timelineKey,
             CASE WHEN tt.hash IS NOT NULL THEN tt.at ELSE v.sort_at END AS timelineAt,
             CASE WHEN tt.hash IS NOT NULL THEN tt.source ELSE v.sort_source END AS timelineSource,
             CASE
-                WHEN v.source_type = 'server' THEN 'REMOTE_ONLY'
-                WHEN v.content_hash IS NULL THEN 'LOCAL_ONLY'
-                WHEN sh.hash IS NOT NULL THEN 'SYNCED'
-                ELSE 'LOCAL_ONLY'
+                WHEN us.row_id IS NULL THEN
+                    CASE WHEN v.source_type = 'server' THEN 'REMOTE_ONLY' ELSE 'LOCAL_ONLY' END
+                WHEN us.any_missing_remote = 1 THEN 'LOCAL_ONLY'
+                WHEN us.any_missing_local = 1 THEN 'REMOTE_ONLY'
+                ELSE 'SYNCED'
             END AS backupState
         FROM visible v
         LEFT JOIN timeline_times tt
             ON tt.hash = v.content_hash
            AND tt.namespace = :namespace
-        LEFT JOIN synced_hashes sh
-            ON sh.hash = v.content_hash
+        LEFT JOIN unit_state us
+            ON us.row_id = v.id
         WHERE :filter = 'ALL' OR backupState = :filter
         ORDER BY timelineAt DESC, timelineKey ASC, id ASC
         LIMIT :limit
@@ -362,6 +424,13 @@ interface PhotoDao {
     }
 
     /** 顺序扫描用：只取本机行。 */
+    /** 按内容哈希取当前身份的投影行（实况整体删除要读它的 live_partner_id）。 */
+    @Query(
+        "SELECT * FROM photos_table WHERE source_type = 'server' AND content_hash = :hash " +
+            "ORDER BY (live_partner_id IS NOT NULL) DESC, id ASC LIMIT 1",
+    )
+    suspend fun getServerRowByHash(hash: String): PhotoEntity?
+
     @Query("SELECT * FROM photos_table WHERE source_type != 'server'")
     suspend fun getLocalPhotosForTimeline(): List<PhotoEntity>
 

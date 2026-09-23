@@ -4,6 +4,8 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.youyou_album.domain.model.Photo
+import com.example.youyou_album.domain.model.LiveMotionSource
+import com.example.youyou_album.domain.model.resolveLiveMotionSource
 import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.data.api.YouyouApiService
 import com.example.youyou_album.data.api.interceptor.TokenProvider
@@ -77,6 +79,36 @@ class PhotoDetailViewModel @Inject constructor(
     }
 
     fun currentPhoto(): Photo? = _uiState.value.photos.getOrNull(_uiState.value.currentIndex)
+
+    /**
+     * 实况动态部分的播放来源（D4：长按或点按标记触发）。
+     *
+     * 本机原件优先（离线可播放、`content://` 不带令牌），否则走远程内容；两者都不可得时
+     * 返回 `null`，详情页保持静态封面并给出可理解状态。
+     */
+    suspend fun liveMotionSource(photo: Photo): LiveMotionSource? {
+        val baseUrl = serverConnectionStore.getConnection()?.baseUrl?.trimEnd('/')
+        // 本机动态部分不能从时间线列表找：时间线按设计不展示配对的动态部分行（FR-6），
+        // 必须查全量本机行。
+        val localByHash = photoRepository.getAll()
+            .asSequence()
+            .filter { it.sourceType != "server" }
+            .mapNotNull { row -> row.contentHash?.let { it to row.sourceUri } }
+            .toMap()
+        val localById = photoRepository.getAll()
+            .asSequence()
+            .filter { it.sourceType != "server" }
+            .mapNotNull { row -> row.sourceUri?.let { row.id to it } }
+            .toMap()
+        return resolveLiveMotionSource(
+            photo,
+            localUriByHash = { hash -> localByHash[hash] },
+            remoteContentUrlFor = { partnerId ->
+                baseUrl?.let { base -> "$base/api/v1/media/$partnerId/content" }
+            },
+            localUriById = { id -> localById[id] },
+        )
+    }
 
     fun videoRequestHeaders(photo: Photo): Map<String, String> =
         videoPlaybackHeaders(

@@ -69,4 +69,23 @@ data class PhotoEntity(
 
     @ColumnInfo(name = "is_favorite", defaultValue = "0")
     val isFavorite: Boolean = false,
+
+    // 实况照片（服务端投影为权威）：live_role 为 null 表示普通媒体。
+    @ColumnInfo(name = "live_role")
+    val liveRole: String? = null,
+
+    @ColumnInfo(name = "live_embedded", defaultValue = "0")
+    val liveEmbedded: Boolean = false,
+
+    @ColumnInfo(name = "live_group_key")
+    val liveGroupKey: String? = null,
+
+    @ColumnInfo(name = "live_partner_id")
+    val livePartnerId: String? = null,
+
+    @ColumnInfo(name = "live_partner_hash")
+    val livePartnerHash: String? = null,
+
+    @ColumnInfo(name = "live_motion_duration_ms")
+    val liveMotionDurationMs: Int? = null,
 )

@@ -125,6 +125,10 @@ interface YouyouApiService {
         @Header("X-Sort-Source") sortSource: String = "unknown",
         @Header("X-Time-Version") timeVersion: Int = 1,
         @Header("X-Original-Name") originalName: String? = null,
+        @Header("X-Live-Photo-Role") livePhotoRole: String? = null,
+        @Header("X-Live-Photo-Group") livePhotoGroup: String? = null,
+        @Header("X-Live-Photo-Embedded") livePhotoEmbedded: String? = null,
+        @Header("X-Live-Photo-Motion-Duration-Ms") livePhotoMotionDurationMs: Long? = null,
         @Body body: RequestBody,
     ): UploadResponseDto
 

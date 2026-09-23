@@ -86,7 +86,20 @@ class UploadForegroundService : Service() {
 
         val allPhotos = photoRepository.getAll()
         val selectedPhotos = allPhotos.filter { it.id in photoIds }
-        val localPhotos = selectedPhotos.filter { it.sourceType == "local" && it.sourceUri != null }
+        // FR-4 实况整体搬运：一段实况的静态帧与动态部分共同搬运（选中静态帧即带上本机动态部分），
+        // 已在服务端的部分不重复上传——半同步态下只补传缺失的动态部分。
+        val remoteHashes = allPhotos
+            .filter { it.sourceType == "server" }
+            .mapNotNull { it.contentHash }
+            .toSet()
+        val liveParts = selectedPhotos.mapNotNull { selected ->
+            val live = selected.livePhoto ?: return@mapNotNull null
+            if (!live.isStill || live.embedded) return@mapNotNull null
+            allPhotos.firstOrNull { it.sourceType != "server" && it.id == live.partnerMediaId }
+        }
+        val localPhotos = (selectedPhotos + liveParts)
+            .distinctBy { it.id }
+            .filter { it.sourceType == "local" && it.sourceUri != null && it.contentHash !in remoteHashes }
 
         if (localPhotos.isEmpty()) {
             updateNotification("没有可上传的本地照片", 0, 0)
@@ -159,6 +172,7 @@ class UploadForegroundService : Service() {
                                         sortAt = photo.sortAt,
                                         sortSource = photo.sortSource,
                                         originalName = photo.originalName,
+                                        livePhoto = photo.livePhoto,
                                     )
                                     lastError = null
                                     break

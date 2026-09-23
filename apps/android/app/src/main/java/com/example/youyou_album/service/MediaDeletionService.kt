@@ -123,7 +123,15 @@ class MediaDeletionService @Inject constructor(
             mediaTaskCoordinator.endDelete(photoIds)
             return DeleteStep.Finished(DeleteSummary(localFailed = photoIds.distinct().size))
         }
-        val entities = photoDao.getByIds(photoIds)
+        val selected = photoDao.getByIds(photoIds)
+        // FR-5 实况整体删除：静态帧与动态部分一起删，避免留下「半张实况」。
+        // 本机动态部分按配对 id 找到本机行；服务端动态部分按投影行的 live_partner_id 追加远程目标。
+        val extraLocalIds = selected.mapNotNull { entity ->
+            if (entity.liveRole != "still" || entity.liveEmbedded) return@mapNotNull null
+            val partnerId = entity.livePartnerId ?: return@mapNotNull null
+            partnerId.takeIf { photoDao.getById(it) != null }
+        }
+        val entities = photoDao.getByIds((photoIds + extraLocalIds).distinct())
         val connection = connectionStore.getConnection()
         val namespace = connection?.let { "server_" + contentHashService.sha256HexForString(it.baseUrl).substring(0, 16) }
         val targets = entities.map { entity ->
@@ -142,12 +150,27 @@ class MediaDeletionService @Inject constructor(
                 serverVersion = serverVersion,
             )
         }
-        if (targets.isEmpty()) {
+        // 远端动态部分（静态帧的投影行记录了它的媒体 id 与版本）。
+        val extraRemoteTargets = entities.mapNotNull { entity ->
+            if (entity.liveRole != "still" || entity.liveEmbedded) return@mapNotNull null
+            val hash = entity.contentHash ?: return@mapNotNull null
+            val twin = photoDao.getServerRowByHash(hash) ?: return@mapNotNull null
+            val motionId = twin.livePartnerId ?: return@mapNotNull null
+            if (targets.any { it.serverMediaId == motionId }) return@mapNotNull null
+            DeleteTarget(
+                photoId = "live-motion:${entity.id}",
+                sourceUri = null,
+                serverMediaId = motionId,
+                serverVersion = namespace?.let { serverProjectionDao.getByMediaId(it, motionId)?.serverVersion },
+            )
+        }
+        val allTargets = targets + extraRemoteTargets
+        if (allTargets.isEmpty()) {
             mediaTaskCoordinator.endDelete(photoIds)
             return DeleteStep.Finished(DeleteSummary())
         }
         // 仅本机无需探测服务端；连接不可达时及时按离线策略继续本机授权。
-        val remoteSession = if (targets.any { it.serverMediaId != null } && connection != null && networkAvailable()) {
+        val remoteSession = if (allTargets.any { it.serverMediaId != null } && connection != null && networkAvailable()) {
             withTimeoutOrNull(3_000L) { remoteDeletionIdentity.capture() }
         } else null
         val session = DeleteSession(
@@ -155,8 +178,8 @@ class MediaDeletionService @Inject constructor(
             online = remoteSession != null,
             remoteSession = remoteSession,
             namespace = namespace,
-            targets = targets,
-            localPending = targets.filter { it.sourceUri != null },
+            targets = allTargets,
+            localPending = allTargets.filter { it.sourceUri != null },
             localDone = emptySet(),
         )
         return advanceLocal(session)

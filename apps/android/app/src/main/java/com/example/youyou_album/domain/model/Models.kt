@@ -10,6 +10,30 @@ enum class MediaSyncDisplay {
     }
 }
 
+/**
+ * 实况照片（iOS Live Photo / Android Motion Photo）标记，服务端投影为权威。
+ *
+ * [role] = "still" 表示本行是静态帧：[partnerMediaId] 为空表示动态部分尚未入库（半态）；
+ * [role] = "motion" 表示本行只是某段实况的动态部分，不作为独立媒体项展示。
+ * [embedded] = true 表示动态部分内嵌在同一文件里（单文件动态照片），没有独立的动态文件。
+ */
+data class LivePhoto(
+    val role: String,
+    val embedded: Boolean = false,
+    val groupKey: String? = null,
+    val partnerMediaId: String? = null,
+    val partnerContentHash: String? = null,
+    val motionDurationMs: Int? = null,
+) {
+    val isStill: Boolean get() = role == ROLE_STILL
+    val isMotionPart: Boolean get() = role == ROLE_MOTION
+
+    companion object {
+        const val ROLE_STILL = "still"
+        const val ROLE_MOTION = "motion"
+    }
+}
+
 data class Photo(
     val id: String,
     val name: String,
@@ -42,6 +66,8 @@ data class Photo(
     val remoteThumbnailUrl: String? = null,
     val remoteContentUrl: String? = null,
     val timelineKey: String? = null,
+    /** 实况照片标记；null 表示普通媒体（服务端投影为权威）。 */
+    val livePhoto: LivePhoto? = null,
 )
 
 data class Tag(

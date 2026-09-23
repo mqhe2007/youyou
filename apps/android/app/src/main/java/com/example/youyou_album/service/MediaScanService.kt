@@ -9,6 +9,7 @@ import kotlinx.coroutines.ensureActive
 import android.provider.MediaStore
 import com.example.youyou_album.data.repository.toDomain
 import com.example.youyou_album.domain.model.MediaTime
+import com.example.youyou_album.domain.model.LivePhoto
 import com.example.youyou_album.domain.model.Photo
 import com.example.youyou_album.domain.repository.PhotoRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -18,6 +19,10 @@ import java.io.File
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+
+/** 识别用文件样本上限：小文件整读，大文件只读头部（识别只是辅助，不影响扫描本身）。 */
+private const val MAX_PROBE_BYTES = 32 * 1024 * 1024
+private const val HEAD_PROBE_BYTES = 2 * 1024 * 1024
 
 @Singleton
 class MediaScanService @Inject constructor(
@@ -85,6 +90,7 @@ class MediaScanService @Inject constructor(
         }
 
         ContentHashBackfillWorker.enqueue(context)
+        applyLocalLivePairing()
 
         ScanResult(
             totalScanned = total,
@@ -98,6 +104,107 @@ class MediaScanService @Inject constructor(
     private fun hasUsableThumbnail(photo: Photo): Boolean {
         val path = photo.thumbnailPath
         return !path.isNullOrEmpty() && File(path).exists()
+    }
+
+    /**
+     * 本机实况收敛（FR-1/FR-8）：扫描结束后统一识别与配对。
+     *
+     * 单文件动态照片按 XMP 声明识别（并以文件长度兜底不误判）；成对实况按「同目录同基名
+     * + 动态部分确有 iOS 实况元数据键」配对（文件名只是辅助线索）。任一侧消失即整体降级
+     * 为普通媒体，下一次扫描自动收敛，不产生重复项。
+     */
+    private suspend fun applyLocalLivePairing() {
+        val rows = photoDao.getAll().map { it.toDomain() }.filter { it.sourceType != "server" }
+        // 用可变状态承载「补齐的哈希」，否则结尾 upsert 会把刚补好的哈希又覆盖回 null。
+        val state = rows.associateBy { it.id }.toMutableMap()
+
+        suspend fun withHash(photo: Photo): Photo {
+            if (photo.contentHash != null) return photo
+            val uri = photo.sourceUri ?: return photo
+            val hash = contentHashService.sha256HexForUri(Uri.parse(uri)) ?: return photo
+            val filled = photo.copy(contentHash = hash)
+            state[photo.id] = filled
+            return filled
+        }
+
+        val desired = mutableMapOf<String, LivePhoto?>()
+        val images = rows.filter { !it.isVideo && it.sourceUri != null }.map { withHash(it) }
+        val videosByStem = rows.filter { it.isVideo && it.sourceUri != null }
+            .map { withHash(it) }
+            .groupBy { stemKey(it.path, it.name) }
+
+        for (image in images) {
+            val sample = readSample(image.sourceUri!!, image.size)
+            val embedded = sample != null &&
+                LocalLivePhotoDetector.isEmbeddedMotionPhoto(sample, image.size ?: sample.size.toLong())
+            val partner = if (embedded) {
+                null
+            } else {
+                videosByStem[stemKey(image.path, image.name)]
+                    ?.firstOrNull { candidate ->
+                        readSample(candidate.sourceUri!!, candidate.size)
+                            ?.let { LocalLivePhotoDetector.isAppleLiveMotionPart(it) } == true
+                    }
+            }
+            val groupKey = "lp:${LocalLivePhotoDetector.stemOf(image.name)}"
+            when {
+                embedded -> {
+                    desired[image.id] = LivePhoto(role = LivePhoto.ROLE_STILL, embedded = true)
+                }
+                partner != null -> {
+                    desired[image.id] = LivePhoto(
+                        role = LivePhoto.ROLE_STILL,
+                        groupKey = groupKey,
+                        partnerMediaId = partner.id,
+                        partnerContentHash = partner.contentHash,
+                        motionDurationMs = partner.duration,
+                    )
+                    desired[partner.id] = LivePhoto(
+                        role = LivePhoto.ROLE_MOTION,
+                        groupKey = groupKey,
+                        partnerMediaId = image.id,
+                        partnerContentHash = image.contentHash,
+                    )
+                }
+            }
+        }
+
+        val original = rows.associateBy { it.id }
+        val changed = state.values.mapNotNull { row ->
+            val live = desired[row.id] ?: null
+            val before = original[row.id] ?: return@mapNotNull null
+            if (row.livePhoto == live && row.contentHash == before.contentHash) {
+                null
+            } else {
+                row.copy(livePhoto = live)
+            }
+        }
+        if (changed.isNotEmpty()) photoRepository.upsertAll(changed)
+    }
+
+    private fun stemKey(path: String, name: String): String =
+        "${path.substringBeforeLast('/', "")}:${LocalLivePhotoDetector.stemOf(name)}"
+
+    /**
+     * 读取文件样本做识别：小文件整读（iOS 动态部分的元数据在 `moov` 里，可能在文件尾），
+     * 大文件只读前 2 MiB。读不到就按识别不出处理，不影响扫描本身。
+     */
+    private fun readSample(uri: String, size: Long?): ByteArray? = try {
+        val limit = if ((size ?: 0L) in 1..MAX_PROBE_BYTES) MAX_PROBE_BYTES else HEAD_PROBE_BYTES
+        context.contentResolver.openInputStream(Uri.parse(uri))?.use { input ->
+            val buffer = java.io.ByteArrayOutputStream()
+            val chunk = ByteArray(64 * 1024)
+            var total = 0
+            while (total < limit) {
+                val read = input.read(chunk, 0, minOf(chunk.size, limit - total))
+                if (read <= 0) break
+                buffer.write(chunk, 0, read)
+                total += read
+            }
+            buffer.toByteArray()
+        }
+    } catch (_: Exception) {
+        null
     }
 
     private fun queryMediaStore(): Sequence<Photo> = sequence {

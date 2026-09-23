@@ -7,6 +7,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -55,6 +58,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import com.example.youyou_album.R
 import com.example.youyou_album.ui.theme.Favorite
 import androidx.compose.ui.input.pointer.pointerInput
@@ -68,6 +73,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.request.ImageRequest
 import com.example.youyou_album.domain.model.MediaSyncDisplay
+import com.example.youyou_album.domain.model.LiveMotionSource
+import kotlinx.coroutines.withTimeoutOrNull
 import com.example.youyou_album.domain.model.Photo
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -214,6 +221,8 @@ fun PhotoDetailPage(
                         onShowChromeChange = { showChrome = it },
                         videoRequestHeaders = viewModel.videoRequestHeaders(photo),
                         bottomControlsPadding = actionBarHeight,
+                        topControlsPadding = actionBarHeight,
+                        resolveLiveMotion = viewModel::liveMotionSource,
                     )
                 }
             }
@@ -495,8 +504,16 @@ private fun PhotoDetailContent(
     onShowChromeChange: (Boolean) -> Unit,
     videoRequestHeaders: Map<String, String>,
     bottomControlsPadding: androidx.compose.ui.unit.Dp,
+    topControlsPadding: androidx.compose.ui.unit.Dp,
+    resolveLiveMotion: suspend (Photo) -> LiveMotionSource?,
 ) {
     val model = photoDetailModel(photo)
+    // 动态部分的来源要异步解析（远程地址依赖当前服务端身份）。
+    var liveMotion by remember(photo.id) { mutableStateOf<LiveMotionSource?>(null) }
+    LaunchedEffect(photo.id) { liveMotion = resolveLiveMotion(photo) }
+    // D4：默认静态封面，只有显式触发才播放；切页/离开页面立即停止，避免声音残留。
+    var playingLive by remember(photo.id) { mutableStateOf(false) }
+    LaunchedEffect(active) { if (!active) playingLive = false }
 
     Box(
         modifier = Modifier
@@ -514,6 +531,7 @@ private fun PhotoDetailContent(
             model == null -> Text("无法预览", color = Color.White)
             else -> {
                 val videoUri = photo.sourceUri ?: photo.remoteContentUrl
+                val motion = liveMotion
                 if (photo.isVideo && videoUri != null) {
                     VideoPlayer(
                         uri = Uri.parse(videoUri),
@@ -524,11 +542,77 @@ private fun PhotoDetailContent(
                         bottomControlsPadding = bottomControlsPadding,
                         modifier = Modifier.fillMaxSize(),
                     )
+                } else if (playingLive && motion != null) {
+                    // 实况动态部分：不设 imageDurationMs 即按视频播放；播完回到静态封面。
+                    VideoPlayer(
+                        uri = Uri.parse(motion.uri),
+                        requestHeaders = if (motion.requiresAuth) videoRequestHeaders else emptyMap(),
+                        active = active,
+                        controlsVisible = showChrome,
+                        onControlsVisibleChange = onShowChromeChange,
+                        bottomControlsPadding = bottomControlsPadding,
+                        onPlaybackEnded = { playingLive = false },
+                        modifier = Modifier.fillMaxSize(),
+                    )
                 } else {
-                    ZoomableImage(model = model, contentDescription = photo.name)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        ZoomableImage(
+                            model = model,
+                            contentDescription = photo.name,
+                            // D4：长按图片播放动态部分。
+                            onLongPressPlay = motion?.let { { playingLive = true } },
+                        )
+                        if (photo.livePhoto != null) {
+                            LivePhotoMarker(
+                                playable = motion != null,
+                                onPlay = { playingLive = true },
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    // 顶部浮层会盖住标记并吃掉点按：让出顶栏高度再落位（D4 点按入口）
+                                    .padding(top = topControlsPadding + 12.dp, end = 12.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/**
+ * 实况标记（FR-2）：与视频的居中播放角标可区分，点按播放动态部分（D4）。
+ * 动态部分不可得时只标记不给入口，不伪造可播放状态。
+ */
+@Composable
+private fun LivePhotoMarker(
+    playable: Boolean,
+    onPlay: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.45f), shape = CircleShape)
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+            .then(if (playable) Modifier.clickable(onClick = onPlay) else Modifier)
+            .semantics {
+                contentDescription = if (playable) {
+                    "实况照片，点按播放动态部分"
+                } else {
+                    "实况照片，动态部分暂不可播放"
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        if (playable) {
+            Icon(
+                painter = painterResource(R.drawable.lucide_ic_play),
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(12.dp),
+            )
+        }
+        Text("实况", color = Color.White, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -536,14 +620,44 @@ private fun PhotoDetailContent(
 private fun ZoomableImage(
     model: Any,
     contentDescription: String,
+    onLongPressPlay: (() -> Unit)? = null,
 ) {
     me.saket.telephoto.zoomable.coil.ZoomableAsyncImage(
         model = model,
         contentDescription = contentDescription,
         contentScale = ContentScale.Fit,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            // D4：长按播放动态部分。只观察长按、不消费任何事件，缩放/平移完全不受影响。
+            .then(if (onLongPressPlay != null) Modifier.onLongPressObserved(onLongPressPlay) else Modifier),
     )
 }
+
+/**
+ * 只观察长按、不消费任何事件的手势修饰符。
+ *
+ * 图片区已有缩放/平移手势，不能让长按检测抢占 down 事件（实测 `detectTapGestures`
+ * 会被 Telephoto 的手势识别吃掉）。这里等到长按超时才触发，期间抬起或产生位移即放弃，
+ * 全程不消费事件。
+ */
+private fun Modifier.onLongPressObserved(onLongPress: () -> Unit): Modifier =
+    pointerInput(onLongPress) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            // 按住不动时不会有新事件，必须靠超时定时器判定长按，否则永远等不到。
+            val completed = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                while (true) {
+                    val event = awaitPointerEvent()
+                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                    if (!change.pressed) break
+                    // 位移超过触摸阈值就让给缩放/平移（合成事件会有微小抖动，不能按像素级相等判）。
+                    if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) break
+                }
+            }
+            // completed == null：等到超时且全程按住无位移 → 长按成立；否则是抬起或移动，放弃。
+            if (completed == null) onLongPress()
+        }
+    }
 
 private fun sharePhoto(context: android.content.Context, photo: Photo) {
     try {

@@ -404,6 +404,21 @@ internal fun PhotoTile(
                     .align(Alignment.Center)
                     .size(32.dp),
             )
+        } else if (photo.livePhoto != null) {
+            // 实况标记（FR-2）：与视频的居中播放角标可区分。
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color.Black.copy(alpha = 0.45f), shape = CircleShape)
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                    .semantics { contentDescription = "实况照片" },
+            ) {
+                Text(
+                    text = "实况",
+                    color = Color.White.copy(alpha = 0.9f),
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
         }
 
         SyncStatusBadge(

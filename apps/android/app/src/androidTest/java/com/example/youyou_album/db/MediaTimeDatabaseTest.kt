@@ -15,6 +15,7 @@ import com.example.youyou_album.data.db.entity.TimelineTimeEntity
 import com.example.youyou_album.data.db.migration.MIGRATION_4_5
 import com.example.youyou_album.data.db.migration.MIGRATION_5_6
 import com.example.youyou_album.data.db.migration.MIGRATION_6_7
+import com.example.youyou_album.data.db.migration.MIGRATION_7_8
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
@@ -90,7 +91,7 @@ class MediaTimeDatabaseTest {
             } finally {raw.endTransaction()}
             helper.close()
             val started=System.nanoTime()
-            val db=Room.databaseBuilder(ctx,AppDatabase::class.java,name).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7).build()
+            val db=Room.databaseBuilder(ctx,AppDatabase::class.java,name).addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8).build()
             try {
                 val migrated=db.openHelper.writableDatabase
                 val elapsed=(System.nanoTime()-started)/1000000

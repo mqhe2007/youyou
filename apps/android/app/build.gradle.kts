@@ -137,10 +137,12 @@ dependencies {
     // EXIF 读取
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 
-    // Video
-    implementation("androidx.media3:media3-exoplayer:1.4.1")
-    implementation("androidx.media3:media3-ui:1.4.1")
-    implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
+    // Video（1.11.0：HEIC Motion Photo 的视频/音频提取自 1.9.1 起支持，
+    // 1.8.0 起支持开头无 Exif 段的 JPEG 动态照片；1.11.0 移除 Mp4Extractor
+    // 旧的动态照片元数据开关，改为自动识别。见官方 Images 指南）
+    implementation("androidx.media3:media3-exoplayer:1.11.0")
+    implementation("androidx.media3:media3-ui:1.11.0")
+    implementation("androidx.media3:media3-exoplayer-hls:1.11.0")
 
     // CameraX + ML Kit（barcode-scanning 17.3+ 原生库已 16KB 对齐）
     implementation("androidx.camera:camera-core:1.3.4")

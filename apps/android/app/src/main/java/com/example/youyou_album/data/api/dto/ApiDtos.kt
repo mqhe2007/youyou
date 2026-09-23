@@ -86,6 +86,24 @@ data class ServerMediaDto(
     val version: Int = 1,
     // 旧服务端快照无此字段；为 null 时保留本地收藏状态
     val isFavorite: Boolean? = null,
+    // 旧服务端快照无此字段；为 null 表示普通媒体
+    val livePhoto: LivePhotoDto? = null,
+)
+
+/**
+ * 实况照片标记（服务端投影为权威）。
+ *
+ * `role` = "still" 表示该静态帧有动态部分，`partnerMediaId` 为空表示动态部分尚未入库；
+ * `role` = "motion" 表示本行只是动态部分，不作为独立媒体项展示。
+ */
+@Serializable
+data class LivePhotoDto(
+    val role: String = "",
+    val embedded: Boolean = false,
+    val groupKey: String? = null,
+    val partnerMediaId: String? = null,
+    val partnerContentHash: String? = null,
+    val motionDurationMs: Int? = null,
 )
 
 @Serializable

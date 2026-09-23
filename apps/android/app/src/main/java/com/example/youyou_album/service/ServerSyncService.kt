@@ -15,6 +15,7 @@ import com.example.youyou_album.data.db.dao.ServerSyncStateDao
 import com.example.youyou_album.data.db.entity.ServerMediaProjectionEntity
 import com.example.youyou_album.data.db.entity.ServerSyncStateEntity
 import com.example.youyou_album.domain.model.Photo
+import com.example.youyou_album.domain.model.LivePhoto
 import com.example.youyou_album.domain.model.Tag
 import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TagRepository
@@ -379,6 +380,16 @@ class ServerSyncService @Inject constructor(
             mimeType = media.mimeType,
             contentHash = media.contentHash,
             isFavorite = media.isFavorite ?: existing?.isFavorite ?: false,
+            livePhoto = media.livePhoto?.let { live ->
+                LivePhoto(
+                    role = live.role,
+                    embedded = live.embedded,
+                    groupKey = live.groupKey,
+                    partnerMediaId = live.partnerMediaId,
+                    partnerContentHash = live.partnerContentHash,
+                    motionDurationMs = live.motionDurationMs,
+                )
+            },
         )
         // 图片与远程映射一起提交，防止观察者先收到缺少预览地址的图片。
         database.withTransaction {

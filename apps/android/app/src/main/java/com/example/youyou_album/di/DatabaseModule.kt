@@ -15,6 +15,7 @@ import com.example.youyou_album.data.db.migration.MIGRATION_1_2
 import com.example.youyou_album.data.db.migration.MIGRATION_2_3
 import com.example.youyou_album.data.db.migration.MIGRATION_5_6
 import com.example.youyou_album.data.db.migration.MIGRATION_6_7
+import com.example.youyou_album.data.db.migration.MIGRATION_7_8
 import com.example.youyou_album.data.db.migration.MIGRATION_4_5
 import com.example.youyou_album.data.db.migration.MIGRATION_3_4
 import dagger.Module
@@ -36,7 +37,15 @@ object DatabaseModule {
             AppDatabase::class.java,
             AppDatabase.DATABASE_NAME
         )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+            .addMigrations(
+                MIGRATION_1_2,
+                MIGRATION_2_3,
+                MIGRATION_3_4,
+                MIGRATION_4_5,
+                MIGRATION_5_6,
+                MIGRATION_6_7,
+                MIGRATION_7_8,
+            )
             .build()
     }
 

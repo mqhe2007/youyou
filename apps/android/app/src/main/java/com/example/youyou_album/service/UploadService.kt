@@ -42,6 +42,11 @@ class UploadService @Inject constructor(
         sortAt: Long? = null,
         sortSource: String = "unknown",
         originalName: String? = null,
+        /**
+         * 实况声明（FR-4）：上传会改名，服务端无法按基名配对，因此由客户端声明分组与角色，
+         * 让「静态帧先到、动态部分后到」也能立即配对。
+         */
+        livePhoto: com.example.youyou_album.domain.model.LivePhoto? = null,
         onProgress: (bytesWritten: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): UploadResult = withContext(Dispatchers.IO) {
         val connection = serverConnectionStore.getConnection()
@@ -90,6 +95,10 @@ class UploadService @Inject constructor(
             sortSource = sortSource,
             timeVersion = 1,
             originalName = originalName,
+            livePhotoRole = livePhoto?.role,
+            livePhotoGroup = livePhoto?.groupKey?.removePrefix("lp:")?.removePrefix("cid:"),
+            livePhotoEmbedded = if (livePhoto?.embedded == true) "1" else null,
+            livePhotoMotionDurationMs = livePhoto?.motionDurationMs?.toLong(),
             body = requestBody,
         )
 

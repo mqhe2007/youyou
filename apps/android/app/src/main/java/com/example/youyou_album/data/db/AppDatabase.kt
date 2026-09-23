@@ -35,7 +35,7 @@ import com.example.youyou_album.data.db.entity.TaskEntity
         PendingMediaOperationEntity::class,
         PendingLocalDeletionEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {

@@ -7,6 +7,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
+import com.example.youyou_album.domain.model.LivePhoto
 import com.example.youyou_album.domain.model.Photo
 import com.example.youyou_album.domain.repository.PhotoRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -30,13 +31,75 @@ class MediaDownloadService @Inject constructor(
     private val mediaTaskCoordinator: MediaTaskCoordinator,
 ) {
 
+    private companion object {
+        const val SAVED_MESSAGE = "已保存到系统相册"
+        const val MOTION_MIME_TYPE = "video/quicktime"
+    }
+
     /** 下载/转存单个媒体到系统相册，返回用户可读的结果消息。 */
     suspend fun downloadToGallery(photo: Photo): String {
         if (!mediaTaskCoordinator.tryRegisterActive(photo.id)) return "该媒体正在删除，已取消下载"
         return try {
-            downloadInternal(photo)
+            val result = downloadInternal(photo)
+            if (result != SAVED_MESSAGE) return result
+            // FR-4 整体搬运：远程实况的静态帧与动态部分一起落盘，避免只落下半张实况。
+            // 本机静态帧不走这里（动态部分本来就在本机）。
+            val live = photo.livePhoto
+            if (photo.sourceUri != null || live?.isStill != true || live.embedded) return result
+            val motion = downloadMotionPart(photo, live)
+            if (motion == SAVED_MESSAGE) {
+                "已保存到系统相册（实况照片：静态帧与动态部分）"
+            } else {
+                "已保存静态帧；实况动态部分未保存：$motion"
+            }
         } finally {
             mediaTaskCoordinator.unregisterActive(photo.id)
+        }
+    }
+
+    /**
+     * 实况动态部分：按静态帧在服务端记录的配对媒体 id 下载为系统相册视频。
+     * 落盘后由后台扫描按内容标识重新配对，本机两部分的配对关系随之收敛。
+     */
+    private suspend fun downloadMotionPart(still: Photo, live: LivePhoto): String = withContext(Dispatchers.IO) {
+        val motionMediaId = live.partnerMediaId ?: return@withContext "服务端未记录配对动态部分"
+        val connection = serverConnectionStore.getConnection() ?: return@withContext "未连接服务端"
+        val name = still.name.substringBeforeLast('.', still.name) + ".MOV"
+        try {
+            val apiService = apiServiceFactory.create(connection.baseUrl)
+            apiService.openMediaContent(motionMediaId).byteStream().use { input ->
+                saveInputStreamToGallery(
+                    inputStream = input,
+                    displayName = name,
+                    mimeType = MOTION_MIME_TYPE,
+                    isVideo = true,
+                    photo = still.copy(
+                        id = motionMediaId,
+                        name = name,
+                        mimeType = MOTION_MIME_TYPE,
+                        isVideo = true,
+                        duration = live.motionDurationMs?.div(1000),
+                        contentHash = live.partnerContentHash,
+                        size = null,
+                        path = "",
+                        storageId = null,
+                        sourceType = "local",
+                        sourceUri = null,
+                        thumbnailPath = null,
+                        remoteThumbnailUrl = null,
+                        remoteContentUrl = null,
+                        livePhoto = LivePhoto(
+                            role = LivePhoto.ROLE_MOTION,
+                            groupKey = live.groupKey,
+                            motionDurationMs = live.motionDurationMs,
+                        ),
+                    ),
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "保存失败：${e.message ?: e.javaClass.simpleName}"
         }
     }
 
@@ -127,7 +190,7 @@ class MediaDownloadService @Inject constructor(
                 ExistingWorkPolicy.APPEND_OR_REPLACE,
                 OneTimeWorkRequestBuilder<MediaScanWorker>().build(),
             )
-            "已保存到系统相册"
+            SAVED_MESSAGE
         } catch (e: Exception) {
             insertedUri?.let {
                 runCatching { context.contentResolver.delete(it, null, null) }
