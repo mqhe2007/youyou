@@ -398,6 +398,7 @@ a {
   align-items: center;
   justify-content: space-between;
   min-block-size: 3rem;
+  margin-block-end: 1.25rem;
   padding-inline: 0.75rem;
 }
 
