@@ -191,7 +191,7 @@ export function jobMessage(job) {
     'cancelled after lease expired': '任务已取消',
     'lease expired; queued for recovery': '任务已排队等待恢复',
     'lease expired; retry limit reached': '任务失败，已达到重试次数上限',
-  }[message] || (job?.kind === 'backup' ? '数据库备份任务' : '服务端后台任务');
+  }[message] || (job?.kind === 'backup' ? '数据库备份任务' : jobKindLabel(job?.kind));
 }
 
 // 扫描作业的跳过/失败明细（来自作业检查点；运行中的扫描还没有终态明细）。

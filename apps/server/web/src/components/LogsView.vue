@@ -101,7 +101,7 @@ function requestCancel(job) {
     <div class="page-intro page-intro-compact">
       <div>
         <h1>日志</h1>
-        <p class="page-lede">后台由单个 worker 串行处理任务：先看在处理的，再看排队等待的，最后是历史记录。</p>
+        <p class="page-lede">查看正在处理的任务、等待队列和运行记录。</p>
       </div>
     </div>
 
@@ -114,8 +114,7 @@ function requestCancel(job) {
           <div>
             <h2>{{ jobKindLabel(focusJob.kind) }}</h2>
             <small v-if="focusJob.kind === 'scan'">目录：{{ jobScopeLabel(focusJob) }}</small>
-            <small v-else-if="runningJob">服务端后台任务</small>
-            <small v-else>队首任务，worker 空闲后即将开始</small>
+            <small v-else-if="!runningJob">即将开始</small>
           </div>
         </div>
         <span class="status-badge" :class="jobStatusClass(focusJob.status)">
@@ -147,7 +146,7 @@ function requestCancel(job) {
       </div>
       <div v-else class="task-progress-wrap">
         <div class="progress-meta">
-          <span>{{ formatTime(focusJob.createdAt) }} 入队，等待 worker 开始</span>
+          <span>{{ formatTime(focusJob.createdAt) }} 加入队列，等待开始</span>
           <span v-if="waiting.length > 1">队列中还有 {{ waiting.length - 1 }} 个任务</span>
         </div>
       </div>
