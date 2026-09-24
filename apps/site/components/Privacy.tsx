@@ -7,15 +7,15 @@ import { useSectionMotion } from "@/hooks/useSectionMotion";
 const rows = [
   {
     q: "数据放在哪里？",
-    a: "在你自己部署的服务器上，按用户目录分开存放。手机里不存原始文件。",
+    a: "服务器原件留在你自己的照片目录里；本机原件和下载到手机的照片也会保留在手机。缩略图缓存只是为了浏览，不能当作原件备份。",
   },
   {
     q: "会上传到第三方吗？",
-    a: "不会。客户端只和你的服务器通信，没有别的去处。",
+    a: "柚柚不提供第三方照片云。客户端连接你指定的服务器；你自行决定服务器所在网络和传输路径。",
   },
   {
-    q: "可以随时带走吗？",
-    a: "可以。数据库备份和校验一条命令完成，原始媒体始终在你自己的目录里。",
+    q: "会修改我的照片吗？",
+    a: "不会。索引只读取原件，上传按原文件保存。标签、收藏和拍摄信息记在数据库里，缩略图单独缓存，都不写回照片。",
   },
 ];
 
@@ -57,10 +57,10 @@ export function Privacy() {
     >
       <div className="privacy-heading">
         <h2 className="text-4xl font-semibold tracking-tight md:text-5xl">
-          数据不离开你自己的服务器
+          照片放在你掌控的位置
         </h2>
         <p className="mt-5 leading-relaxed text-subtle">
-          自部署、不追踪、不分析。服务端不可用时，客户端仍可浏览本地缓存。
+          自部署的服务端管理自己的照片目录；离线时仍可浏览手机上的原件，服务器照片是否可见取决于已有缓存。
         </p>
       </div>
       <div className="privacy-rows mt-14 divide-y divide-line border-t border-line">
