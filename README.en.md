@@ -87,14 +87,6 @@ so bump it before tagging; CI enforces this.
 Running the server locally: `cargo run --manifest-path apps/server/Cargo.toml`; the admin UI is at
 `http://127.0.0.1:8989/admin`.
 
-## Engineering docs
-
-Engineering documents — product requirements, experience design, the design system, architecture
-and data model, tech stack, media time rules, deletion and recycle rules, scale acceptance
-benchmarks — are not maintained in this repository. The project is currently organized around a
-single developer, and these specifications live in an internal knowledge base. The only public
-documentation is the website's three pages: deployment, privacy and terms.
-
 ## License
 
 This project is licensed under **AGPL-3.0-only**; see [LICENSE](LICENSE) for the full text.
