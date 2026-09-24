@@ -23,6 +23,17 @@ const repo = "https://github.com/mqhe2007/youyou";
 
 const sections: DocSection[] = [
   {
+    id: "choose",
+    title: "先选自己的路径",
+    body: (
+      <>
+        <P><strong>管理员：</strong>准备常开机器和照片目录 → 启动服务端 → 创建管理员 → 在管理页创建成员并绑定目录 → 生成邀请二维码。下方是完整部署步骤。</P>
+        <P><strong>受邀成员：</strong><Link href="/download" className="link-quiet">下载客户端</Link> → 安装 → 扫描管理员提供的邀请二维码 → 浏览自己的第一张照片。已有邀请时，不需要自己部署服务端。</P>
+        <Note title="先确认可达性">手机必须能访问管理员的服务器。同一局域网最简单；外出访问需要管理员自行配置网络，柚柚不会自动提供公网连接。</Note>
+      </>
+    ),
+  },
+  {
     id: "prepare",
     title: "准备条件",
     body: (
@@ -35,7 +46,7 @@ const sections: DocSection[] = [
           <li>一个放照片的目录，磁盘按你的照片库容量估。</li>
           <li>一个空闲端口，默认 <CodeInline>8989</CodeInline>。</li>
         </UL>
-        <P>手机这边只需要 Android 12（API 31）或更高版本，HarmonyOS 4.2（基于 Android 12）也在支持范围内。</P>
+        <P>当前客户端支持 Android 12（API 31）或更高版本。</P>
       </>
     ),
   },
@@ -72,8 +83,44 @@ const sections: DocSection[] = [
     ),
   },
   {
+    id: "first-run",
+    title: "第一次启动：创建管理员",
+    body: (
+      <>
+        <P>服务端首次启动会在数据目录里写一个一次性初始化令牌，它只用来创建第一个管理员，完成初始化后立即失效。</P>
+        <Code
+          label="读取初始化令牌"
+          lines={["cat ./youyou-server/data/bootstrap/setup-token"]}
+        />
+        <P>然后打开 <CodeInline>http://&lt;服务端地址&gt;:8989/admin</CodeInline>，用这个令牌创建管理员账号并登录。管理页里可以做这些事：</P>
+        <UL>
+          <li>登录与注销会话。</li>
+          <li>创建成员，为每位成员绑定各自的媒体库目录；先确认目录已挂载且权限可读。</li>
+          <li>生成邀请二维码，把对应成员的手机接进来。</li>
+          <li>按目录刷新媒体索引，确认第一张照片可见。</li>
+          <li>查看运行日志。</li>
+        </UL>
+        <H3>只用 HTTP</H3>
+        <P>当前版本统一走 HTTP，服务端不做 HTTPS 终止。要暴露到公网，请自己在前面加反向代理。管理页仍然使用 HttpOnly、SameSite=Strict 的会话与 CSRF Cookie。</P>
+        <H3>存储根可以改</H3>
+        <P><CodeInline>&lt;server-dir&gt;/media</CodeInline> 只是首次初始化时的默认目录。在管理页改过的存储根会持久化到服务端数据库，重启后继续用。切换根目录后，已有索引会先隐藏，完成一次扫描后才重新可见。</P>
+      </>
+    ),
+  },
+  {
+    id: "pair",
+    title: "成员下载并扫码",
+    body: (
+      <>
+        <P><Link href="/download" className="link-quiet">下载当前客户端</Link>并安装，在客户端扫描管理员从管理页生成的邀请二维码；也可以按界面提示手填服务端信息。接入后查看自己的第一张照片，或选一张本机照片手动上传。</P>
+        <P>手机要能访问到服务端：同一个局域网最直接；跨网使用需要你自己处理端口映射或内网穿透。</P>
+        <Note title="没看到照片？">先在管理页确认该成员的目录已绑定、挂载可读且扫描完成。扫码失败时确认二维码仍有效、手机已授予必要权限，并检查服务器地址是否可达；不连接服务器也可以先浏览本机照片。</Note>
+      </>
+    ),
+  },
+  {
     id: "puid",
-    title: "PUID 与 PGID：容器用哪个用户跑",
+    title: "进阶：PUID 与 PGID",
     body: (
       <>
         <P>镜像内置一个非 root 用户（uid <span className="tabular">10001</span>）。但 bind mount 进来的宿主目录属主是你自己，那个 uid 对它没有写权限，所以直接跑会失败，报 <CodeInline>create data directory /srv/youyou/data</CodeInline>。</P>
@@ -88,42 +135,8 @@ const sections: DocSection[] = [
     ),
   },
   {
-    id: "first-run",
-    title: "第一次启动：创建管理员",
-    body: (
-      <>
-        <P>服务端首次启动会在数据目录里写一个一次性初始化令牌，它只用来创建第一个管理员，完成初始化后立即失效。</P>
-        <Code
-          label="读取初始化令牌"
-          lines={["cat ./youyou-server/data/bootstrap/setup-token"]}
-        />
-        <P>然后打开 <CodeInline>http://&lt;服务端地址&gt;:8989/admin</CodeInline>，用这个令牌创建管理员账号并登录。管理页里可以做这些事：</P>
-        <UL>
-          <li>登录与注销会话。</li>
-          <li>生成配对二维码，把手机接进来。</li>
-          <li>配置存储根，按文件夹刷新媒体索引。</li>
-          <li>查看运行日志。</li>
-        </UL>
-        <H3>只用 HTTP</H3>
-        <P>当前版本统一走 HTTP，服务端不做 HTTPS 终止。要暴露到公网，请自己在前面加反向代理。管理页仍然使用 HttpOnly、SameSite=Strict 的会话与 CSRF Cookie。</P>
-        <H3>存储根可以改</H3>
-        <P><CodeInline>&lt;server-dir&gt;/media</CodeInline> 只是首次初始化时的默认目录。在管理页改过的存储根会持久化到服务端数据库，重启后继续用。切换根目录后，已有索引会先隐藏，完成一次扫描后才重新可见。</P>
-      </>
-    ),
-  },
-  {
-    id: "pair",
-    title: "连上手机",
-    body: (
-      <>
-        <P>在 Android 客户端里扫管理页生成的连接二维码就行，也可以手填服务端地址。之后客户端只与你填写或扫码得到的这个地址通信。</P>
-        <P>手机要能访问到服务端：同一个局域网最直接；跨网使用需要你自己处理端口映射或内网穿透。</P>
-      </>
-    ),
-  },
-  {
     id: "config",
-    title: "环境变量与运行时目录",
+    title: "进阶：环境变量与运行时目录",
     body: (
       <>
         <P>服务端优先从环境变量读配置。本地开发时会从仓库根目录的 <CodeInline>.env</CodeInline> 加载，不覆盖已有的进程环境变量。也可以用命令行参数 <CodeInline>--port</CodeInline>、<CodeInline>--server-dir</CodeInline> 覆盖。</P>
@@ -169,7 +182,7 @@ const sections: DocSection[] = [
   },
   {
     id: "backup",
-    title: "备份与恢复",
+    title: "进阶：备份与恢复",
     body: (
       <>
         <P>数据库有三个备份子命令：<CodeInline>backup create</CodeInline> 生成一致快照和清单，<CodeInline>backup verify</CodeInline> 校验目录、清单与 SQLite 完整性，<CodeInline>backup restore</CodeInline> 把验证过的备份恢复回去。</P>
@@ -199,7 +212,7 @@ const sections: DocSection[] = [
   },
   {
     id: "source",
-    title: "从源码构建",
+    title: "进阶：从源码构建",
     body: (
       <>
         <P>次要路径。只有你要改代码，或者想把它接进自己的构建流程时才需要。clone 仓库后用根目录的 <CodeInline>docker-compose.yml</CodeInline>，端口和运行时目录都在那个文件里改：</P>
@@ -281,8 +294,8 @@ export default function QuickstartPage() {
       title="快速开始"
       lead={
         <>
-          <p>把柚柚相册的服务端装到你自己的机器上。全程几条命令，拉现成镜像就行，不用编译。</p>
-          <p className="mt-3">服务端跑起来之后，在管理页建管理员、连上手机，就能备份和浏览照片了。</p>
+          <p>管理员按步骤接入自己的照片目录；受邀成员下载客户端扫码即可开始浏览。</p>
+          <p className="mt-3">部署细节与进阶运维说明在下方，成员可以直接跳到“成员下载并扫码”。</p>
         </>
       }
       sections={sections}

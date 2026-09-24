@@ -1,92 +1,99 @@
-"use client";
-
 import Image from "next/image";
-import { useRef } from "react";
-import { ArrowRight } from "@phosphor-icons/react/dist/ssr";
-import { gsap } from "@/lib/gsap";
-import { useSectionMotion } from "@/hooks/useSectionMotion";
+import Link from "next/link";
+import { ArrowRight, HouseLine, ShieldCheck, UsersThree } from "@phosphor-icons/react/dist/ssr";
+
+const points = [
+  { icon: HouseLine, label: "连接自己的照片库" },
+  { icon: ShieldCheck, label: "原件由自己保管" },
+  { icon: UsersThree, label: "家人各有私密空间" },
+];
 
 export function Hero() {
-  const root = useRef<HTMLElement>(null);
-
-  useSectionMotion(root, ({ reduce }) => {
-    if (reduce) return;
-
-    const tl = gsap.timeline({
-      defaults: { ease: "power3.out" },
-    });
-
-    tl.from(".hero-title", { y: 48, autoAlpha: 0, duration: 1 })
-      .from(".hero-lede", { y: 28, autoAlpha: 0, duration: 0.7 }, "-=0.55")
-      .from(
-        ".hero-actions .btn",
-        { y: 20, autoAlpha: 0, duration: 0.55, stagger: 0.08 },
-        "-=0.4",
-      )
-      .from(
-        ".hero-media-inner",
-        { scale: 1.14, duration: 1.35, ease: "power2.out" },
-        0,
-      )
-      .from(
-        ".hero-media",
-        { clipPath: "inset(12% 8% 12% 8% round 16px)", duration: 1.2 },
-        0,
-      );
-
-    gsap.to(".hero-media-inner", {
-      yPercent: 8,
-      ease: "none",
-      scrollTrigger: {
-        trigger: root.current,
-        start: "top top",
-        end: "bottom top",
-        scrub: true,
-      },
-    });
-  });
-
   return (
-    <section
-      ref={root}
-      id="top"
-      className="mx-auto w-full max-w-[1400px] px-4 pt-16 md:px-8 md:pt-20"
-    >
-      <div className="grid items-center gap-10 md:grid-cols-12 md:gap-12">
-        <div className="md:col-span-6">
-          <h1 className="hero-title text-[44px] font-semibold leading-[1.06] tracking-tight md:text-[64px]">
-            轻松管理人生影相
-          </h1>
-          <p className="hero-lede mt-6 text-lg leading-relaxed text-subtle">
-            照片存在你自己部署的服务器上，手机端只留索引和缓存。不经过任何第三方。
-          </p>
-          <div className="hero-actions mt-9 flex flex-wrap items-center gap-4">
-            <a href="#deploy" className="btn btn-primary group">
-              开始部署
-              <ArrowRight size={16} weight="bold" className="cta-icon" />
-            </a>
-            <a href="#daily" className="btn btn-ghost group">
-              看看怎么用
-              <ArrowRight size={16} weight="bold" className="cta-icon" />
-            </a>
-          </div>
+    <section id="top" className="mx-auto grid w-full max-w-[1400px] items-center gap-10 px-4 pb-20 pt-14 md:grid-cols-12 md:gap-8 md:px-8 md:pb-28 md:pt-20">
+      <div className="md:col-span-6 lg:col-span-7">
+        <p className="mb-5 text-sm font-semibold tracking-[0.16em] text-subtle">自有照片库的手机入口</p>
+        <h1 className="text-[clamp(3rem,5.6vw,5.5rem)] font-semibold leading-[1.08] tracking-[-0.055em] md:text-[39px] lg:text-[clamp(3rem,4.5vw,4rem)] lg:whitespace-nowrap">
+          轻松管理<span className="block lg:inline">人生影相<span className="text-accent">。</span></span>
+        </h1>
+        <p className="mt-7 text-xl leading-[1.55] text-subtle md:text-2xl">
+          手机里的新照片，家中珍藏的旧照片，一起看。
+        </p>
+        <p className="mt-4 leading-relaxed text-subtle">
+          柚柚连接手机与自建照片库。保留原有目录，统一浏览，按需上传和下载。
+        </p>
+        <div className="mt-9 flex flex-wrap gap-3">
+          <a href="/download" className="btn btn-primary group">
+            下载客户端 <ArrowRight size={16} weight="bold" className="cta-icon" />
+          </a>
+          <Link href="/quickstart" className="btn btn-ghost group">
+            了解如何使用 <ArrowRight size={16} weight="bold" className="cta-icon" />
+          </Link>
         </div>
-        <div className="md:col-span-6">
-          <div className="hero-media overflow-hidden rounded-2xl">
-            <div className="hero-media-inner will-change-transform">
-              <Image
-                src="/images/hero-photo.jpg"
-                alt="暖象牙台面上的新鲜柚子与一叠打印照片"
-                width={864}
-                height={1152}
-                priority
-                fetchPriority="high"
-                className="h-[420px] w-full object-cover md:h-[540px]"
-              />
-            </div>
-          </div>
-        </div>
+        <ul className="mt-12 hidden max-w-[590px] grid-cols-3 gap-4 border-t border-line pt-6 text-sm text-subtle lg:grid">
+          {points.map(({ icon: Icon, label }) => (
+            <li key={label} className="flex items-center gap-2.5">
+              <Icon size={23} weight="regular" className="shrink-0 text-ink" aria-hidden />
+              <span>{label}</span>
+            </li>
+          ))}
+        </ul>
       </div>
+      <figure className="relative flex min-w-0 flex-col items-center md:col-span-6 lg:col-span-5">
+        <div className="relative left-[-40px] hidden aspect-[916/887] w-[min(50vw,680px)] shrink-0 lg:block">
+          <Image
+            src="/images/hero-reference-stage.png"
+            alt=""
+            aria-hidden
+            width={916}
+            height={887}
+            priority
+            sizes="(max-width: 1360px) 50vw, 680px"
+            className="h-full w-full mix-blend-darken"
+          />
+          <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 h-[6%] bg-gradient-to-b from-transparent to-surface" />
+          {/* The reference includes a cropped headline and a concept UI. Keep its
+              original decoration, then cover both with the live product capture. */}
+          <div aria-hidden className="absolute left-0 top-[18%] h-[11%] w-[6.2%] bg-surface" />
+          <div className="absolute left-[28.4%] top-[5.35%] h-[86.7%] w-[41.9%] overflow-hidden rounded-[7.5%] bg-white">
+            <Image
+              src="/images/app-timeline-demo.webp"
+              alt="柚柚相册真实时间线：照片格子中，云朵表示仅服务器、手机表示仅本机；无徽标的照片两端都有"
+              width={1280}
+              height={2856}
+              priority
+              fetchPriority="high"
+              sizes="344px"
+              className="h-full w-full"
+              style={{ objectFit: "fill" }}
+            />
+          </div>
+          <span aria-hidden className="absolute left-[48.35%] top-[5.95%] aspect-square w-[2.05%] rounded-full border-[2px] border-[#333941] bg-[#0b0e13]" />
+        </div>
+        <div className="relative flex w-full flex-col items-center lg:hidden">
+          <Image
+            src="/images/hero-warm-halo.webp"
+            alt=""
+            aria-hidden
+            width={1254}
+            height={1254}
+            sizes="(max-width: 768px) 100vw, 620px"
+            className="pointer-events-none absolute left-0 top-[5%] z-0 w-full max-w-none mix-blend-multiply"
+          />
+          <div className="relative z-20 w-[min(77vw,344px)] rounded-[42px] border-[8px] border-[#292825] bg-white p-[3px] shadow-[0_30px_70px_rgba(28,27,26,0.18)]">
+            <Image
+              src="/images/app-timeline-demo.webp"
+              alt="柚柚相册真实时间线：照片格子中，云朵表示仅服务器、手机表示仅本机；无徽标的照片两端都有"
+              width={1280}
+              height={2856}
+              priority
+              fetchPriority="high"
+              sizes="(max-width: 768px) 77vw, 344px"
+              className="h-auto w-full rounded-[31px]"
+            />
+          </div>
+        </div>
+      </figure>
     </section>
   );
 }

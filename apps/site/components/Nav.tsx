@@ -3,9 +3,10 @@ import { GitHubStars } from "./GitHubStars";
 
 const links = [
   { href: "#daily", label: "日常使用" },
-  { href: "#admin", label: "管理" },
-  { href: "#deploy", label: "部署" },
-  { href: "#privacy", label: "隐私" },
+  { href: "#library", label: "原有照片库" },
+  { href: "#start", label: "开始使用" },
+  { href: "#faq", label: "常见问题" },
+  { href: "/quickstart", label: "文档" },
 ];
 
 type NavProps = {
@@ -31,7 +32,7 @@ export function Nav({ anchorPrefix = "" }: NavProps) {
             {links.map((l) => (
               <li key={l.href}>
                 <a
-                  href={`${anchorPrefix}${l.href}`}
+                  href={l.href.startsWith("/") ? l.href : `${anchorPrefix}${l.href}`}
                   className="text-sm text-subtle transition-colors hover:text-ink"
                 >
                   {l.label}
@@ -39,12 +40,18 @@ export function Nav({ anchorPrefix = "" }: NavProps) {
               </li>
             ))}
           </ul>
-          <GitHubStars />
           <a
-            href={`${anchorPrefix}#deploy`}
+            href="/quickstart"
+            className="text-sm text-subtle transition-colors hover:text-ink md:hidden"
+          >
+            文档
+          </a>
+          <span className="hidden lg:inline-flex"><GitHubStars /></span>
+          <a
+            href="/download"
             className="btn btn-primary btn-sm shrink-0"
           >
-            开始部署
+            下载客户端
           </a>
         </div>
       </nav>

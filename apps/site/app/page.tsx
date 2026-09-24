@@ -1,6 +1,7 @@
 import { Nav } from "@/components/Nav";
 import { Hero } from "@/components/Hero";
 import { Daily } from "@/components/Daily";
+import { Transfer } from "@/components/Transfer";
 import { Onboard } from "@/components/Onboard";
 import { Admin } from "@/components/Admin";
 import { Deploy } from "@/components/Deploy";
@@ -15,9 +16,10 @@ export default function Page() {
       <Nav />
       <main>
         <Hero />
-        <Daily />
-        <Onboard />
         <Admin />
+        <Daily />
+        <Transfer />
+        <Onboard />
         <Deploy />
         <Privacy />
         <Faq />

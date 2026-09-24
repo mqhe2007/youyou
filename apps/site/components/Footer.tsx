@@ -8,14 +8,14 @@ const site = "https://youyou.mengqinghe.com";
 
 const productLinks = [
   { label: "日常使用", href: "#daily" },
-  { label: "管理", href: "#admin" },
-  { label: "部署", href: "#deploy" },
+  { label: "原有照片库", href: "#library" },
+  { label: "开始使用", href: "#start" },
   { label: "隐私", href: "#privacy" },
 ];
 
 const docLinks = [
   { label: "快速开始", href: "/quickstart" },
-  { label: "客户端下载", href: `${repo}/releases` },
+  { label: "客户端下载", href: "/download" },
 ];
 
 const legalLinks = [
@@ -145,7 +145,7 @@ export function Footer({ anchorPrefix = "" }: FooterProps) {
         </div>
         <div className="mt-14 flex flex-col gap-3 border-t border-line pt-7 text-sm text-subtle md:flex-row md:items-center md:justify-between">
           <p>© 2026 柚柚相册</p>
-          <p>Docker · Android 12+</p>
+          <p>AGPL-3.0-only</p>
         </div>
       </div>
     </footer>

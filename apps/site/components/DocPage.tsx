@@ -71,7 +71,7 @@ export function DocPage({ current, title, lead, sections }: DocPageProps) {
         </div>
 
         <div className={container}>
-          <div className="grid gap-10 border-t border-line pb-20 md:grid-cols-12 md:gap-12 md:pb-28">
+          <div className="grid gap-10 border-t border-line pb-20 pt-10 md:grid-cols-12 md:gap-12 md:pb-28 md:pt-12">
             <aside className="md:sticky md:top-24 md:col-span-3 md:self-start">
               <h2 className="text-sm font-semibold text-subtle">本页内容</h2>
               <ol className="mt-4 space-y-2.5 border-l border-line pl-4 text-sm">

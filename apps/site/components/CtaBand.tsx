@@ -6,8 +6,6 @@ import { ArrowRight } from "@phosphor-icons/react/dist/ssr";
 import { gsap } from "@/lib/gsap";
 import { useSectionMotion } from "@/hooks/useSectionMotion";
 
-const repo = "https://github.com/mqhe2007/youyou";
-/** 站内路由：快速开始已不再是仓库里的 md */
 const quickstart = "/quickstart";
 
 export function CtaBand() {
@@ -45,24 +43,17 @@ export function CtaBand() {
       <div className="mx-auto w-full max-w-[1400px] px-4 py-24 md:px-8 md:py-32">
         <div className="cta-copy">
           <h2 className="text-4xl font-semibold leading-[1.12] tracking-tight text-accent-fg md:text-5xl">
-            现在就装一套自己的相册
+            让新旧照片，在同一条时间线上相遇
           </h2>
           <p className="mt-5 text-lg leading-relaxed text-accent-fg/80">
-            不用编译，拉现成镜像就能起服务端，Android 扫码即可使用。
+            已有邀请，下载客户端扫码接入；想管理自己的照片库，从部署说明开始。
           </p>
           <div className="cta-actions mt-9 flex flex-wrap items-center gap-3">
-            <Link className="btn btn-invert group" href={quickstart}>
-              开始部署
+            <a className="btn btn-invert group" href="/download">
+              下载客户端
               <ArrowRight size={16} weight="bold" className="cta-icon" />
-            </Link>
-            <a
-              className="btn btn-on-accent"
-              href={repo}
-              target="_blank"
-              rel="noreferrer"
-            >
-              查看仓库
             </a>
+            <Link className="btn btn-on-accent" href={quickstart}>部署服务端</Link>
           </div>
         </div>
       </div>
