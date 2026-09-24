@@ -57,15 +57,14 @@ export function Hero() {
           <div aria-hidden className="absolute left-0 top-[18%] h-[11%] w-[6.2%] bg-surface" />
           <div className="absolute left-[28.4%] top-[5.35%] h-[86.7%] w-[41.9%] overflow-hidden rounded-[7.5%] bg-white">
             <Image
-              src="/images/app-timeline-demo.webp"
+              src="/images/app-timeline-filled.webp"
               alt="柚柚相册真实时间线：照片格子中，云朵表示仅服务器、手机表示仅本机；无徽标的照片两端都有"
               width={1280}
-              height={2856}
+              height={2566}
               priority
               fetchPriority="high"
               sizes="344px"
-              className="h-full w-full"
-              style={{ objectFit: "fill" }}
+              className="h-full w-full object-cover"
             />
           </div>
           <span aria-hidden className="absolute left-[48.35%] top-[5.95%] aspect-square w-[2.05%] rounded-full border-[2px] border-[#333941] bg-[#0b0e13]" />
@@ -82,10 +81,10 @@ export function Hero() {
           />
           <div className="relative z-20 w-[min(77vw,344px)] rounded-[42px] border-[8px] border-[#292825] bg-white p-[3px] shadow-[0_30px_70px_rgba(28,27,26,0.18)]">
             <Image
-              src="/images/app-timeline-demo.webp"
+              src="/images/app-timeline-filled.webp"
               alt="柚柚相册真实时间线：照片格子中，云朵表示仅服务器、手机表示仅本机；无徽标的照片两端都有"
               width={1280}
-              height={2856}
+              height={2566}
               priority
               fetchPriority="high"
               sizes="(max-width: 768px) 77vw, 344px"
