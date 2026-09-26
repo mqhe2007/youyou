@@ -60,6 +60,8 @@ const FORMATS: &[(&str, MediaFormat)] = &[
     ("gif", image("image/gif")),
     ("webp", image("image/webp")),
     ("bmp", image("image/bmp")),
+    ("tif", image("image/tiff")),
+    ("tiff", image("image/tiff")),
     // iPhone 默认拍照格式：尺寸解析不依赖外部工具，缩略图需要 HEIF 解码器
     ("heic", heif("image/heic")),
     ("heif", heif("image/heif")),
@@ -94,6 +96,22 @@ pub fn from_path(path: &str) -> Option<MediaFormat> {
         .iter()
         .find(|(candidate, _)| *candidate == extension)
         .map(|(_, format)| *format)
+}
+
+/// 文件名不可信时，按图片内容选择解码器与 MIME。
+pub fn image_from_content(bytes: &[u8]) -> Option<MediaFormat> {
+    if crate::heif::is_heif(bytes) {
+        return Some(heif("image/heic"));
+    }
+    match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Jpeg => Some(image("image/jpeg")),
+        image::ImageFormat::Png => Some(image("image/png")),
+        image::ImageFormat::Gif => Some(image("image/gif")),
+        image::ImageFormat::WebP => Some(image("image/webp")),
+        image::ImageFormat::Bmp => Some(image("image/bmp")),
+        image::ImageFormat::Tiff => Some(image("image/tiff")),
+        _ => None,
+    }
 }
 
 /// 扫描白名单：注册表内的格式才进入索引。
@@ -143,5 +161,24 @@ mod tests {
         assert_eq!(mime_for_path("photo.mpg").as_deref(), Some("video/mpeg"));
         assert_eq!(mime_for_path("photo.heic").as_deref(), Some("image/heic"));
         assert_eq!(mime_for_path("no-extension").as_deref(), None);
+    }
+
+    #[test]
+    fn image_content_overrides_misleading_extension() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 3));
+        for (format, mime) in [
+            (image::ImageFormat::Jpeg, "image/jpeg"),
+            (image::ImageFormat::Tiff, "image/tiff"),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut bytes, format).unwrap();
+            assert_eq!(image_from_content(&bytes.into_inner()).unwrap().mime, mime);
+        }
+        assert_eq!(
+            image_from_content(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic")
+                .unwrap()
+                .decoder,
+            Decoder::Heif
+        );
     }
 }

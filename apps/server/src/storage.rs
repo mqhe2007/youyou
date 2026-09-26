@@ -57,6 +57,7 @@ pub struct StorageHealth {
     pub read_only: bool,
     pub writable: bool,
     pub free_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -393,11 +394,13 @@ impl StorageDriver for LocalFilesystemStorageDriver {
             return Err(StorageError::NotDirectory(self.root.display().to_string()));
         }
         let read_only = metadata.permissions().readonly();
+        let disk_space = disk_space_bytes(&self.root);
         Ok(StorageHealth {
             root_path: self.root.display().to_string(),
             read_only,
             writable: !read_only,
-            free_bytes: free_space_bytes(&self.root),
+            free_bytes: disk_space.map(|space| space.0),
+            total_bytes: disk_space.map(|space| space.1),
         })
     }
 
@@ -637,7 +640,7 @@ fn epoch_millis(value: SystemTime) -> Option<i64> {
 }
 
 #[cfg(unix)]
-fn free_space_bytes(path: &Path) -> Option<u64> {
+fn disk_space_bytes(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -647,11 +650,14 @@ fn free_space_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    u64::from(stats.f_bavail).checked_mul(stats.f_frsize)
+    Some((
+        u64::from(stats.f_bavail).checked_mul(stats.f_frsize)?,
+        u64::from(stats.f_blocks).checked_mul(stats.f_frsize)?,
+    ))
 }
 
 #[cfg(not(unix))]
-fn free_space_bytes(_path: &Path) -> Option<u64> {
+fn disk_space_bytes(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 

@@ -12,7 +12,7 @@ use tempfile::tempdir;
 use tokio::time::sleep;
 use tower::util::ServiceExt;
 use uuid::Uuid;
-use youyou_server::{api::build_router, initialize, metadata};
+use youyou_server::{api::build_router, initialize, metadata, scan};
 
 /// 可解码的最小 JPEG 夹具：图片必须能解析出尺寸才会入库。
 /// `seed` 追加在 JPEG 之后，用来让不同文件的内容哈希不同（解码器忽略尾部字节）。
@@ -671,6 +671,67 @@ async fn admin_can_inspect_storage_jobs_backups_audit_and_diagnostics() {
         serde_json::from_slice(&diagnostics_body).expect("diagnostics json");
     assert_eq!(diagnostics_json["databaseQuickCheck"], "ok");
     assert!(diagnostics_json["storage"].is_object());
+    assert!(diagnostics_json["storage"]["totalBytes"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn diagnostics_counts_indexed_files_and_deduplicated_media() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let bytes = photo_bytes(b"same-content");
+    tokio::fs::write(media.path().join("first.jpg"), &bytes)
+        .await
+        .expect("first photo");
+    tokio::fs::write(media.path().join("second.jpg"), &bytes)
+        .await
+        .expect("duplicate photo");
+
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let summary = scan::scan_directory(&state.db, state.storage.clone(), "duplicate-scan")
+        .await
+        .expect("scan");
+    assert_eq!(summary.indexed, 2);
+    sqlx::query(
+        "INSERT INTO media_index_failures
+         (storage_id, normalized_path, file_name, size, reason, first_failed_at, last_failed_at)
+         VALUES ('local', 'broken.jpg', 'broken.jpg', 1, 'decode failed', 1, 1)",
+    )
+    .execute(&state.db)
+    .await
+    .expect("index failure");
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, status, checkpoint, created_at, updated_at, finished_at)
+         VALUES ('full-scan', 'scan', 'succeeded', '{\"kind\":\"scan\",\"scopePath\":\"\"}', 1, 2, 2)",
+    )
+    .execute(&state.db)
+    .await
+    .expect("full scan job");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state);
+    let (admin_token, _, _) = establish_device(&app, setup_token.trim()).await;
+    let response = request(
+        &app,
+        Method::GET,
+        "/api/v1/admin/diagnostics",
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("diagnostics body");
+    let diagnostics: serde_json::Value = serde_json::from_slice(&body).expect("diagnostics json");
+    assert_eq!(diagnostics["indexedFileCount"], 2);
+    assert_eq!(diagnostics["mediaCount"], 1);
+    assert_eq!(diagnostics["photoCount"], 2);
+    assert_eq!(diagnostics["videoCount"], 0);
+    assert_eq!(diagnostics["indexFailureCount"], 1);
+    assert_eq!(diagnostics["indexFailures"][0]["path"], "broken.jpg");
+    assert_eq!(diagnostics["latestFullScan"]["id"], "full-scan");
 }
 
 #[tokio::test]
@@ -4195,6 +4256,75 @@ async fn live_photo_pair_merges_and_hides_paired_motion() {
         "清单里不应再有独立视频项：{list}"
     );
 
+    let admin_list = request(
+        &app,
+        Method::GET,
+        "/api/v1/admin/media-library?path=library/camera",
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(admin_list.status(), StatusCode::OK);
+    let body = to_bytes(admin_list.into_body(), usize::MAX).await.unwrap();
+    let admin_list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let admin_items = admin_list["media"].as_array().unwrap();
+    assert_eq!(admin_items.len(), 3, "管理端也应合并实况：{admin_list}");
+    assert_eq!(
+        admin_items
+            .iter()
+            .filter(|item| item["isLivePhoto"] == true)
+            .count(),
+        2
+    );
+    assert_eq!(
+        admin_items
+            .iter()
+            .find(|item| item["name"] == "IMG_0001.jpg")
+            .unwrap()["motionName"],
+        "IMG_0001.mov",
+        "管理端下载须保留动态原文件名"
+    );
+    let admin_still_id = admin_items
+        .iter()
+        .find(|item| item["name"] == "IMG_0001.jpg")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let motion = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/media-library/media/{admin_still_id}/content?motion=true"),
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(motion.status(), StatusCode::OK);
+    assert_eq!(motion.headers()[header::CONTENT_TYPE], "video/quicktime");
+    let motion_bytes = to_bytes(motion.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        motion_bytes.as_ref(),
+        std::fs::read(library.join("camera/IMG_0001.mov")).unwrap()
+    );
+    let still_content = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/media-library/media/{admin_still_id}/content"),
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(still_content.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(still_content.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        std::fs::read(library.join("camera/IMG_0001.jpg")).unwrap()
+    );
+
     for name in ["IMG_0001.jpg", "IMG_0003.jpg"] {
         let still = media_by_name(&list, name);
         let live = &still["livePhoto"];
@@ -4329,6 +4459,102 @@ async fn live_photo_pair_merges_and_hides_paired_motion() {
         media_by_name(&list, "IMG_0003.jpg")["livePhoto"]["role"],
         "still"
     );
+
+    let paired_id = media_by_name(&list, "IMG_0003.jpg")["id"].as_str().unwrap();
+    let delete = request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/admin/media-library/entries?kind=media&target={paired_id}"),
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert!(!library.join("camera/IMG_0003.jpg").exists());
+    assert!(!library.join("camera/IMG_0003.MOV").exists());
+}
+
+#[tokio::test]
+async fn live_photo_admin_move_moves_pair_and_rejects_motion_collision() {
+    let data = tempdir().unwrap();
+    let media = tempdir().unwrap();
+    let library = media.path().join("library");
+    tokio::fs::create_dir_all(library.join("camera"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(library.join("album"))
+        .await
+        .unwrap();
+    write_jpeg(&library.join("camera/IMG_1000.jpg"), [10, 20, 30]);
+    write_video_fixture(
+        &library.join("camera/IMG_1000.mov"),
+        "libx264",
+        "mov",
+        "160x120",
+    );
+    let state = initialize(data.path(), media.path()).await.unwrap();
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "library").await;
+    assert_eq!(
+        run_scan(&app, &admin_token, &csrf_token).await["status"],
+        "succeeded"
+    );
+
+    tokio::fs::write(library.join("album/IMG_1000.mov"), b"collision")
+        .await
+        .unwrap();
+    let move_pair = || {
+        json_request(
+            &app,
+            Method::POST,
+            "/api/v1/admin/media-library/move",
+            serde_json::json!({"from":"library/camera/IMG_1000.jpg","to":"library/album/IMG_1000.jpg"}),
+            Some(&admin_token),
+            Some(&csrf_token),
+        )
+    };
+    assert_eq!(move_pair().await.status(), StatusCode::CONFLICT);
+    assert!(library.join("camera/IMG_1000.jpg").exists());
+    assert!(library.join("camera/IMG_1000.mov").exists());
+    assert!(!library.join("album/IMG_1000.jpg").exists());
+    tokio::fs::remove_file(library.join("album/IMG_1000.mov"))
+        .await
+        .unwrap();
+
+    assert_eq!(move_pair().await.status(), StatusCode::NO_CONTENT);
+    assert!(!library.join("camera/IMG_1000.jpg").exists());
+    assert!(!library.join("camera/IMG_1000.mov").exists());
+    assert!(library.join("album/IMG_1000.jpg").exists());
+    assert!(library.join("album/IMG_1000.mov").exists());
+    let list = media_list(&app, &device_token).await;
+    let still = media_by_name(&list, "IMG_1000.jpg");
+    assert_eq!(still["path"], "library/album/IMG_1000.jpg");
+    assert_eq!(still["livePhoto"]["role"], "still");
+    let partner_id = still["livePhoto"]["partnerMediaId"].as_str().unwrap();
+    assert_eq!(
+        media_detail(&app, &device_token, partner_id).await["path"],
+        "library/album/IMG_1000.mov"
+    );
+
+    let admin_list = request(
+        &app,
+        Method::GET,
+        "/api/v1/admin/media-library?path=library/album",
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(admin_list.status(), StatusCode::OK);
+    let body = to_bytes(admin_list.into_body(), usize::MAX).await.unwrap();
+    let admin_list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(admin_list["media"].as_array().unwrap().len(), 1);
+    assert_eq!(admin_list["media"][0]["motionName"], "IMG_1000.mov");
 }
 
 /// 上传路径：客户端显式声明实况分组（上传会改名，基名配对不可用），第二侧入库即配对。
@@ -4472,6 +4698,43 @@ async fn live_photo_embedded_motion_photo_is_detected_from_xmp() {
     );
     assert_eq!(item["livePhoto"]["embedded"], true);
     assert_eq!(item["livePhoto"]["partnerMediaId"], serde_json::Value::Null);
+
+    let admin_list = request(
+        &app,
+        Method::GET,
+        "/api/v1/admin/media-library?path=library",
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(admin_list.status(), StatusCode::OK);
+    let body = to_bytes(admin_list.into_body(), usize::MAX).await.unwrap();
+    let admin_list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let live = admin_list["media"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "MVIMG_0001.jpg")
+        .unwrap();
+    assert_eq!(live["isLivePhoto"], true);
+    assert!(live["motionName"].is_null(), "内嵌实况下载只需一个原文件");
+    let motion = request(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/admin/media-library/media/{}/content?motion=true",
+            live["id"].as_str().unwrap()
+        ),
+        None,
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(motion.status(), StatusCode::OK);
+    assert_eq!(motion.headers()[header::CONTENT_TYPE], "video/mp4");
+    let motion_bytes = to_bytes(motion.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(motion_bytes.as_ref(), video.as_slice());
 
     // 不误判：XMP 声明了动态照片但视频字节已被截断 → 普通图片。
     assert_eq!(

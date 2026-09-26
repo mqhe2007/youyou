@@ -658,9 +658,11 @@ async fn probe_image(
     path: &str,
     file_size: u64,
 ) -> anyhow::Result<Probe> {
-    let head_cap = match crate::media_format::from_path(path) {
-        Some(format) if format.decoder == crate::media_format::Decoder::Heif => HEIC_HEAD_BYTES,
-        _ => IMAGE_HEAD_BYTES,
+    let signature = read_range(storage, path, 0, file_size.min(64)).await?;
+    let head_cap = if crate::heif::is_heif(&signature) {
+        HEIC_HEAD_BYTES
+    } else {
+        IMAGE_HEAD_BYTES
     };
     let head_len = file_size.min(head_cap);
     let head = read_range(storage, path, 0, head_len)

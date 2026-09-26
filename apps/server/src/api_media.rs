@@ -925,9 +925,10 @@ pub(crate) async fn render_thumbnail(
     }
     // HEIC/HEIF：image crate 不支持该容器，走 heif-convert / sips；解码器缺失
     // 或解码失败时返回占位图。
-    if crate::media_format::from_path(normalized_path)
-        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Heif)
-    {
+    let head = storage
+        .read_all(normalized_path, Some((0, Some(63))))
+        .await?;
+    if crate::heif::is_heif(&head) {
         if crate::heif::tool().is_none() {
             // 服务端缺少 HEIF 解码器：明确告知调用方（而非返回占位图），
             // 客户端可回退到原始内容并用设备解码（Android 12 原生支持 HEIF）。

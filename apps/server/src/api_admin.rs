@@ -100,6 +100,7 @@ pub(crate) struct AdminStorageResponse {
     read_only: bool,
     writable: bool,
     free_bytes: Option<u64>,
+    total_bytes: Option<u64>,
     updated_at: i64,
     capabilities: StorageCapabilitiesResponse,
 }
@@ -181,6 +182,7 @@ pub(crate) async fn admin_storage_response(state: &AppState) -> AppResult<AdminS
         read_only: health.read_only || row.3 == 1,
         writable: health.writable && row.3 == 0,
         free_bytes: health.free_bytes,
+        total_bytes: health.total_bytes,
         updated_at: row.4,
         capabilities: StorageCapabilitiesResponse {
             read_only_scan: true,

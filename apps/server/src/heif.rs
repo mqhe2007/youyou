@@ -35,6 +35,12 @@ pub fn is_heif(bytes: &[u8]) -> bool {
         brands.push(&bytes[offset..offset + 4]);
         offset += 4;
     }
+    if brands
+        .iter()
+        .any(|brand| *brand == b"avif" || *brand == b"avis")
+    {
+        return false;
+    }
     brands
         .iter()
         .any(|brand| HEIF_BRANDS.iter().any(|known| *known == brand))
@@ -228,5 +234,6 @@ mod tests {
         assert!(is_heif(&bytes), "sips 产物应被识别为 HEIF");
         assert_eq!(dimensions(&bytes), Some((8, 6)));
         assert!(!is_heif(b"not an image"));
+        assert!(!is_heif(b"\0\0\0\x18ftypavif\0\0\0\0mif1avif"));
     }
 }

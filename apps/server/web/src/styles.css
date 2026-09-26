@@ -2595,8 +2595,10 @@ a {
   position: fixed;
   inset: 0;
   z-index: 85;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   gap: 0.75rem;
   padding: 2.5rem 1rem 1.5rem;
   background: rgb(18 17 16 / 88%);
@@ -2623,6 +2625,23 @@ a {
   border-radius: 0.6rem;
   object-fit: contain;
   background: #000;
+}
+
+.media-lightbox-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.5rem 0.85rem;
+  border: 1px solid rgb(255 255 255 / 50%);
+  border-radius: 999px;
+  background: rgb(18 17 16 / 75%);
+  color: #fff;
+  cursor: pointer;
+}
+
+.media-lightbox-live:focus-visible {
+  outline: 2px solid #f0c82e;
+  outline-offset: 3px;
 }
 
 .media-lightbox-caption {
@@ -3219,5 +3238,409 @@ a {
 
   .media-index-metrics {
     grid-template-columns: 1fr;
+  }
+}
+
+/* 仪表盘：媒体规模优先，异常只在需要处理时出现。 */
+.dashboard-intro {
+  align-items: flex-start;
+  margin-block-end: 1.8rem;
+}
+
+.dashboard-intro h1 {
+  font-size: clamp(2.1rem, 3vw, 2.9rem);
+}
+
+.dashboard-freshness {
+  color: #777168;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.dashboard-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(18rem, 1fr);
+  gap: 1rem;
+  margin-block-end: 1rem;
+}
+
+.dashboard-media,
+.dashboard-side {
+  min-block-size: 24rem;
+  padding: clamp(1.4rem, 2.5vw, 2rem);
+}
+
+.dashboard-media {
+  display: flex;
+  flex-direction: column;
+}
+
+.dashboard-media-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.dashboard-accent-line {
+  flex: 0 0 0.38rem;
+  block-size: 4rem;
+  border-radius: 999px;
+  background: #ffd63a;
+}
+
+.dashboard-home h2 {
+  margin: 0;
+  color: #1c1b1a;
+  font-size: 1.2rem;
+  font-weight: 750;
+}
+
+.dashboard-media-title h2 {
+  font-size: 1.45rem;
+}
+
+.dashboard-home p {
+  margin: 0;
+  color: #777168;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.dashboard-media-title p {
+  margin-block-start: 0.25rem;
+}
+
+.dashboard-media-total {
+  display: block;
+  margin-block: 1.3rem auto;
+  color: #1c1b1a;
+  font-size: clamp(3.5rem, 6vw, 6rem);
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  letter-spacing: -0.07em;
+  line-height: 1;
+}
+
+.dashboard-media-breakdown {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding-block-start: 1.45rem;
+  border-block-start: 1px solid #eee8de;
+}
+
+.dashboard-media-breakdown > div {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  min-inline-size: 0;
+}
+
+.dashboard-media-breakdown > div + div {
+  padding-inline-start: 1.5rem;
+  border-inline-start: 1px solid #eee8de;
+}
+
+.dashboard-icon {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  inline-size: 3rem;
+  block-size: 3rem;
+  border-radius: 0.95rem;
+  background: #fff6d9;
+  color: #a47700;
+}
+
+.dashboard-icon-large {
+  inline-size: 3.6rem;
+  block-size: 3.6rem;
+  border-radius: 50%;
+}
+
+.dashboard-media-breakdown small {
+  display: block;
+  color: #55514b;
+  font-size: 0.85rem;
+}
+
+.dashboard-media-breakdown strong {
+  display: block;
+  margin-block-start: 0.12rem;
+  font-size: clamp(1.6rem, 2.6vw, 2.5rem);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.dashboard-side {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+}
+
+.dashboard-side-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 1.2rem;
+  min-inline-size: 0;
+}
+
+.dashboard-side-row + .dashboard-side-row {
+  padding-block-start: 1.25rem;
+  border-block-start: 1px solid #eee8de;
+}
+
+.dashboard-side-row h2 {
+  margin-block: 0.15rem 0.5rem;
+  font-size: 1rem;
+}
+
+.dashboard-side-row strong {
+  display: block;
+  font-size: clamp(2.2rem, 3.5vw, 3.5rem);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.06em;
+  line-height: 1.05;
+}
+
+.dashboard-side-row strong span {
+  color: #777168;
+}
+
+.dashboard-side-row p {
+  margin-block-start: 0.55rem;
+}
+
+.dashboard-space-copy {
+  flex: 1;
+  min-inline-size: 0;
+}
+
+.dashboard-space-meter {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-block-start: 1rem;
+}
+
+.dashboard-meter-track {
+  flex: 1;
+  block-size: 0.65rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eeeae3;
+}
+
+.dashboard-meter-track span {
+  display: block;
+  block-size: 100%;
+  border-radius: inherit;
+  background: #ffd63a;
+}
+
+.dashboard-space-meter small {
+  color: #55514b;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.dashboard-scan {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  min-block-size: 7.4rem;
+  padding: 1.35rem 2rem;
+}
+
+.dashboard-scan-heading {
+  min-inline-size: 11rem;
+}
+
+.dashboard-scan-heading p {
+  margin-block-start: 0.3rem;
+}
+
+.dashboard-scan-result {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  min-inline-size: 0;
+  padding-inline-start: 1.5rem;
+  border-inline-start: 1px solid #eee8de;
+}
+
+.dashboard-scan-result p {
+  flex: 1 1 14rem;
+}
+
+.dashboard-scan-result progress {
+  inline-size: 100%;
+  block-size: 0.55rem;
+  accent-color: #ffd63a;
+}
+
+.dashboard-scan .btn {
+  margin-inline-start: auto;
+  white-space: nowrap;
+}
+
+.dashboard-alerts {
+  margin-block-start: 1rem;
+  overflow: hidden;
+  border: 1px solid #f0d996;
+  border-radius: 1rem;
+  background: #fff9e9;
+}
+
+.dashboard-alert-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.5rem;
+  color: #a47700;
+}
+
+.dashboard-alerts > .dashboard-alert-row:not(:first-child) {
+  border-block-start: 1px solid #f0e4c5;
+}
+
+.dashboard-alert-row > div {
+  flex: 1;
+  min-inline-size: 0;
+}
+
+.dashboard-alert-row strong {
+  color: #1c1b1a;
+  font-size: 0.95rem;
+}
+
+.dashboard-alert-row p {
+  margin-block-start: 0.2rem;
+}
+
+.dashboard-alert-row .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-block-size: 2.75rem;
+  white-space: nowrap;
+}
+
+.dashboard-failure-details {
+  padding: 0 1.5rem 1.2rem 3.75rem;
+}
+
+.dashboard-failure-details p {
+  margin-block-end: 0.5rem;
+}
+
+.dashboard-failure-details ul {
+  display: grid;
+  gap: 0.5rem;
+  max-block-size: 15rem;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.dashboard-failure-details li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.8rem;
+  font-size: 0.82rem;
+}
+
+.dashboard-failure-details li code {
+  color: #1c1b1a;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-failure-details li span {
+  color: #777168;
+}
+
+.dashboard-failure-details .btn {
+  margin-block-start: 0.9rem;
+}
+
+@media (max-width: 1100px) {
+  .dashboard-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dashboard-side {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto;
+    min-block-size: auto;
+  }
+
+  .dashboard-side-row + .dashboard-side-row {
+    padding-block-start: 0;
+    padding-inline-start: 1.25rem;
+    border-block-start: 0;
+    border-inline-start: 1px solid #eee8de;
+  }
+}
+
+@media (max-width: 720px) {
+  .dashboard-media,
+  .dashboard-side {
+    min-block-size: auto;
+  }
+
+  .dashboard-media-total {
+    margin-block: 2rem;
+  }
+
+  .dashboard-side {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.5rem;
+  }
+
+  .dashboard-side-row + .dashboard-side-row {
+    padding-block-start: 1.5rem;
+    padding-inline-start: 0;
+    border-block-start: 1px solid #eee8de;
+    border-inline-start: 0;
+  }
+
+  .dashboard-scan {
+    flex-wrap: wrap;
+    padding: 1.25rem;
+  }
+
+  .dashboard-scan-result {
+    flex-basis: calc(100% - 5rem);
+    padding-inline-start: 0;
+    border-inline-start: 0;
+  }
+
+  .dashboard-alert-row {
+    flex-wrap: wrap;
+  }
+
+  .dashboard-alert-row .text-button {
+    margin-inline-start: 2.25rem;
+  }
+
+  .dashboard-failure-details {
+    padding-inline: 1.25rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .dashboard-media-breakdown > div {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .dashboard-media-breakdown > div + div {
+    padding-inline-start: 0.8rem;
+  }
+
+  .dashboard-icon {
+    inline-size: 2.6rem;
+    block-size: 2.6rem;
   }
 }

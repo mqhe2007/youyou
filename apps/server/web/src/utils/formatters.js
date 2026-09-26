@@ -170,7 +170,7 @@ export function jobMessage(job) {
 
   const scanProgress = message.match(/^discovered=(\d+), indexed=(\d+)$/);
   if (scanProgress) {
-    return `已发现 ${formatNumber(scanProgress[1])} 项，已建立索引 ${formatNumber(scanProgress[2])} 项`;
+    return `已发现 ${formatNumber(scanProgress[1])} 项，成功处理 ${formatNumber(scanProgress[2])} 项`;
   }
 
   const scanSummary = message.match(
@@ -179,7 +179,7 @@ export function jobMessage(job) {
   if (scanSummary) {
     const prefix = message.startsWith('cancelled:') ? '扫描已取消' : '扫描完成';
     const skipped = scanSummary[4] ? `，跳过 ${formatNumber(scanSummary[4])} 项` : '';
-    return `${prefix}：发现 ${formatNumber(scanSummary[1])} 项，建立索引 ${formatNumber(scanSummary[2])} 项，失败 ${formatNumber(scanSummary[3])} 项${skipped}`;
+    return `${prefix}：发现 ${formatNumber(scanSummary[1])} 项，成功处理 ${formatNumber(scanSummary[2])} 项，失败 ${formatNumber(scanSummary[3])} 项${skipped}`;
   }
 
   return {

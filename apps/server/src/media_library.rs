@@ -124,6 +124,9 @@ pub struct LibraryMedia {
     pub height: Option<u64>,
     pub taken_at: Option<i64>,
     pub sort_at: Option<i64>,
+    pub is_live_photo: bool,
+    /// Original motion file name for a paired live photo; absent for embedded motion.
+    pub motion_name: Option<String>,
 }
 
 /// Full metadata for one media asset, mirroring the fields the Android client
@@ -180,6 +183,10 @@ struct IndexedLocationRow {
     height: Option<i64>,
     taken_at: Option<i64>,
     sort_at: Option<i64>,
+    live_role: String,
+    live_embedded: i64,
+    live_partner_id: Option<String>,
+    motion_name: Option<String>,
 }
 
 /// Roll-up of the indexed media nested under one direct child folder.
@@ -216,6 +223,14 @@ struct MediaServeRow {
     content_hash: Option<String>,
     version: i64,
     is_video: i64,
+    live_role: String,
+    live_embedded: i64,
+    live_partner_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LibraryContentQuery {
+    motion: Option<bool>,
 }
 
 #[derive(Debug, FromRow)]
@@ -348,20 +363,62 @@ pub(crate) async fn move_library(
     }
 
     let source_stat = storage.stat(&from).await?;
-    storage
-        .move_path(&from, &to)
-        .await
-        .map_err(|error| match error {
-            StorageError::Io(io) if io.kind() == ErrorKind::AlreadyExists => {
-                AppError::Conflict("target path already exists".to_owned())
-            }
-            other => other.into(),
-        })?;
-
     if source_stat.is_directory {
+        storage.move_path(&from, &to).await.map_err(move_error)?;
         rewrite_folder_locations(&state.db, &from, &to).await?;
     } else {
-        rewrite_media_location(&state.db, &from, &to).await?;
+        let mut moves = vec![(from.clone(), to.clone())];
+        let media_id = sqlx::query_scalar::<_, String>(
+            "SELECT a.id FROM media_assets a JOIN media_locations l ON l.media_asset_id = a.id WHERE l.storage_id = 'local' AND l.normalized_path = ?1 AND a.identity_state = 'verified' AND l.hash_state = 'verified' LIMIT 1",
+        )
+        .bind(&from)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some(media_id) = media_id {
+            let still = find_verified_media(&state.db, &media_id).await?;
+            if still.live_role == "still"
+                && let Some(partner_id) = still.live_partner_id
+            {
+                let motion = find_verified_media(&state.db, &partner_id).await?;
+                if motion.live_role != "motion" || motion.is_video != 1 {
+                    return Err(AppError::Conflict(
+                        "live photo motion is invalid".to_owned(),
+                    ));
+                }
+                let parent = to.rsplit_once('/').map_or("", |(parent, _)| parent);
+                let name = motion.normalized_path.rsplit('/').next().unwrap_or("");
+                let motion_to = if parent.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{parent}/{name}")
+                };
+                if motion_to != motion.normalized_path {
+                    match storage.stat(&motion_to).await {
+                        Ok(_) => {
+                            return Err(AppError::Conflict("target path already exists".to_owned()));
+                        }
+                        Err(StorageError::NotFound(_)) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    storage.stat(&motion.normalized_path).await?;
+                    moves.push((motion.normalized_path, motion_to));
+                }
+            }
+        }
+        for (index, (source, target)) in moves.iter().enumerate() {
+            if let Err(error) = storage.move_path(source, target).await {
+                for (prior_source, prior_target) in moves[..index].iter().rev() {
+                    let _ = storage.move_path(prior_target, prior_source).await;
+                }
+                return Err(move_error(error));
+            }
+        }
+        if let Err(error) = rewrite_media_locations(&state.db, &moves).await {
+            for (source, target) in moves.iter().rev() {
+                let _ = storage.move_path(target, source).await;
+            }
+            return Err(error);
+        }
     }
 
     let _ = audit::record(
@@ -373,6 +430,15 @@ pub(crate) async fn move_library(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn move_error(error: StorageError) -> AppError {
+    match error {
+        StorageError::Io(io) if io.kind() == ErrorKind::AlreadyExists => {
+            AppError::Conflict("target path already exists".to_owned())
+        }
+        other => other.into(),
+    }
 }
 
 #[utoipa::path(
@@ -498,7 +564,10 @@ pub(crate) async fn upload_library(
     get,
     path = "/api/v1/admin/media-library/media/{id}/content",
     tag = "administration",
-    params(("id" = String, Path, description = "Media ID")),
+    params(
+        ("id" = String, Path, description = "Media ID"),
+        ("motion" = Option<bool>, Query, description = "Return the motion part of a live photo")
+    ),
     responses(
         (status = 200, description = "Media content", content_type = "application/octet-stream", body = [u8]),
         (status = 401, description = "Unauthorized"),
@@ -509,23 +578,52 @@ pub(crate) async fn library_media_content(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<LibraryContentQuery>,
 ) -> AppResult<Response> {
     auth::require_admin(&state.db, &headers, false).await?;
-    let row = find_verified_media(&state.db, &id).await?;
-    let (stat, stream) = state
-        .storage
-        .read_stream(&row.normalized_path, None)
+    let storage = state.storage.snapshot().await;
+    let mut row = find_verified_media(&state.db, &id).await?;
+    let mut embedded_range = None;
+    let mut embedded_mime = None;
+    if query.motion == Some(true) {
+        if row.live_role != "still" {
+            return Err(AppError::NotFound("live photo motion not found".to_owned()));
+        }
+        if let Some(partner_id) = row.live_partner_id.clone() {
+            row = find_verified_media(&state.db, &partner_id).await?;
+            if row.live_role != "motion" || row.is_video != 1 {
+                return Err(AppError::NotFound("live photo motion not found".to_owned()));
+            }
+        } else if row.live_embedded == 1 {
+            let size = storage.stat(&row.normalized_path).await?.size;
+            let motion = crate::live_photo::probe_path(&storage, &row.normalized_path, size, false)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?
+                .embedded
+                .ok_or_else(|| AppError::NotFound("live photo motion not found".to_owned()))?;
+            let offset = motion
+                .offset_in(size)
+                .ok_or_else(|| AppError::NotFound("live photo motion not found".to_owned()))?;
+            embedded_range = Some((offset, Some(offset + motion.video_length - 1)));
+            embedded_mime = Some(motion.mime.unwrap_or_else(|| "video/mp4".to_owned()));
+        } else {
+            return Err(AppError::NotFound("live photo motion not found".to_owned()));
+        }
+    }
+    let (stat, stream) = storage
+        .read_stream(&row.normalized_path, embedded_range)
         .await?;
     let body_stream =
         stream.map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = StatusCode::OK;
-    let content_type = row
-        .mime_type
+    let content_type = embedded_mime
         .or_else(|| {
-            mime_guess::from_path(&row.normalized_path)
-                .first_raw()
-                .map(str::to_owned)
+            row.mime_type.or_else(|| {
+                mime_guess::from_path(&row.normalized_path)
+                    .first_raw()
+                    .map(str::to_owned)
+            })
         })
         .unwrap_or_else(|| "application/octet-stream".to_owned());
     response.headers_mut().insert(
@@ -535,8 +633,12 @@ pub(crate) async fn library_media_content(
     );
     response.headers_mut().insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&stat.size.to_string())
-            .expect("content length is always an ASCII integer"),
+        HeaderValue::from_str(
+            &embedded_range
+                .map_or(stat.size, |(start, end)| end.unwrap() - start + 1)
+                .to_string(),
+        )
+        .expect("content length is always an ASCII integer"),
     );
     let file_name = row
         .normalized_path
@@ -544,10 +646,12 @@ pub(crate) async fn library_media_content(
         .next()
         .unwrap_or("download")
         .to_owned();
-    if let Ok(value) = HeaderValue::from_str(&format!(
-        "attachment; filename=\"{}\"",
-        file_name.replace('"', "")
-    )) {
+    if query.motion != Some(true)
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            file_name.replace('"', "")
+        ))
+    {
         response
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
@@ -757,7 +861,7 @@ async fn build_listing(
     storage: &LocalFilesystemStorageDriver,
     path: &str,
 ) -> AppResult<LibraryListResponse> {
-    let rows = sqlx::query_as::<_, IndexedLocationRow>(
+    let query = format!(
         r#"
         SELECT
             a.id AS media_id,
@@ -769,16 +873,24 @@ async fn build_listing(
             a.width,
             a.height,
             a.taken_at,
-            a.sort_at
+            a.sort_at,
+            a.live_role,
+            a.live_embedded,
+            a.live_partner_id,
+            p.name AS motion_name
         FROM media_assets a
         INNER JOIN media_locations l ON l.media_asset_id = a.id
+        LEFT JOIN media_assets p ON p.id = a.live_partner_id
         WHERE a.identity_state = 'verified'
           AND l.hash_state = 'verified'
           AND l.storage_id = 'local'
+          AND {}
         "#,
-    )
-    .fetch_all(pool)
-    .await?;
+        crate::live_photo::VISIBLE_PREDICATE
+    );
+    let rows = sqlx::query_as::<_, IndexedLocationRow>(&query)
+        .fetch_all(pool)
+        .await?;
 
     let mut folder_aggregates = BTreeMap::<String, FolderAggregate>::new();
     let mut media = Vec::new();
@@ -806,6 +918,9 @@ async fn build_listing(
             height: row.height.and_then(|v| u64::try_from(v).ok()),
             taken_at: row.taken_at,
             sort_at: row.sort_at,
+            is_live_photo: row.live_role == "still"
+                && (row.live_embedded == 1 || row.live_partner_id.is_some()),
+            motion_name: row.motion_name,
         });
     }
 
@@ -863,6 +978,31 @@ async fn delete_media(
     trash: &crate::trash::TrashRuntime,
     media_id: &str,
 ) -> AppResult<()> {
+    let row = find_verified_media(pool, media_id).await?;
+    if row.live_role == "still"
+        && let Some(partner_id) = row.live_partner_id
+    {
+        let motion = crate::trash::delete_media(
+            pool,
+            storage,
+            trash,
+            &partner_id,
+            None,
+            "admin_deleted",
+            "admin",
+            &Uuid::new_v4().to_string(),
+            None,
+            None,
+        )
+        .await?;
+        if !matches!(motion.state.as_str(), "succeeded" | "not_found") {
+            return Err(AppError::Conflict(
+                motion
+                    .message
+                    .unwrap_or_else(|| "删除实况视频失败".to_owned()),
+            ));
+        }
+    }
     let operation_id = Uuid::new_v4().to_string();
     let outcome = crate::trash::delete_media(
         pool,
@@ -920,24 +1060,26 @@ async fn delete_empty_folder(
     Ok(())
 }
 
-async fn rewrite_media_location(pool: &SqlitePool, from: &str, to: &str) -> AppResult<()> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            i64,
-            Option<String>,
-            i64,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-            Option<i64>,
-        ),
-    >(
-        r#"
+async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) -> AppResult<()> {
+    let mut transaction = pool.begin().await?;
+    for (from, to) in moves {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i64,
+                Option<String>,
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<i64>,
+            ),
+        >(
+            r#"
         SELECT
             a.id,
             a.name,
@@ -955,46 +1097,45 @@ async fn rewrite_media_location(pool: &SqlitePool, from: &str, to: &str) -> AppR
         LEFT JOIN content_blobs b ON b.id = a.blob_id
         WHERE l.storage_id = 'local' AND l.normalized_path = ?1
         "#,
-    )
-    .bind(from)
-    .fetch_optional(pool)
-    .await?;
-    let Some((
-        media_id,
-        _old_name,
-        size,
-        mime_type,
-        is_video,
-        width,
-        height,
-        taken_at,
-        sort_at,
-        content_hash,
-        duration_ms,
-    )) = row
-    else {
-        // Path may be an unindexed empty-folder move; nothing to rewrite.
-        return Ok(());
-    };
+        )
+        .bind(from)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((
+            media_id,
+            _old_name,
+            size,
+            mime_type,
+            is_video,
+            width,
+            height,
+            taken_at,
+            sort_at,
+            content_hash,
+            duration_ms,
+        )) = row
+        else {
+            // Path may be an unindexed empty-folder move; nothing to rewrite.
+            continue;
+        };
 
-    let file_name = to.rsplit('/').next().unwrap_or(to).to_owned();
-    let now = now_millis();
-    let mut transaction = pool.begin().await?;
-    let revision = sync::allocate_revision(&mut transaction).await?;
-    sqlx::query(
-        r#"
+        let file_name = to.rsplit('/').next().unwrap_or(to).to_owned();
+        let now = now_millis();
+        let revision = sync::allocate_revision(&mut transaction).await?;
+        sqlx::query(
+            r#"
         UPDATE media_locations
         SET normalized_path = ?1, file_name = ?2, updated_at = ?3
         WHERE storage_id = 'local' AND normalized_path = ?4
         "#,
-    )
-    .bind(to)
-    .bind(&file_name)
-    .bind(now)
-    .bind(from)
-    .execute(&mut *transaction)
-    .await?;
-    sqlx::query(
+        )
+        .bind(to)
+        .bind(&file_name)
+        .bind(now)
+        .bind(from)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
         "UPDATE media_assets SET name = ?1, version = version + 1, updated_at = ?2 WHERE id = ?3",
     )
     .bind(&file_name)
@@ -1002,54 +1143,56 @@ async fn rewrite_media_location(pool: &SqlitePool, from: &str, to: &str) -> AppR
     .bind(&media_id)
     .execute(&mut *transaction)
     .await?;
-    let version = sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
+        let version =
+            sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
+                .bind(&media_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let mut payload = serde_json::json!({
+            "id": media_id,
+            "name": file_name,
+            "path": to,
+            "size": size,
+            "contentHash": content_hash,
+            "mimeType": mime_type,
+            "isVideo": is_video != 0,
+            "storageId": "local",
+            "identityState": "verified",
+            "hashState": "verified",
+            "durationMs": duration_ms,
+            "width": width,
+            "height": height,
+            "takenAt": taken_at,
+            "sortAt": sort_at,
+        });
+        let time = sqlx::query_as::<_, (String, i64, Option<String>)>(
+            "SELECT sort_source,time_version,original_name FROM media_assets WHERE id=?1",
+        )
         .bind(&media_id)
         .fetch_one(&mut *transaction)
         .await?;
-    let mut payload = serde_json::json!({
-        "id": media_id,
-        "name": file_name,
-        "path": to,
-        "size": size,
-        "contentHash": content_hash,
-        "mimeType": mime_type,
-        "isVideo": is_video != 0,
-        "storageId": "local",
-        "identityState": "verified",
-        "hashState": "verified",
-        "durationMs": duration_ms,
-        "width": width,
-        "height": height,
-        "takenAt": taken_at,
-        "sortAt": sort_at,
-    });
-    let time = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT sort_source,time_version,original_name FROM media_assets WHERE id=?1",
-    )
-    .bind(&media_id)
-    .fetch_one(&mut *transaction)
-    .await?;
-    payload["sortSource"] = serde_json::json!(time.0);
-    payload["timeVersion"] = serde_json::json!(time.1);
-    payload["originalName"] = serde_json::json!(time.2);
-    payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
-        .await?
-        .unwrap_or(serde_json::Value::Null);
-    sqlx::query(
-        r#"
+        payload["sortSource"] = serde_json::json!(time.0);
+        payload["timeVersion"] = serde_json::json!(time.1);
+        payload["originalName"] = serde_json::json!(time.2);
+        payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
+            .await?
+            .unwrap_or(serde_json::Value::Null);
+        sqlx::query(
+            r#"
         INSERT INTO change_log
             (revision, event_id, entity, operation, entity_id, version, payload, created_at)
         VALUES (?1, ?2, 'media', 'upsert', ?3, ?4, ?5, ?6)
         "#,
-    )
-    .bind(revision)
-    .bind(Uuid::new_v4().to_string())
-    .bind(&media_id)
-    .bind(version)
-    .bind(serde_json::to_string(&payload).map_err(|error| AppError::Internal(error.into()))?)
-    .bind(now)
-    .execute(&mut *transaction)
-    .await?;
+        )
+        .bind(revision)
+        .bind(Uuid::new_v4().to_string())
+        .bind(&media_id)
+        .bind(version)
+        .bind(serde_json::to_string(&payload).map_err(|error| AppError::Internal(error.into()))?)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -1203,7 +1346,10 @@ async fn find_verified_media(pool: &SqlitePool, id: &str) -> AppResult<MediaServ
             a.mime_type,
             b.content_hash,
             a.version,
-            a.is_video
+            a.is_video,
+            a.live_role,
+            a.live_embedded,
+            a.live_partner_id
         FROM media_assets a
         INNER JOIN media_locations l ON l.media_asset_id = a.id
         LEFT JOIN content_blobs b ON b.id = a.blob_id

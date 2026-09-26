@@ -42,17 +42,16 @@ const navigation = [
 const activeSection = ref('dashboard');
 const mobileNavOpen = ref(false);
 const initialLoading = ref(true);
-const refreshing = ref(false);
 const actionBusy = ref('');
 const toast = ref(null);
 const status = ref(null);
 const storage = ref(null);
+const users = ref([]);
 const jobs = ref({ items: [] });
 const watchedScanId = ref(null);
 const libraryRevision = ref(0);
 const diagnostics = ref(null);
-const auditLog = ref([]);
-const auditLoaded = ref(false);
+const refreshedAt = ref(null);
 const userMenuOpen = ref(false);
 const logoPath = '/admin/logo_mark.png';
 const iconStrokeWidth = 1.8;
@@ -97,19 +96,19 @@ function handleError(error, silent = false) {
 }
 
 async function loadDashboard({ silent = false } = {}) {
-  if (!silent) refreshing.value = true;
-
   try {
-    const [statusResult, storageResult, jobsResult] =
+    const [statusResult, storageResult, jobsResult, usersResult] =
       await Promise.all([
         props.api.request('/api/v1/admin/status'),
         props.api.request('/api/v1/admin/storage'),
         props.api.request('/api/v1/admin/jobs?limit=20'),
+        props.api.request('/api/v1/admin/users'),
       ]);
 
     status.value = statusResult;
     storage.value = storageResult;
     jobs.value = jobsResult || { items: [] };
+    users.value = usersResult || [];
 
     if (activeJobs.value.length) {
       scheduleJobPoll();
@@ -117,41 +116,33 @@ async function loadDashboard({ silent = false } = {}) {
       stopJobPoll();
     }
 
-    await Promise.all([
-      diagnostics.value ? Promise.resolve() : loadDiagnostics({ silent: true }),
-      auditLoaded.value ? Promise.resolve() : loadAudit({ silent: true }),
-    ]);
+    const diagnosticsReady = await loadDiagnostics({ silent: true });
+    if (diagnosticsReady) refreshedAt.value = Date.now();
+    return diagnosticsReady;
   } catch (error) {
+    storage.value = null;
+    diagnostics.value = null;
     handleError(error, silent);
+    return false;
   } finally {
     initialLoading.value = false;
-    refreshing.value = false;
   }
 }
 
 async function loadDiagnostics({ silent = false } = {}) {
   try {
     diagnostics.value = await props.api.request('/api/v1/admin/diagnostics');
+    return true;
   } catch (error) {
+    diagnostics.value = null;
     handleError(error, silent);
-  }
-}
-
-async function loadAudit({ silent = false } = {}) {
-  try {
-    const page = await props.api.request('/api/v1/admin/audit-log?limit=30');
-    auditLog.value = page?.items || [];
-    auditLoaded.value = true;
-  } catch (error) {
-    handleError(error, silent);
+    return false;
   }
 }
 
 async function refreshAll() {
   dismissToast();
-  await loadDashboard();
-  await Promise.all([loadDiagnostics(), loadAudit()]);
-  notify('状态已更新。', 'success');
+  if (await loadDashboard()) notify('状态已更新。', 'success');
 }
 
 const validSections = new Set(navigation.map((item) => item.id));
@@ -171,10 +162,7 @@ function selectSection(section) {
     window.location.hash = target;
   }
   if (section === 'dashboard') {
-    void Promise.all([
-      loadDiagnostics({ silent: true }),
-      auditLoaded.value ? Promise.resolve() : loadAudit({ silent: true }),
-    ]);
+    void loadDashboard({ silent: true });
   }
 }
 
@@ -184,10 +172,7 @@ function onHashChange() {
     activeSection.value = section;
     mobileNavOpen.value = false;
     if (section === 'dashboard') {
-      void Promise.all([
-        loadDiagnostics({ silent: true }),
-        auditLoaded.value ? Promise.resolve() : loadAudit({ silent: true }),
-      ]);
+      void loadDashboard({ silent: true });
     }
   }
 }
@@ -241,6 +226,8 @@ function stopJobPoll() {
 
 async function pollJobs() {
   try {
+    const hadActiveJob = activeJobs.value.length > 0;
+    let refreshedAfterJob = false;
     await loadJobs();
     if (watchedScanId.value) {
       const watched = (jobs.value.items || []).find((job) => job.id === watchedScanId.value);
@@ -252,7 +239,11 @@ async function pollJobs() {
           watched.status === 'succeeded' ? 'success' : 'error',
         );
         await loadDashboard({ silent: true });
+        refreshedAfterJob = true;
       }
+    }
+    if (hadActiveJob && !activeJobs.value.length && !refreshedAfterJob) {
+      await loadDashboard({ silent: true });
     }
     if (activeJobs.value.length) {
       scheduleJobPoll();
@@ -466,14 +457,14 @@ onUnmounted(() => {
         <template v-else>
           <DashboardHome
             v-if="activeSection === 'dashboard'"
-            :status="status"
             :storage="storage"
             :diagnostics="diagnostics"
             :jobs="jobs"
-            :audit-log="auditLog"
-            :refreshing="refreshing"
+            :users="users"
+            :refreshed-at="refreshedAt"
             @refresh="refreshAll"
             @go="selectSection"
+            @retry-scan="retryFailedScan('')"
           />
 
           <MediaLibraryView

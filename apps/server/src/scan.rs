@@ -1071,7 +1071,7 @@ pub(crate) async fn index_media_with_time(
 ) -> anyhow::Result<()> {
     let media_format = crate::media_format::from_path(&entry.path);
     let mime_type = crate::media_format::mime_for_path(&entry.path);
-    let effective_mime_type = mime_type_override
+    let mut effective_mime_type = mime_type_override
         .map(|value| value.map(str::to_owned))
         .unwrap_or_else(|| mime_type.clone());
     let metadata_override_requested =
@@ -1166,9 +1166,9 @@ pub(crate) async fn index_media_with_time(
             entry.path
         ));
     }
-    let extracted = if is_video {
+    let (extracted, detected_mime) = if is_video {
         match extract_video_metadata(storage, &entry.path).await {
-            Ok(metadata) => metadata,
+            Ok(metadata) => (metadata, None),
             Err(error) => {
                 return Err(record_terminal_failure(
                     pool,
@@ -1203,10 +1203,15 @@ pub(crate) async fn index_media_with_time(
                     error = ?error,
                     "media metadata extraction failed"
                 );
-                ExtractedMetadata::default()
+                (ExtractedMetadata::default(), None)
             }
         }
     };
+    if mime_type_override.is_none() {
+        if let Some(mime) = detected_mime {
+            effective_mime_type = Some(mime.to_owned());
+        }
+    }
     // 实况识别：探测单文件动态照片（XMP 声明 + 视频字节确认）与 iOS 内容标识。
     // 只在新行、内容变化、探测版本落后或调用方带声明时执行，避免每次重扫都读文件。
     let live_probe = if needs_live_probe || !declared.is_empty() {
@@ -1704,32 +1709,37 @@ async fn emit_reconcile_change(pool: &SqlitePool, media_id: &str) -> anyhow::Res
 async fn extract_image_metadata(
     storage: &LocalFilesystemStorageDriver,
     path: &str,
-) -> anyhow::Result<ExtractedMetadata> {
+) -> anyhow::Result<(ExtractedMetadata, Option<&'static str>)> {
     let bytes = storage.read_all(path, None).await?;
-    if crate::media_format::from_path(path)
-        .is_some_and(|format| format.decoder == crate::media_format::Decoder::Heif)
-    {
+    let detected_mime = crate::media_format::image_from_content(&bytes).map(|format| format.mime);
+    if crate::heif::is_heif(&bytes) {
         // HEIC/HEIF：尺寸从 ISOBMFF 容器解析（不依赖解码器），
         // EXIF（含拍摄时间）走 kamadak-exif 的 HEIF 支持。
         let (width, height) = crate::heif::dimensions(&bytes)
             .ok_or_else(|| anyhow::anyhow!("HEIF 容器未找到图像尺寸（ispe）"))?;
-        return Ok(ExtractedMetadata {
+        return Ok((
+            ExtractedMetadata {
+                duration_ms: None,
+                width: Some(i64::from(width)),
+                height: Some(i64::from(height)),
+                taken_at: extract_exif_taken_at(&bytes),
+                video_codec: None,
+            },
+            detected_mime,
+        ));
+    }
+    let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
+    let (width, height) = reader.into_dimensions()?;
+    Ok((
+        ExtractedMetadata {
             duration_ms: None,
             width: Some(i64::from(width)),
             height: Some(i64::from(height)),
             taken_at: extract_exif_taken_at(&bytes),
             video_codec: None,
-        });
-    }
-    let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
-    let (width, height) = reader.into_dimensions()?;
-    Ok(ExtractedMetadata {
-        duration_ms: None,
-        width: Some(i64::from(width)),
-        height: Some(i64::from(height)),
-        taken_at: extract_exif_taken_at(&bytes),
-        video_codec: None,
-    })
+        },
+        detected_mime,
+    ))
 }
 
 async fn extract_video_metadata(
@@ -2059,6 +2069,68 @@ mod tests {
         bytes.into_inner()
     }
 
+    /// 设置 YOUYOU_DECODE_SAMPLES 为用户提供的样本目录时，跑真实文件回归。
+    #[tokio::test]
+    async fn indexes_mislabeled_real_image_samples() -> anyhow::Result<()> {
+        let Some(samples) = std::env::var_os("YOUYOU_DECODE_SAMPLES") else {
+            return Ok(());
+        };
+        let samples = std::path::PathBuf::from(samples);
+        let root = tempfile::tempdir()?;
+        let media_root = root.path().join("media");
+        std::fs::create_dir_all(&media_root)?;
+        let mut pending = vec![samples.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("jpg" | "jpeg" | "png" | "heic")
+                ) {
+                    let target = media_root.join(path.strip_prefix(&samples)?);
+                    std::fs::create_dir_all(target.parent().unwrap())?;
+                    std::fs::copy(path, target)?;
+                }
+            }
+        }
+        let state = crate::initialize(&root.path().join("data"), &media_root).await?;
+        let summary = scan_directory(&state.db, state.storage.clone(), "sample-scan").await?;
+        assert_eq!(summary.discovered, 18);
+        assert_eq!(summary.indexed, 18, "{:?}", summary.failures);
+        let rows = sqlx::query_as::<_, (String, String, String, i64, i64)>(
+            "SELECT l.normalized_path, a.id, a.mime_type, a.width, a.height FROM media_locations l JOIN media_assets a ON a.id = l.media_asset_id",
+        )
+        .fetch_all(&state.db)
+        .await?;
+        assert_eq!(rows.len(), 18);
+        let storage = state.storage.snapshot().await;
+        for (path, id, mime, width, height) in rows {
+            assert!(width > 0 && height > 0, "{path}: {width}x{height}");
+            let expected = if path.ends_with("IMG_2256.HEIC") {
+                "image/jpeg"
+            } else if path.ends_with("mmexport1563862671011.jpg") {
+                "image/tiff"
+            } else {
+                "image/heic"
+            };
+            assert_eq!(mime, expected, "{path}");
+            let thumbnail = crate::api::render_thumbnail(&storage, &id, &path, false, 64)
+                .await
+                .expect("render thumbnail");
+            assert!(
+                matches!(thumbnail, crate::api::ThumbnailRender::Rendered(_)),
+                "{path}"
+            );
+        }
+        Ok(())
+    }
+
     async fn write_test_entry(
         storage: &LocalFilesystemStorageDriver,
         path: &str,
@@ -2115,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_does_not_tombstone_present_unsupported_files() -> anyhow::Result<()> {
-        // 上传路径可写入扫描白名单之外的格式（如 HEIC）；重扫必须按「文件仍在」
+        // 上传路径可写入扫描白名单之外的格式；重扫必须按「文件仍在」
         // 对待，否则这些媒体会在扫描后凭空消失（source_missing）。
         let root = tempfile::tempdir()?;
         let media_root = root.path().join("media");
@@ -2125,14 +2197,14 @@ mod tests {
         // 上传/旧版本可写入注册表之外的格式；这里用「可用图片 + 未登记扩展名」模拟，
         // 表示文件确实存在且已入库，只是当前格式不在扫描白名单里。
         let unsupported =
-            write_test_entry(&storage, "IMG_20240102_000000.tiff", &tiny_png()).await?;
+            write_test_entry(&storage, "IMG_20240102_000000.raw", &tiny_png()).await?;
         index_media(&state.db, &storage, &unsupported).await?;
 
         let summary = scan_directory(&state.db, state.storage.clone(), "scan").await?;
         assert_eq!(summary.skipped_unsupported, 1);
         assert_eq!(summary.discovered, 0);
         let location_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM media_locations WHERE normalized_path = 'IMG_20240102_000000.tiff'",
+            "SELECT COUNT(*) FROM media_locations WHERE normalized_path = 'IMG_20240102_000000.raw'",
         )
         .fetch_one(&state.db)
         .await?;

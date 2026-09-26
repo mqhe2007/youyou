@@ -8,6 +8,7 @@ import {
   FolderPlus,
   Images,
   Move,
+  Play,
   RefreshCw,
   Square,
   Trash2,
@@ -44,6 +45,9 @@ const moveDestPath = ref('');
 const treeNodes = ref([]);
 const treeLoading = ref(false);
 const lightbox = ref(null);
+const lightboxPlaying = ref(false);
+const lightboxStillUrl = ref('');
+const lightboxVideo = ref(null);
 const uploadInput = ref(null);
 const contextMenu = ref(null);
 const moveTargets = ref([]);
@@ -216,8 +220,8 @@ function onGlobalKeydown(event) {
   }
 }
 
-function thumbnailUrl(mediaItem) {
-  return `/api/v1/admin/media-library/media/${encodeURIComponent(mediaItem.id)}/thumbnail?size=256`;
+function thumbnailUrl(mediaItem, size = 256) {
+  return `/api/v1/admin/media-library/media/${encodeURIComponent(mediaItem.id)}/thumbnail?size=${size}`;
 }
 
 const failedFolderThumbs = ref({});
@@ -332,10 +336,36 @@ function contentUrl(mediaItem) {
 function openLightbox(mediaItem) {
   closeContextMenu();
   lightbox.value = mediaItem;
+  lightboxPlaying.value = false;
+  lightboxStillUrl.value = contentUrl(mediaItem);
 }
 
 function closeLightbox() {
+  lightboxPlaying.value = false;
   lightbox.value = null;
+}
+
+function onLightboxStillError() {
+  if (lightbox.value && lightboxStillUrl.value === contentUrl(lightbox.value)) {
+    lightboxStillUrl.value = thumbnailUrl(lightbox.value, 1024);
+  }
+}
+
+async function playLivePhoto() {
+  lightboxPlaying.value = true;
+  await nextTick();
+  try {
+    await lightboxVideo.value?.play();
+  } catch {
+    lightboxPlaying.value = false;
+    emit('notify', '实况视频无法播放。', 'error');
+  }
+}
+
+function onLiveVideoError() {
+  if (!lightboxPlaying.value) return;
+  lightboxPlaying.value = false;
+  emit('notify', '实况视频无法播放。', 'error');
 }
 
 async function createFolder() {
@@ -404,15 +434,21 @@ async function downloadTarget(preferred = null) {
   busy.value = 'download';
   try {
     for (const target of targets) {
-      const blob = await props.api.requestBlob(contentUrl(target.item));
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = target.item.name || 'download';
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
+      const files = [{ url: contentUrl(target.item), name: target.item.name || 'download' }];
+      if (target.item.isLivePhoto && target.item.motionName) {
+        files.push({ url: `${contentUrl(target.item)}?motion=true`, name: target.item.motionName });
+      }
+      const blobs = await Promise.all(files.map((file) => props.api.requestBlob(file.url)));
+      files.forEach((file, index) => {
+        const url = URL.createObjectURL(blobs[index]);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = file.name;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      });
     }
   } catch (error) {
     handleError(error);
@@ -763,7 +799,8 @@ function contextStyle() {
         </span>
         <span class="media-tile-preview">
           <img :src="thumbnailUrl(item)" :alt="item.name" loading="lazy">
-          <span v-if="item.isVideo" class="media-video-badge">视频</span>
+          <span v-if="item.isLivePhoto" class="media-video-badge">实况</span>
+          <span v-else-if="item.isVideo" class="media-video-badge">视频</span>
         </span>
       </button>
     </div>
@@ -940,7 +977,16 @@ function contextStyle() {
           <X :size="20" :stroke-width="iconStrokeWidth" />
         </button>
         <video
-          v-if="lightbox.isVideo"
+          v-if="lightbox.isLivePhoto && lightboxPlaying"
+          ref="lightboxVideo"
+          class="media-lightbox-media"
+          :src="`${contentUrl(lightbox)}?motion=true`"
+          playsinline
+          @ended="lightboxPlaying = false"
+          @error="onLiveVideoError"
+        />
+        <video
+          v-else-if="lightbox.isVideo"
           class="media-lightbox-media"
           :src="contentUrl(lightbox)"
           controls
@@ -949,9 +995,20 @@ function contextStyle() {
         <img
           v-else
           class="media-lightbox-media"
-          :src="contentUrl(lightbox)"
+          :src="lightboxStillUrl"
           :alt="lightbox.name"
+          @error="onLightboxStillError"
         >
+        <button
+          v-if="lightbox.isLivePhoto && !lightboxPlaying"
+          class="media-lightbox-live"
+          type="button"
+          aria-label="播放实况照片"
+          @click="playLivePhoto"
+        >
+          <Play :size="17" :stroke-width="iconStrokeWidth" aria-hidden="true" />
+          实况
+        </button>
         <p class="media-lightbox-caption">{{ lightbox.name }}</p>
       </div>
     </Teleport>

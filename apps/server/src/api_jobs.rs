@@ -1052,12 +1052,25 @@ pub(crate) async fn list_audit_log(
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct IndexFailureSummary {
+    path: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DiagnosticsResponse {
     server_version: &'static str,
     api_version: &'static str,
     schema_version: i64,
     database_quick_check: String,
+    indexed_file_count: i64,
     media_count: i64,
+    photo_count: i64,
+    video_count: i64,
+    index_failure_count: i64,
+    index_failures: Vec<IndexFailureSummary>,
+    latest_full_scan: Option<JobResponse>,
     active_job_count: i64,
     storage: AdminStorageResponse,
     ffmpeg_version: Option<String>,
@@ -1085,11 +1098,49 @@ pub(crate) async fn admin_diagnostics(
     let database_quick_check = sqlx::query_scalar::<_, String>("PRAGMA quick_check")
         .fetch_one(&state.db)
         .await?;
-    let media_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM media_assets WHERE identity_state != 'tombstoned'",
+    let (indexed_file_count, media_count) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COUNT(DISTINCT l.media_asset_id)
+         FROM media_locations l
+         JOIN media_assets a ON a.id = l.media_asset_id
+         WHERE l.storage_id = 'local' AND l.hash_state = 'verified'
+           AND a.identity_state = 'verified'",
     )
     .fetch_one(&state.db)
     .await?;
+    let (photo_count, video_count) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COALESCE(SUM(CASE WHEN a.is_video = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN a.is_video = 1 THEN 1 ELSE 0 END), 0)
+         FROM media_locations l
+         JOIN media_assets a ON a.id = l.media_asset_id
+         WHERE l.storage_id = 'local' AND l.hash_state = 'verified'
+           AND a.identity_state = 'verified' AND a.live_role != 'motion'",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let index_failure_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM media_index_failures WHERE storage_id = 'local'",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    // ponytail: 100 条足够在仪表盘检查日常失败；大量失败时改成分页接口。
+    let index_failures = sqlx::query_as::<_, (String, String)>(
+        "SELECT normalized_path, reason
+         FROM media_index_failures WHERE storage_id = 'local'
+         ORDER BY last_failed_at DESC LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .map(|(path, reason)| IndexFailureSummary { path, reason })
+    .collect();
+    let latest_full_scan = sqlx::query_as::<_, JobRow>(
+        "SELECT * FROM jobs WHERE kind = 'scan'
+           AND COALESCE(json_extract(checkpoint, '$.scopePath'), '') = ''
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await?
+    .map(job_response);
     let active_job_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running', 'interrupted')",
     )
@@ -1103,7 +1154,13 @@ pub(crate) async fn admin_diagnostics(
         api_version: "v1",
         schema_version,
         database_quick_check,
+        indexed_file_count,
         media_count,
+        photo_count,
+        video_count,
+        index_failure_count,
+        index_failures,
+        latest_full_scan,
         active_job_count,
         storage,
         ffmpeg_version,
