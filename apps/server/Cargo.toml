@@ -1,6 +1,6 @@
 [package]
 name = "youyou-server"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted server for the youyou photo library"
