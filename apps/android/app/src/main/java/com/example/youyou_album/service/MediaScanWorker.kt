@@ -21,6 +21,7 @@ class MediaScanWorker @AssistedInject constructor(
 
     companion object {
         const val TASK_ID_KEY = "task_id"
+        const val UNIQUE_WORK_NAME = "media_library_scan"
         private const val TAG = "MediaScanWorker"
     }
 

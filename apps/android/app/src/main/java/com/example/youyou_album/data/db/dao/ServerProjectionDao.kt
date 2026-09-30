@@ -20,6 +20,9 @@ interface ServerProjectionDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(projection: ServerMediaProjectionEntity)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(projections: List<ServerMediaProjectionEntity>)
+
     @Query("DELETE FROM server_media_projection WHERE server_namespace = :namespace AND server_media_id = :mediaId")
     suspend fun deleteByMediaId(namespace: String, mediaId: String)
 

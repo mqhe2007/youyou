@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import com.example.youyou_album.domain.model.AppTask
@@ -131,7 +132,7 @@ class HomeViewModel @Inject constructor(
             val connection = serverConnectionStore.getConnection() ?: return@launch
             _reachability.value = ServerReachability.CHECKING
             try {
-                serverSyncService.sync(connection.baseUrl)
+                serverSyncService.requestSync(connection.baseUrl).await()
                 _reachability.value = ServerReachability.ONLINE
             } catch (e: CancellationException) {
                 throw e
@@ -223,7 +224,14 @@ class HomeViewModel @Inject constructor(
             .addTag("media_scan")
             .build()
 
-        WorkManager.getInstance(getApplication()).enqueue(scanRequest)
+        // 同名任务已在排队或执行时不再另开一条，避免一次刷新叠出多条「扫描媒体库」。
+        val workManager = WorkManager.getInstance(getApplication())
+        workManager.cancelUniqueWork("download_media_scan")
+        workManager.enqueueUniqueWork(
+            MediaScanWorker.UNIQUE_WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            scanRequest,
+        )
 
         _uiState.value = _uiState.value.copy(isScanning = true)
         if (notify) {

@@ -12,6 +12,7 @@ import com.example.youyou_album.service.ApiServiceFactory
 import com.example.youyou_album.service.RemoteAccountCacheCleaner
 import com.example.youyou_album.service.SecureStorageService
 import com.example.youyou_album.service.ServerConnectionStore
+import com.example.youyou_album.service.ServerSyncActivity
 import com.example.youyou_album.service.ServerSyncService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
@@ -57,6 +58,7 @@ data class ServerConnectionUiState(
     val connectingBaseUrl: String? = null,
     val connectionStage: ConnectionStage = ConnectionStage.IDLE,
     val feedback: SnackbarFeedback? = null,
+    val syncActivity: ServerSyncActivity = ServerSyncActivity(),
 )
 
 /**
@@ -98,7 +100,9 @@ class ServerConnectionViewModel @Inject constructor(
      * 因此换绑、断开后会自动跟着变。
      */
     val serverStats: StateFlow<ServerStats> = serverSyncStateDao.observe()
-        .map { state -> state?.serverNamespace?.takeIf { it.isNotBlank() } to state?.updatedAt }
+        .map { state ->
+            state?.serverNamespace?.takeIf { it.isNotBlank() } to state?.updatedAt?.takeIf { it > 0 }
+        }
         .distinctUntilChanged()
         .flatMapLatest { (namespace, updatedAt) ->
             if (namespace == null) {
@@ -112,6 +116,11 @@ class ServerConnectionViewModel @Inject constructor(
 
     init {
         observeConnection()
+        viewModelScope.launch {
+            serverSyncService.activity.collect { activity ->
+                _uiState.update { it.copy(syncActivity = activity) }
+            }
+        }
     }
 
     /** 连接信息变化即复核可达性：连接、断开、换绑都在同一条链上收口。 */
@@ -184,6 +193,8 @@ class ServerConnectionViewModel @Inject constructor(
                 if (serverInfo.storage?.writable != true) {
                     throw IllegalStateException("服务端媒体目录不可写，请联系管理员检查存储目录和权限。")
                 }
+                // 停掉上一轮清单，避免换绑时旧同步把刚清掉的投影写回来。
+                serverSyncService.cancelOngoingSync()
                 // 配对成功后才切换身份；切换前清空旧身份的远程投影与缓存。
                 val connection = ServerConnection(
                     baseUrl = normalizedUrl,
@@ -199,6 +210,7 @@ class ServerConnectionViewModel @Inject constructor(
                     tokenProvider.setToken(credentials.token)
                     serverConnectionStore.saveConnection(connection)
                 }
+                serverSyncService.resumeSync()
                 _uiState.update {
                     it.copy(
                         connection = connection,
@@ -207,7 +219,8 @@ class ServerConnectionViewModel @Inject constructor(
                         reachability = ServerReachability.ONLINE,
                     )
                 }
-                serverSyncService.sync(normalizedUrl)
+                // 同步在应用级协程里跑。离开这个页面只会结束等待，不会把清单掐断。
+                serverSyncService.requestSync(normalizedUrl).await()
                 _uiState.update {
                     it.copy(
                         connection = connection,
@@ -217,6 +230,8 @@ class ServerConnectionViewModel @Inject constructor(
                         feedback = feedback("已连接服务端"),
                     )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: retrofit2.HttpException) {
                 finishConnectWithError(
                     when (e.code()) {
@@ -236,6 +251,8 @@ class ServerConnectionViewModel @Inject constructor(
                         else -> "连接失败：${e.message ?: "未知错误"}"
                     }
                 )
+            } finally {
+                serverSyncService.resumeSync()
             }
         }
     }
@@ -274,29 +291,34 @@ class ServerConnectionViewModel @Inject constructor(
 
     fun disconnect() {
         viewModelScope.launch {
-            // 先通知服务端撤销设备（失败不影响本地断开）
-            val currentBaseUrl = _uiState.value.connection?.baseUrl
-            if (!currentBaseUrl.isNullOrBlank()) {
-                try {
-                    apiServiceFactory.create(currentBaseUrl).revokeSelfDevice()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    // 服务端不可达或已撤销，忽略错误，继续清除本地数据
+            serverSyncService.cancelOngoingSync()
+            try {
+                // 先通知服务端撤销设备（失败不影响本地断开）
+                val currentBaseUrl = _uiState.value.connection?.baseUrl
+                if (!currentBaseUrl.isNullOrBlank()) {
+                    try {
+                        apiServiceFactory.create(currentBaseUrl).revokeSelfDevice()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // 服务端不可达或已撤销，忽略错误，继续清除本地数据
+                    }
                 }
-            }
-            serverConnectionStore.clearConnection()
-            secureStorageService.clearDeviceToken()
-            secureStorageService.clearDeviceId()
-            tokenProvider.setToken(null)
-            remoteAccountCacheCleaner.clear()
-            _uiState.update {
-                it.copy(
-                    connection = null,
-                    reachability = ServerReachability.UNBOUND,
-                    liveServerVersion = null,
-                    feedback = feedback("已断开连接"),
-                )
+                serverConnectionStore.clearConnection()
+                secureStorageService.clearDeviceToken()
+                secureStorageService.clearDeviceId()
+                tokenProvider.setToken(null)
+                remoteAccountCacheCleaner.clear()
+                _uiState.update {
+                    it.copy(
+                        connection = null,
+                        reachability = ServerReachability.UNBOUND,
+                        liveServerVersion = null,
+                        feedback = feedback("已断开连接"),
+                    )
+                }
+            } finally {
+                serverSyncService.resumeSync()
             }
         }
     }

@@ -185,8 +185,10 @@ class MediaDownloadService @Inject constructor(
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             context.contentResolver.update(uri, values, null, null)
-            WorkManager.getInstance(context).enqueueUniqueWork(
-                "download_media_scan",
+            val workManager = WorkManager.getInstance(context)
+            workManager.cancelUniqueWork("download_media_scan")
+            workManager.enqueueUniqueWork(
+                MediaScanWorker.UNIQUE_WORK_NAME,
                 ExistingWorkPolicy.APPEND_OR_REPLACE,
                 OneTimeWorkRequestBuilder<MediaScanWorker>().build(),
             )

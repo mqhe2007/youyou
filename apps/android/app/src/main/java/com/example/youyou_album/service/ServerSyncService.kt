@@ -19,7 +19,16 @@ import com.example.youyou_album.domain.model.LivePhoto
 import com.example.youyou_album.domain.model.Tag
 import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TagRepository
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.KSerializer
@@ -37,6 +46,22 @@ data class ServerSyncReport(
     val removedCount: Int,
 )
 
+enum class ServerSyncPhase {
+    IDLE,
+    /** 服务端还在物化快照，客户端还没有可写入的行。 */
+    PREPARING,
+    /** 正在把清单写入本机，远程媒体数量会跟着增加。 */
+    APPLYING,
+}
+
+data class ServerSyncActivity(
+    val phase: ServerSyncPhase = ServerSyncPhase.IDLE,
+    val appliedMedia: Int = 0,
+    val lastError: String? = null,
+) {
+    val running: Boolean get() = phase != ServerSyncPhase.IDLE
+}
+
 @Singleton
 class ServerSyncService @Inject constructor(
     private val database: AppDatabase,
@@ -53,8 +78,9 @@ class ServerSyncService @Inject constructor(
 ) {
     companion object {
         const val PROJECTION_STORAGE_ID = "server"
-        private const val MAX_BOOTSTRAP_POLLS = 120
-        private const val POLL_INTERVAL_MS = 250L
+        /** 大库物化快照可能远超过半分钟；准备中就失败会让下一次又从头拉。 */
+        private const val MAX_BOOTSTRAP_WAIT_MS = 30L * 60L * 1000L
+        private const val POLL_INTERVAL_MS = 1_000L
         private const val TAG = "ServerSync"
 
         /** 对账单批删除量：规避 SQLite 的 SQL 变量数上限。 */
@@ -63,8 +89,51 @@ class ServerSyncService @Inject constructor(
 
     // ponytail: one active account needs one lock; use per-account locks only if concurrent accounts arrive.
     private val syncMutex = Mutex()
+    private val launchLock = Any()
+    private val syncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var inflight: Deferred<ServerSyncReport?>? = null
+
+    /** 断开/换绑期间拒绝新的同步，避免清库和写入交错。 */
+    @Volatile private var acceptingSync = true
+
+    private val _activity = MutableStateFlow(ServerSyncActivity())
+    val activity: StateFlow<ServerSyncActivity> = _activity.asStateFlow()
+
     private lateinit var serverNamespace: String
     private var apiService: YouyouApiService? = null
+
+    /**
+     * 页面退出不会取消这里的同步。连接页返回后清单仍继续写，远程媒体数量会在写入过程中增加。
+     * 同一时刻只跑一轮；后来的刷新等候这一轮，而不是再开一份全量清单。
+     */
+    fun requestSync(baseUrl: String): Deferred<ServerSyncReport?> {
+        synchronized(launchLock) {
+            if (!acceptingSync) {
+                return syncScope.async { null }
+            }
+            inflight?.takeIf { it.isActive }?.let { return it }
+            val job = syncScope.async { sync(baseUrl) }
+            inflight = job
+            job.invokeOnCompletion {
+                synchronized(launchLock) { if (inflight === job) inflight = null }
+            }
+            return job
+        }
+    }
+
+    /** 停掉在途同步并暂时不再接受新任务。调用方清完身份后必须 [resumeSync]。 */
+    suspend fun cancelOngoingSync() {
+        val job = synchronized(launchLock) {
+            acceptingSync = false
+            inflight.also { inflight = null }
+        }
+        job?.cancel()
+        job?.join()
+    }
+
+    fun resumeSync() {
+        acceptingSync = true
+    }
 
     fun setApiService(service: YouyouApiService) {
         this.apiService = service
@@ -128,17 +197,27 @@ class ServerSyncService @Inject constructor(
     suspend fun prepareAccountSwitch(change: suspend () -> Unit) = syncMutex.withLock { change() }
 
     suspend fun sync(baseUrl: String): ServerSyncReport? = syncMutex.withLock {
+        try {
             val service = apiService?.takeIf {
                 ::serverNamespace.isInitialized && serverNamespace == computeServerNamespace(baseUrl)
             } ?: apiServiceFactory.create(baseUrl)
             apiService = service
             serverNamespace = computeServerNamespace(baseUrl)
+            _activity.value = ServerSyncActivity(phase = ServerSyncPhase.APPLYING)
             val previousState = serverSyncStateDao.get()
-            val report = if (previousState != null && previousState.serverNamespace == serverNamespace) {
+            val report = if (hasIncrementalCursor(
+                    previousState?.serverNamespace,
+                    previousState?.changesCursor,
+                    serverNamespace,
+                )
+            ) {
                 try {
-                    applyChanges(previousState, service)
+                    applyChanges(previousState!!, service)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    // Fall through to bootstrap on any error
+                    // 增量失败就整份重拉。取消必须往外抛，不能在断开时再开一轮清单。
+                    Log.d(TAG, "incremental sync failed, bootstrapping: ${e.message}")
                     bootstrap(service)
                 }
             } else {
@@ -150,7 +229,15 @@ class ServerSyncService @Inject constructor(
             // 同步失败时不动旧数据。
             purgeOtherNamespaces()
             remoteDeletionIdentity.reconcile()
+            _activity.value = ServerSyncActivity()
             report
+        } catch (e: CancellationException) {
+            _activity.value = ServerSyncActivity()
+            throw e
+        } catch (e: Exception) {
+            _activity.value = ServerSyncActivity(lastError = e.message ?: "同步失败")
+            throw e
+        }
     }
 
     /**
@@ -191,26 +278,53 @@ class ServerSyncService @Inject constructor(
 
     private suspend fun bootstrap(service: YouyouApiService): ServerSyncReport {
         val start = service.startBootstrap()
+        val deadline = System.currentTimeMillis() + MAX_BOOTSTRAP_WAIT_MS
         var status = service.getBootstrap(start.snapshotId)
-        var attempt = 0
-        while (status.state == "preparing" && attempt < MAX_BOOTSTRAP_POLLS) {
+        while (status.state == "preparing" && System.currentTimeMillis() < deadline) {
+            _activity.value = ServerSyncActivity(phase = ServerSyncPhase.PREPARING)
             delay(POLL_INTERVAL_MS)
             status = service.getBootstrap(start.snapshotId)
-            attempt++
         }
         if (status.state != "ready") {
-            throw IllegalStateException("服务端快照未就绪：${status.state}")
+            val reason = status.lastError?.takeIf { it.isNotBlank() }?.let { "（$it）" }.orEmpty()
+            throw IllegalStateException(
+                if (status.state == "preparing") "服务端清单仍在准备，请稍后在时间线再刷新一次"
+                else "服务端快照未就绪：${status.state}$reason",
+            )
         }
         val revision = status.snapshotRevision ?: throw IllegalStateException("服务端快照缺少 revision")
 
-        // 1. Sync media
+        // 先挂上身份，连接页才能在写入过程中看到远程媒体数量，而不是等整份清单提交后突然跳变。
+        // 游标留空：中途退出的下一轮仍走全量，不会把写了一半的清单当成已经同步完。
+        beginBootstrapIdentity()
+
+        // 1. Sync media（按页落库，避免三万条各开一次事务）
         val loadedMediaIds = mutableSetOf<String>()
         var mediaCount = 0
-        syncBootstrapEntity(service, start.snapshotId, "media", ServerMediaDto.serializer()) { media ->
-            if (media.id.isEmpty()) return@syncBootstrapEntity
-            loadedMediaIds.add(media.id)
-            upsertMedia(media, revision)
-            mediaCount++
+        var cursor: String? = null
+        while (true) {
+            val page = service.listBootstrapEntity(start.snapshotId, "media", cursor = cursor, limit = 100)
+            val medias = mutableListOf<ServerMediaDto>()
+            for (raw in page.items) {
+                val envelope = json.decodeFromJsonElement(
+                    SnapshotEnvelopeDto.serializer(ServerMediaDto.serializer()),
+                    raw,
+                )
+                val media = envelope.data
+                    ?: throw IllegalStateException("bootstrap media 条目缺少 data 字段: $raw")
+                if (media.id.isEmpty()) continue
+                loadedMediaIds.add(media.id)
+                medias.add(media)
+            }
+            upsertMediaBatch(medias, revision)
+            mediaCount += medias.size
+            _activity.value = ServerSyncActivity(
+                phase = ServerSyncPhase.APPLYING,
+                appliedMedia = mediaCount,
+            )
+            if (!page.hasMore || page.nextCursor.isNullOrEmpty()) break
+            if (page.nextCursor == cursor) throw IllegalStateException("清单分页没有前进")
+            cursor = page.nextCursor
         }
         Log.d(TAG, "bootstrap media done count=$mediaCount")
 
@@ -344,22 +458,80 @@ class ServerSyncService @Inject constructor(
         )
     }
 
+    /**
+     * 全量清单开始写入前先记下当前身份，但先不提交游标。
+     * 这样连接页的远程媒体计数能跟着每一页增长；中断后再进来仍会整份重拉。
+     */
+    private suspend fun beginBootstrapIdentity() {
+        val existing = serverSyncStateDao.get()
+        val keepClock = existing?.serverNamespace == serverNamespace && existing.updatedAt > 0
+        serverSyncStateDao.upsert(
+            ServerSyncStateEntity(
+                id = 1,
+                serverNamespace = serverNamespace,
+                changesCursor = "",
+                snapshotRevision = 0,
+                updatedAt = if (keepClock) existing.updatedAt else 0L,
+            ),
+        )
+    }
+
     private suspend fun upsertMedia(media: ServerMediaDto, revision: Int) {
-        if (media.id.isEmpty()) return
-        Log.d(TAG, "upsertMedia id=${media.id} name=${media.name} mime=${media.mimeType}")
-        val existing = photoRepository.getByServerMediaId(serverNamespace, media.id)
-        // 删除前启动的旧快照/变更响应不得覆盖已删除状态；更高版本（恢复/重建）则放行。
-        if (existing == null &&
-            mediaTaskCoordinator.shouldDiscardRemoteUpsert(serverNamespace, media.id, media.version)
-        ) {
-            Log.d(TAG, "discard stale upsert for deleted media ${media.id}")
-            return
+        upsertMediaBatch(listOf(media), revision)
+    }
+
+    private suspend fun upsertMediaBatch(items: List<ServerMediaDto>, revision: Int) {
+        if (items.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val photos = mutableListOf<Photo>()
+        val projections = mutableListOf<ServerMediaProjectionEntity>()
+        for (media in items) {
+            if (media.id.isEmpty()) continue
+            val existing = photoRepository.getByServerMediaId(serverNamespace, media.id)
+            // 删除前启动的旧快照/变更响应不得覆盖已删除状态；更高版本（恢复/重建）则放行。
+            if (existing == null &&
+                mediaTaskCoordinator.shouldDiscardRemoteUpsert(serverNamespace, media.id, media.version)
+            ) {
+                Log.d(TAG, "discard stale upsert for deleted media ${media.id}")
+                continue
+            }
+            val photo = projectedPhoto(media, existing)
+            photos.add(photo)
+            projections.add(
+                ServerMediaProjectionEntity(
+                    serverNamespace = serverNamespace,
+                    serverMediaId = media.id,
+                    localPhotoId = photo.id,
+                    serverVersion = media.version,
+                    lastAppliedRevision = revision,
+                    serverStorageId = media.storageId,
+                    updatedAt = now,
+                ),
+            )
         }
+        if (photos.isEmpty()) return
+        // 图片与远程映射一起提交，防止观察者先收到缺少预览地址的图片。
+        database.withTransaction {
+            photoRepository.upsertAll(photos)
+            serverProjectionDao.upsertAll(projections)
+            photos.mapNotNull { it.contentHash }.distinct().forEach { hash ->
+                photoDao.reconcileTimeForNamespace(hash, serverNamespace)
+            }
+        }
+    }
+
+    private fun projectedPhoto(media: ServerMediaDto, existing: Photo?): Photo {
         val time = if (media.timeVersion >= 1) {
             com.example.youyou_album.domain.model.MediaTime.Value(media.sortAt, media.sortSource ?: "unknown")
-        } else com.example.youyou_album.domain.model.MediaTime.resolve(media.originalName ?: media.name, null, null, media.sortAt)
-        val sortAt = time.at
-        val photo = Photo(
+        } else {
+            com.example.youyou_album.domain.model.MediaTime.resolve(
+                media.originalName ?: media.name,
+                null,
+                null,
+                media.sortAt,
+            )
+        }
+        return Photo(
             id = existing?.id ?: UUID.randomUUID().toString(),
             name = media.name,
             path = media.path,
@@ -369,7 +541,7 @@ class ServerSyncService @Inject constructor(
             duration = media.durationMs,
             createdAt = media.takenAt,
             modifiedAt = null,
-            sortAt = sortAt,
+            sortAt = time.at,
             takenAt = media.takenAt.takeIf { media.timeVersion >= 1 },
             sortSource = time.source,
             timeVersion = media.timeVersion,
@@ -391,22 +563,6 @@ class ServerSyncService @Inject constructor(
                 )
             },
         )
-        // 图片与远程映射一起提交，防止观察者先收到缺少预览地址的图片。
-        database.withTransaction {
-            photoRepository.upsert(photo)
-            serverProjectionDao.upsert(
-                ServerMediaProjectionEntity(
-                    serverNamespace = serverNamespace,
-                    serverMediaId = media.id,
-                    localPhotoId = photo.id,
-                    serverVersion = media.version,
-                    lastAppliedRevision = revision,
-                    serverStorageId = media.storageId,
-                    updatedAt = System.currentTimeMillis(),
-                )
-            )
-            database.photoDao().reconcileTimeForNamespace(photo.contentHash,serverNamespace)
-        }
     }
 
     private suspend fun upsertTag(tag: ServerTagDto, localId: String) {

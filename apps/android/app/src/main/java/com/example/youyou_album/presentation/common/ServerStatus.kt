@@ -29,3 +29,13 @@ internal fun formatLastSyncedAt(timestamp: Long?, now: Long = System.currentTime
     timestamp == null -> "尚未完成同步"
     else -> formatSyncedAgo(timestamp, now) + "同步"
 }
+
+/**
+ * 连接管理「远程媒体」指标。
+ * 清单还在准备或写入、且本机还没落下一行时，不显示 0——0 会被看成库是空的，或连接没通。
+ */
+internal fun remoteMediaCountText(settled: Boolean, syncing: Boolean, count: Int): String = when {
+    !settled -> "—"
+    syncing && count == 0 -> "同步中"
+    else -> count.toString()
+}

@@ -62,6 +62,9 @@ import com.example.youyou_album.R
 import com.example.youyou_album.domain.model.ServerConnection
 import com.example.youyou_album.presentation.common.ServerReachability
 import com.example.youyou_album.presentation.common.formatSyncedAgo
+import com.example.youyou_album.presentation.common.remoteMediaCountText
+import com.example.youyou_album.service.ServerSyncActivity
+import com.example.youyou_album.service.ServerSyncPhase
 import com.example.youyou_album.presentation.widgets.AppOutlinedButton
 import com.example.youyou_album.presentation.widgets.AppSnackbarHost
 import com.example.youyou_album.presentation.widgets.AppTextButton
@@ -205,6 +208,7 @@ fun ServerConnectionPage(
                     reachability = uiState.reachability,
                     serverVersion = uiState.liveServerVersion ?: connection.serverVersion,
                     stats = stats,
+                    syncActivity = uiState.syncActivity,
                     manualExpanded = manualExpanded,
                     onScan = { navController.navigate("qr_scanner") },
                     onToggleManual = { manualExpanded = !manualExpanded },
@@ -353,6 +357,14 @@ private fun ConnectingContent(state: ServerConnectionUiState) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        if (state.syncActivity.running || state.syncActivity.lastError != null) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = syncProgressText(state.syncActivity),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Spacer(modifier = Modifier.height(20.dp))
         Text(
             text = CONNECTION_STAGE_NAMES.joinToString(" → "),
@@ -360,6 +372,12 @@ private fun ConnectingContent(state: ServerConnectionUiState) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+private fun syncProgressText(activity: ServerSyncActivity): String = when (activity.phase) {
+    ServerSyncPhase.PREPARING -> "正在向服务端要清单。照片多时这一步会持续几分钟，远程媒体要等开始写入后才会出现。"
+    ServerSyncPhase.APPLYING -> "正在写入清单，已处理 ${activity.appliedMedia} 项。"
+    ServerSyncPhase.IDLE -> activity.lastError ?: "正在同步清单"
 }
 
 /** 四段进度：已完成段用品牌色实底，未到段用分隔线色。段名由图例一行给出。 */
@@ -395,6 +413,7 @@ private fun ConnectedContent(
     reachability: ServerReachability,
     serverVersion: String?,
     stats: ServerStats,
+    syncActivity: ServerSyncActivity,
     manualExpanded: Boolean,
     onScan: () -> Unit,
     onToggleManual: () -> Unit,
@@ -423,6 +442,7 @@ private fun ConnectedContent(
             serverVersion = serverVersion,
             deviceName = connection.deviceName,
             stats = stats,
+            syncActivity = syncActivity,
             onRecheck = onRecheck,
         )
 
@@ -504,14 +524,26 @@ private fun ConnectionStatusSection(
     serverVersion: String?,
     deviceName: String?,
     stats: ServerStats,
+    syncActivity: ServerSyncActivity,
     onRecheck: () -> Unit,
 ) {
+    val syncing = syncActivity.running
     val status = when (reachability) {
-        ServerReachability.ONLINE -> StatusSpec(
-            color = MaterialTheme.colorScheme.tertiary,
-            text = "已连接 · 可达",
-            icon = R.drawable.lucide_ic_cloud_check,
-        )
+        ServerReachability.ONLINE -> if (syncing) {
+            StatusSpec(
+                color = MaterialTheme.colorScheme.tertiary,
+                text = "已连接 · 正在同步清单",
+                hint = syncProgressText(syncActivity),
+                icon = R.drawable.lucide_ic_cloud,
+            )
+        } else {
+            StatusSpec(
+                color = MaterialTheme.colorScheme.tertiary,
+                text = "已连接 · 可达",
+                hint = syncActivity.lastError,
+                icon = R.drawable.lucide_ic_cloud_check,
+            )
+        }
 
         ServerReachability.OFFLINE -> StatusSpec(
             color = MaterialTheme.colorScheme.error,
@@ -582,7 +614,7 @@ private fun ConnectionStatusSection(
         Row(modifier = Modifier.fillMaxWidth()) {
             StatusMetric(
                 label = "远程媒体",
-                value = if (checked) stats.remoteMediaCount.toString() else "—",
+                value = remoteMediaCountText(checked, syncing, stats.remoteMediaCount),
                 modifier = Modifier.weight(1f),
             )
             StatusMetric(

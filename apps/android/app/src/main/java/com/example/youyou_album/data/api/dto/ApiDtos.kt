@@ -180,6 +180,7 @@ data class BootstrapStatusDto(
     val snapshotRevision: Int? = null,
     val expiresAt: Long = 0,
     val changesCursor: String? = null,
+    val lastError: String? = null,
 )
 
 @Serializable
