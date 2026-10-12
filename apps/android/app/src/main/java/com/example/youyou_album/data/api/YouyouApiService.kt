@@ -105,7 +105,7 @@ interface YouyouApiService {
         @Path("id") id: String,
         @Header("Range") range: String? = null,
         @Header("Authorization") authorization: String? = null,
-    ): ResponseBody
+    ): Response<ResponseBody>
 
     @Streaming
     @GET("media/{id}/thumbnail")

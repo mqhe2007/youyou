@@ -43,7 +43,7 @@ class MediaDeletionService @Inject constructor(
     private val mediaOperationDao: MediaOperationDao,
     private val connectionStore: ServerConnectionStore,
     private val apiServiceFactory: ApiServiceFactory,
-    private val contentHashService: ContentHashService,
+    private val serverSyncService: ServerSyncService,
     private val thumbnailCacheService: ThumbnailCacheService,
     private val mediaTaskCoordinator: MediaTaskCoordinator,
     private val remoteDeletionIdentity: RemoteDeletionIdentity,
@@ -69,8 +69,8 @@ class MediaDeletionService @Inject constructor(
 
     /** Read current local index and current-namespace projection before showing a destructive choice. */
     suspend fun preview(photoIds: List<String>): List<DeletePreviewItem> {
-        val connection = connectionStore.getConnection()
-        val namespace = connection?.let { "server_" + contentHashService.sha256HexForString(it.baseUrl).substring(0, 16) }
+        // 命名空间必须与同步引擎同源（地址 + 服务端实例 + 用户），否则投影查不到。
+        val namespace = serverSyncService.activeServerNamespace()
         return photoDao.getByIds(photoIds.distinct()).map { photo ->
             val remote = namespace?.let { ns ->
                 serverProjectionDao.getByLocalPhotoIdInNamespace(photo.id, ns)?.serverMediaId
@@ -156,7 +156,8 @@ class MediaDeletionService @Inject constructor(
         }
         val entities = photoDao.getByIds((photoIds + extraLocalIds).distinct())
         val connection = connectionStore.getConnection()
-        val namespace = connection?.let { "server_" + contentHashService.sha256HexForString(it.baseUrl).substring(0, 16) }
+        // 命名空间必须与同步引擎同源（地址 + 服务端实例 + 用户），否则投影查不到。
+        val namespace = serverSyncService.activeServerNamespace()
         val targets = entities.map { entity ->
             // 同步态按内容哈希派生，投影可能挂在另一条 server 行上；优先本行投影，回退按哈希解析。
             val direct = namespace?.let { serverProjectionDao.getByLocalPhotoIdInNamespace(entity.id, it) }
