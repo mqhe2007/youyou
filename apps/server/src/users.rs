@@ -132,10 +132,14 @@ async fn ensure_library_name_free(
     transaction: &mut sqlx::SqliteConnection,
     library_name: &str,
 ) -> AppResult<()> {
-    let taken = sqlx::query_scalar::<_, i64>("SELECT 1 FROM user_libraries WHERE root_path = ?1")
-        .bind(library_name)
-        .fetch_optional(&mut *transaction)
-        .await?;
+    // 大小写不敏感判重：大小写不敏感的文件系统上 `bob` 与 `Bob` 是同一个目录，
+    // 两个用户绑同一目录会让归属随扫描顺序翻转。
+    let taken = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM user_libraries WHERE root_path = ?1 COLLATE NOCASE",
+    )
+    .bind(library_name)
+    .fetch_optional(&mut *transaction)
+    .await?;
     if taken.is_some() {
         return Err(AppError::Conflict(format!(
             "媒体库目录 {library_name} 已被其他用户绑定"
@@ -161,7 +165,10 @@ async fn claim_unowned_assets(
               SELECT 1 FROM media_locations l
               WHERE l.media_asset_id = a.id
                 AND l.hash_state = 'verified'
-                AND (l.normalized_path = ?1 OR l.normalized_path LIKE ?1 || '/%')
+                AND (
+                    l.normalized_path = ?1
+                    OR substr(l.normalized_path, 1, length(?1) + 1) = ?1 || '/'
+                )
           )
         "#,
     )
@@ -230,26 +237,17 @@ pub async fn user_exists(pool: &SqlitePool, user_id: i64) -> AppResult<bool> {
 pub async fn delete_user(pool: &SqlitePool, user_id: i64) -> AppResult<()> {
     let mut transaction = pool.begin().await?;
     let now = now_millis();
-    let revision = sync::allocate_revision(&mut transaction).await?;
 
-    // 媒体归还无属主池，并向该用户的变更流补 delete 事件，避免在线设备残留投影。
-    let owned_ids =
-        sqlx::query_scalar::<_, String>("SELECT id FROM media_assets WHERE owner_user_id = ?1")
-            .bind(user_id)
-            .fetch_all(&mut *transaction)
-            .await?;
-    if !owned_ids.is_empty() {
-        sqlx::query(
-            "UPDATE media_assets SET owner_user_id = NULL, version = version + 1, updated_at = ?1 WHERE owner_user_id = ?2",
-        )
-        .bind(now)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-        for media_id in &owned_ids {
-            append_media_delete_change(&mut transaction, revision, media_id, user_id, now).await?;
-        }
-    }
+    // 媒体归还无属主池并递增版本（未来的认领者以新版本 supersede 旧投影）。
+    // 不向变更流补 delete 事件：本事务会吊销该用户全部设备并把其历史变更置为
+    // 无属主（满足用户行外键删除），设备拿不到任何读路径，补的事件必然是死信。
+    sqlx::query(
+        "UPDATE media_assets SET owner_user_id = NULL, version = version + 1, updated_at = ?1 WHERE owner_user_id = ?2",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await?;
 
     sqlx::query("DELETE FROM media_tags WHERE tag_id IN (SELECT id FROM tags WHERE user_id = ?1)")
         .bind(user_id)
@@ -352,6 +350,11 @@ pub async fn require_user_library_root(pool: &SqlitePool, user_id: i64) -> AppRe
 }
 
 /// 按目录前缀解析媒体归属（路径为相对存储根的相对路径）。
+///
+/// 前缀匹配必须大小写敏感（`substr` 为二进制比较）：`LIKE` 对 ASCII 大小写
+/// 不敏感，在大小写敏感的文件系统上会把 `Bob/` 下的文件错判给库名 `bob` 的用户。
+/// 大小写不敏感文件系统上同一目录的两种拼写由 `ensure_library_name_free` 拒绝，
+/// 保证存续期内不会出现两个仅大小写不同的库。
 pub async fn resolve_owner_for_path(
     pool: &SqlitePool,
     relative_path: &str,
@@ -359,7 +362,7 @@ pub async fn resolve_owner_for_path(
     sqlx::query_scalar(
         r#"
         SELECT user_id FROM user_libraries
-        WHERE ?1 = root_path OR ?1 LIKE root_path || '/%'
+        WHERE ?1 = root_path OR substr(?1, 1, length(root_path) + 1) = root_path || '/'
         ORDER BY length(root_path) DESC
         LIMIT 1
         "#,
@@ -458,6 +461,7 @@ pub(crate) async fn append_media_upsert_change(
         "takenAt": row.taken_at,
         "sortAt": row.sort_at,
         "sortSource": row.sort_source, "timeVersion": row.time_version, "originalName": row.original_name,
+        "version": row.version,
     });
     payload["livePhoto"] = crate::live_photo::payload_json(&mut *transaction, media_id)
         .await?
@@ -473,45 +477,6 @@ pub(crate) async fn append_media_upsert_change(
     .bind(Uuid::new_v4().to_string())
     .bind(media_id)
     .bind(row.version)
-    .bind(serde_json::to_string(&payload).map_err(|e| AppError::Internal(e.into()))?)
-    .bind(now)
-    .bind(owner_user_id)
-    .execute(&mut *transaction)
-    .await?;
-    Ok(())
-}
-
-/// 向指定用户的变更流写入媒体 delete（归属移除/用户删除场景，文件本身仍在磁盘）。
-pub(crate) async fn append_media_delete_change(
-    transaction: &mut sqlx::SqliteConnection,
-    revision: i64,
-    media_id: &str,
-    owner_user_id: i64,
-    now: i64,
-) -> AppResult<()> {
-    let version: Option<i64> = sqlx::query_scalar("SELECT version FROM media_assets WHERE id = ?1")
-        .bind(media_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-    let Some(version) = version else {
-        return Ok(());
-    };
-    let payload = serde_json::json!({
-        "id": media_id,
-        "version": version,
-        "reason": "library_rebound",
-    });
-    sqlx::query(
-        r#"
-        INSERT INTO change_log
-            (revision, event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
-        VALUES (?1, ?2, 'media', 'delete', ?3, ?4, ?5, ?6, ?7)
-        "#,
-    )
-    .bind(revision)
-    .bind(Uuid::new_v4().to_string())
-    .bind(media_id)
-    .bind(version)
     .bind(serde_json::to_string(&payload).map_err(|e| AppError::Internal(e.into()))?)
     .bind(now)
     .bind(owner_user_id)

@@ -264,6 +264,23 @@ pub(crate) async fn update_admin_storage(
         }
     }
     let root_changed = previous.root() != FsPath::new(&health.root_path);
+    // 存储根切换会让全部 location 失效（服务端隐藏所有远程媒体），但设备端无从
+    // 得知——为受影响用户抬升裁剪水位，强制其下一次增量拉取走全量重建清单。
+    // 查询先于事务，避免在 deferred 事务里先读后写引入 WAL 快照冲突。
+    let affected_users = if root_changed {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT DISTINCT a.owner_user_id
+            FROM media_assets a
+            INNER JOIN media_locations l ON l.media_asset_id = a.id
+            WHERE l.storage_id = 'local' AND a.owner_user_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        Vec::new()
+    };
     let mut transaction = match state.db.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -293,6 +310,25 @@ pub(crate) async fn update_admin_storage(
         {
             state.storage.restore(previous).await;
             return Err(error.into());
+        }
+        if !affected_users.is_empty() {
+            // 新分配的 revision 保证高于任何已签发的游标；结束标记让所有旧游标
+            // 在下一次 /changes 时收到 409 resync_required。
+            let revision = match crate::sync::allocate_revision(&mut transaction).await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    state.storage.restore(previous).await;
+                    return Err(error.into());
+                }
+            };
+            for user_id in &affected_users {
+                if let Err(error) =
+                    crate::sync::force_user_resync(&mut transaction, *user_id, revision).await
+                {
+                    state.storage.restore(previous).await;
+                    return Err(error.into());
+                }
+            }
         }
     }
     if let Err(error) = transaction.commit().await {

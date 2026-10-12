@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     api::{AppState, ThumbnailRender, render_thumbnail},
     audit, auth,
-    db::now_millis,
+    db::{begin_write, now_millis},
     error::{AppError, AppResult},
     storage::{LocalFilesystemStorageDriver, StorageDriver, StorageError},
     sync, uploads,
@@ -395,7 +395,9 @@ pub(crate) async fn move_library(
                 if motion_to != motion.normalized_path {
                     match storage.stat(&motion_to).await {
                         Ok(_) => {
-                            return Err(AppError::Conflict("target path already exists".to_owned()));
+                            return Err(AppError::Conflict(
+                                "target path already exists".to_owned(),
+                            ));
                         }
                         Err(StorageError::NotFound(_)) => {}
                         Err(error) => return Err(error.into()),
@@ -598,7 +600,7 @@ pub(crate) async fn library_media_content(
             let size = storage.stat(&row.normalized_path).await?.size;
             let motion = crate::live_photo::probe_path(&storage, &row.normalized_path, size, false)
                 .await
-                .map_err(|error| AppError::Internal(error.into()))?
+                .map_err(AppError::Internal)?
                 .embedded
                 .ok_or_else(|| AppError::NotFound("live photo motion not found".to_owned()))?;
             let offset = motion
@@ -1061,7 +1063,7 @@ async fn delete_empty_folder(
 }
 
 async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) -> AppResult<()> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     for (from, to) in moves {
         let row = sqlx::query_as::<
             _,
@@ -1077,6 +1079,8 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
                 Option<i64>,
                 Option<String>,
                 Option<i64>,
+                i64,
+                Option<i64>,
             ),
         >(
             r#"
@@ -1091,7 +1095,9 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
             a.taken_at,
             a.sort_at,
             b.content_hash,
-            a.duration_ms
+            a.duration_ms,
+            a.is_favorite,
+            a.owner_user_id
         FROM media_locations l
         INNER JOIN media_assets a ON a.id = l.media_asset_id
         LEFT JOIN content_blobs b ON b.id = a.blob_id
@@ -1113,6 +1119,8 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
             sort_at,
             content_hash,
             duration_ms,
+            is_favorite,
+            owner_user_id,
         )) = row
         else {
             // Path may be an unindexed empty-folder move; nothing to rewrite.
@@ -1164,6 +1172,8 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
             "height": height,
             "takenAt": taken_at,
             "sortAt": sort_at,
+            "version": version,
+            "isFavorite": is_favorite == 1,
         });
         let time = sqlx::query_as::<_, (String, i64, Option<String>)>(
             "SELECT sort_source,time_version,original_name FROM media_assets WHERE id=?1",
@@ -1180,8 +1190,8 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
         sqlx::query(
             r#"
         INSERT INTO change_log
-            (revision, event_id, entity, operation, entity_id, version, payload, created_at)
-        VALUES (?1, ?2, 'media', 'upsert', ?3, ?4, ?5, ?6)
+            (revision, event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+        VALUES (?1, ?2, 'media', 'upsert', ?3, ?4, ?5, ?6, ?7)
         "#,
         )
         .bind(revision)
@@ -1190,6 +1200,7 @@ async fn rewrite_media_locations(pool: &SqlitePool, moves: &[(String, String)]) 
         .bind(version)
         .bind(serde_json::to_string(&payload).map_err(|error| AppError::Internal(error.into()))?)
         .bind(now)
+        .bind(owner_user_id)
         .execute(&mut *transaction)
         .await?;
     }
@@ -1215,7 +1226,7 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
     }
 
     let now = now_millis();
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_write(pool).await?;
     let revision = sync::allocate_revision(&mut transaction).await?;
     for (media_id, old_path) in rows {
         let new_path = if old_path == from {
@@ -1258,6 +1269,8 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
             content_hash,
             duration_ms,
             version,
+            is_favorite,
+            owner_user_id,
         ) = sqlx::query_as::<
             _,
             (
@@ -1272,11 +1285,14 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
                 Option<String>,
                 Option<i64>,
                 i64,
+                i64,
+                Option<i64>,
             ),
         >(
             r#"
                 SELECT a.name, l.size, a.mime_type, a.is_video, a.width, a.height,
-                       a.taken_at, a.sort_at, b.content_hash, a.duration_ms, a.version
+                       a.taken_at, a.sort_at, b.content_hash, a.duration_ms, a.version,
+                       a.is_favorite, a.owner_user_id
                 FROM media_assets a
                 INNER JOIN media_locations l
                     ON l.media_asset_id = a.id AND l.storage_id = 'local' AND l.normalized_path = ?1
@@ -1304,6 +1320,8 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
             "height": height,
             "takenAt": taken_at,
             "sortAt": sort_at,
+            "version": version,
+            "isFavorite": is_favorite == 1,
         });
         let time = sqlx::query_as::<_, (String, i64, Option<String>)>(
             "SELECT sort_source,time_version,original_name FROM media_assets WHERE id=?1",
@@ -1320,8 +1338,8 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
         sqlx::query(
             r#"
             INSERT INTO change_log
-                (revision, event_id, entity, operation, entity_id, version, payload, created_at)
-            VALUES (?1, ?2, 'media', 'upsert', ?3, ?4, ?5, ?6)
+                (revision, event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+            VALUES (?1, ?2, 'media', 'upsert', ?3, ?4, ?5, ?6, ?7)
             "#,
         )
         .bind(revision)
@@ -1330,6 +1348,7 @@ async fn rewrite_folder_locations(pool: &SqlitePool, from: &str, to: &str) -> Ap
         .bind(version)
         .bind(serde_json::to_string(&payload).map_err(|error| AppError::Internal(error.into()))?)
         .bind(now)
+        .bind(owner_user_id)
         .execute(&mut *transaction)
         .await?;
     }

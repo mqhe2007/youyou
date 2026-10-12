@@ -83,6 +83,7 @@ fn emit_sql() -> String {
       'storageId',l.storage_id,'identityState',a.identity_state,'hashState',l.hash_state,
       'width',a.width,'height',a.height,'durationMs',a.duration_ms,'takenAt',a.taken_at,
       'sortAt',a.sort_at,'sortSource',a.sort_source,'timeVersion',a.time_version,'originalName',a.original_name,
+      'version',a.version,'isFavorite',json(CASE WHEN a.is_favorite=1 THEN 'true' ELSE 'false' END),
       {live}),?3,a.owner_user_id
       FROM media_assets a JOIN media_locations l ON l.media_asset_id=a.id LEFT JOIN content_blobs b ON b.id=a.blob_id
       WHERE a.id=?4 ORDER BY l.normalized_path LIMIT 1"#,

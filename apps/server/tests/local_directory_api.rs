@@ -1783,28 +1783,34 @@ async fn changes_cursor_requires_resync_after_retention_prunes_old_events() {
         .expect("setup token");
     let app = build_router(state.clone());
     let (_, _, device_token) = establish_device(&app, setup_token.trim()).await;
+    let user_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users ORDER BY id LIMIT 1")
+        .fetch_one(&state.db)
+        .await
+        .expect("user id");
     let now = youyou_server::db::now_millis();
     sqlx::query(
         r#"
         INSERT INTO change_log
-            (event_id, entity, operation, entity_id, version, payload, created_at)
-        VALUES (?1, 'media', 'upsert', 'old', 1, '{}', ?2)
+            (event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+        VALUES (?1, 'media', 'upsert', 'old', 1, '{}', ?2, ?3)
         "#,
     )
     .bind(Uuid::new_v4().to_string())
     .bind(now - 31 * 24 * 60 * 60 * 1000)
+    .bind(user_id)
     .execute(&state.db)
     .await
     .expect("old change");
     sqlx::query(
         r#"
         INSERT INTO change_log
-            (event_id, entity, operation, entity_id, version, payload, created_at)
-        VALUES (?1, 'media', 'upsert', 'new', 1, '{}', ?2)
+            (event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+        VALUES (?1, 'media', 'upsert', 'new', 1, '{}', ?2, ?3)
         "#,
     )
     .bind(Uuid::new_v4().to_string())
     .bind(now)
+    .bind(user_id)
     .execute(&state.db)
     .await
     .expect("recent change");
@@ -1848,6 +1854,398 @@ async fn changes_cursor_requires_resync_after_retention_prunes_old_events() {
             .await
             .expect("old change count");
     assert_eq!(old_count, 0);
+}
+
+#[tokio::test]
+async fn retention_watermark_is_isolated_per_user() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token) = establish_admin(&app, setup_token.trim()).await;
+    let user_a =
+        admin_create_user(&app, &admin_token, &csrf_token, "alice-retention", "reta").await;
+    let device_a = pair_user_device(&app, &admin_token, &csrf_token, user_a, "a-phone").await;
+    let user_b = admin_create_user(&app, &admin_token, &csrf_token, "bob-retention", "retb").await;
+    let device_b = pair_user_device(&app, &admin_token, &csrf_token, user_b, "b-phone").await;
+
+    let now = youyou_server::db::now_millis();
+    sqlx::query(
+        r#"
+        INSERT INTO change_log
+            (event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+        VALUES (?1, 'media', 'upsert', 'a-old', 1, '{}', ?2, ?3)
+        "#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(now - 31 * 24 * 60 * 60 * 1000)
+    .bind(user_a)
+    .execute(&state.db)
+    .await
+    .expect("old change for a");
+    sqlx::query(
+        r#"
+        INSERT INTO change_log
+            (event_id, entity, operation, entity_id, version, payload, created_at, owner_user_id)
+        VALUES (?1, 'media', 'upsert', 'b-recent', 1, '{}', ?2, ?3)
+        "#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(now)
+    .bind(user_b)
+    .execute(&state.db)
+    .await
+    .expect("recent change for b");
+
+    // B 用显式旧游标拉取：A 的过期行被裁剪不应牵连 B。
+    let bob_changes = request(
+        &app,
+        Method::GET,
+        "/api/v1/changes?cursor=djI6MDo&limit=100",
+        None,
+        Some(&device_b),
+        None,
+    )
+    .await;
+    assert_eq!(bob_changes.status(), StatusCode::OK);
+    let bob_body = to_bytes(bob_changes.into_body(), usize::MAX)
+        .await
+        .expect("bob changes body");
+    let bob_json: serde_json::Value = serde_json::from_slice(&bob_body).expect("bob changes json");
+    let entity_ids = bob_json["items"]
+        .as_array()
+        .expect("bob items")
+        .iter()
+        .filter_map(|item| item["entityId"].as_str())
+        .collect::<Vec<_>>();
+    assert!(entity_ids.contains(&"b-recent"));
+
+    // A 的旧游标落在自身被裁剪的水位之前：必须要求全量重同步。
+    let alice_changes = request(
+        &app,
+        Method::GET,
+        "/api/v1/changes?cursor=djI6MDo&limit=100",
+        None,
+        Some(&device_a),
+        None,
+    )
+    .await;
+    assert_eq!(alice_changes.status(), StatusCode::CONFLICT);
+    let alice_body = to_bytes(alice_changes.into_body(), usize::MAX)
+        .await
+        .expect("alice changes body");
+    let alice_json: serde_json::Value =
+        serde_json::from_slice(&alice_body).expect("alice changes json");
+    assert_eq!(alice_json["code"], "resync_required");
+}
+
+#[tokio::test]
+async fn admin_move_propagates_user_media_change_with_owner() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "movelib").await;
+
+    tokio::fs::write(
+        media.path().join("movelib/a.jpg"),
+        photo_bytes(b"move-owner"),
+    )
+    .await
+    .expect("media file");
+    let scan = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let scan_body = to_bytes(scan.into_body(), usize::MAX)
+        .await
+        .expect("scan body");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&scan_body).expect("scan json")["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let job = wait_admin_job(&app, &admin_token, &job_id).await;
+    assert_eq!(job["status"], "succeeded");
+
+    let listed = request(
+        &app,
+        Method::GET,
+        "/api/v1/media?limit=100",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = to_bytes(listed.into_body(), usize::MAX)
+        .await
+        .expect("media body");
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed_body).expect("media json");
+    let media_id = listed_json["items"][0]["id"]
+        .as_str()
+        .expect("media id")
+        .to_owned();
+
+    let move_response = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/media-library/move",
+        serde_json::json!({
+            "from": "movelib/a.jpg",
+            "to": "movelib/b.jpg"
+        }),
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(move_response.status(), StatusCode::NO_CONTENT);
+
+    // 该用户设备必须能拿到这次移动的变更，且载荷完整（路径/版本/收藏）。
+    let changes = request(
+        &app,
+        Method::GET,
+        "/api/v1/changes?limit=200",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(changes.status(), StatusCode::OK);
+    let changes_body = to_bytes(changes.into_body(), usize::MAX)
+        .await
+        .expect("changes body");
+    let changes_json: serde_json::Value =
+        serde_json::from_slice(&changes_body).expect("changes json");
+    let latest = changes_json["items"]
+        .as_array()
+        .expect("changes items")
+        .iter()
+        .rfind(|item| {
+            item["entity"] == "media"
+                && item["entityId"] == serde_json::json!(media_id)
+                && item["operation"] == "upsert"
+        })
+        .expect("move change for user media");
+    assert_eq!(latest["data"]["path"], "movelib/b.jpg");
+    assert_eq!(latest["data"]["name"], "b.jpg");
+    assert!(
+        latest["data"]["version"].as_i64().is_some_and(|v| v >= 2),
+        "move payload must carry the bumped version: {latest}"
+    );
+    assert_eq!(latest["data"]["isFavorite"], false);
+
+    // 扫描写入的 upsert 同样必须携带 version / isFavorite（客户端增量落库依赖它们，
+    // 不再回源逐条 GET /media/{id}）。
+    let first_upsert = changes_json["items"]
+        .as_array()
+        .expect("changes items")
+        .iter()
+        .find(|item| {
+            item["entity"] == "media"
+                && item["entityId"] == serde_json::json!(media_id)
+                && item["operation"] == "upsert"
+        })
+        .expect("scan change for user media");
+    assert!(
+        first_upsert["data"]["version"]
+            .as_i64()
+            .is_some_and(|v| v >= 1),
+        "scan payload must carry the version: {first_upsert}"
+    );
+    assert!(
+        !first_upsert["data"]["isFavorite"].is_null(),
+        "scan payload must carry isFavorite: {first_upsert}"
+    );
+}
+
+#[tokio::test]
+async fn storage_root_change_forces_user_resync() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token, device_token) =
+        establish_user_device(&app, setup_token.trim(), "sroot").await;
+
+    tokio::fs::write(
+        media.path().join("sroot/a.jpg"),
+        photo_bytes(b"storage-root"),
+    )
+    .await
+    .expect("media file");
+    let scan = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let scan_body = to_bytes(scan.into_body(), usize::MAX)
+        .await
+        .expect("scan body");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&scan_body).expect("scan json")["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let job = wait_admin_job(&app, &admin_token, &job_id).await;
+    assert_eq!(job["status"], "succeeded");
+
+    let changes = request(
+        &app,
+        Method::GET,
+        "/api/v1/changes?limit=200",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(changes.status(), StatusCode::OK);
+    let changes_body = to_bytes(changes.into_body(), usize::MAX)
+        .await
+        .expect("changes body");
+    let changes_json: serde_json::Value =
+        serde_json::from_slice(&changes_body).expect("changes json");
+    let cursor = changes_json["nextCursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_owned();
+
+    let new_root = media.path().join("relocated");
+    tokio::fs::create_dir_all(&new_root)
+        .await
+        .expect("new storage root");
+    let update = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/admin/storage",
+        serde_json::json!({"rootPath": new_root.to_str().expect("root path")}),
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    // 存储根切换后旧游标不再可信：设备必须在下次拉取时收到 resync_required。
+    let resync = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/changes?cursor={cursor}&limit=200"),
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert_eq!(resync.status(), StatusCode::CONFLICT);
+    let resync_body = to_bytes(resync.into_body(), usize::MAX)
+        .await
+        .expect("resync body");
+    let resync_json: serde_json::Value = serde_json::from_slice(&resync_body).expect("resync json");
+    assert_eq!(resync_json["code"], "resync_required");
+}
+
+#[tokio::test]
+async fn delete_user_releases_media_without_dead_letter_events() {
+    let data = tempdir().expect("data directory");
+    let media = tempdir().expect("media directory");
+    let state = initialize(data.path(), media.path()).await.expect("state");
+    let setup_token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .expect("setup token");
+    let app = build_router(state.clone());
+    let (admin_token, csrf_token) = establish_admin(&app, setup_token.trim()).await;
+    let user_id = admin_create_user(&app, &admin_token, &csrf_token, "gone-user", "gonelib").await;
+    let device_token =
+        pair_user_device(&app, &admin_token, &csrf_token, user_id, "gone-phone").await;
+
+    tokio::fs::write(media.path().join("gonelib/gone.jpg"), photo_bytes(b"gone"))
+        .await
+        .expect("media file");
+    let scan = request(
+        &app,
+        Method::POST,
+        "/api/v1/admin/jobs/scan",
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let scan_body = to_bytes(scan.into_body(), usize::MAX)
+        .await
+        .expect("scan body");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&scan_body).expect("scan json")["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let job = wait_admin_job(&app, &admin_token, &job_id).await;
+    assert_eq!(job["status"], "succeeded");
+
+    let deleted = request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/admin/users/{user_id}"),
+        None,
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    // 媒体回到无属主池。
+    let owner = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT owner_user_id FROM media_assets WHERE name = 'gone.jpg'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("media owner");
+    assert_eq!(owner, None);
+
+    // 不产生读不到的死信 delete 事件。
+    let dead_letters = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM change_log WHERE payload LIKE '%library_rebound%'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("dead letters");
+    assert_eq!(dead_letters, 0);
+
+    // 设备已被吊销，无法再读用户数据。
+    let revoked = request(
+        &app,
+        Method::GET,
+        "/api/v1/media?limit=10",
+        None,
+        Some(&device_token),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            revoked.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "revoked device must lose access, got {}",
+        revoked.status()
+    );
 }
 
 #[tokio::test]

@@ -1,14 +1,27 @@
+use std::time::Duration as StdDuration;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::db::now_millis;
+use crate::db::{begin_write, now_millis};
 
 const SNAPSHOT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 // Six bound values per row fit 4,000 rows below SQLite's default variable
 // limit while keeping each write transaction short enough for other jobs.
 const SNAPSHOT_INSERT_BATCH_SIZE: usize = 4_000;
 pub const CHANGES_CURSOR_END: &str = "\u{10ffff}";
+
+/// 变更流保留期。超过该年龄的变更由后台任务与读路径的机会式裁剪共同清理。
+pub const CHANGE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const CHANGE_RETENTION_INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
+
+/// 某用户的裁剪水位：早于它的游标必须全量重同步。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserWatermark {
+    pub revision: i64,
+    pub event_id: String,
+}
 
 pub async fn allocate_revision(transaction: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     sqlx::query("UPDATE change_revision SET revision = revision + 1 WHERE id = 1")
@@ -21,6 +34,150 @@ pub async fn allocate_revision(transaction: &mut SqliteConnection) -> Result<i64
 
 pub fn encode_changes_cursor(revision: i64, event_id: &str) -> String {
     URL_SAFE_NO_PAD.encode(format!("v2:{revision}:{event_id}"))
+}
+
+/// 读取某用户的裁剪水位；没有记录即空水位（从未裁剪过该用户的变更）。
+pub async fn load_user_watermark(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<UserWatermark, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, String)>(
+        "SELECT pruned_through_revision, pruned_through_event_id FROM change_log_user_meta WHERE user_id = ?1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|(revision, event_id)| UserWatermark { revision, event_id })
+        .unwrap_or_default())
+}
+
+/// 单调抬升某用户水位（只增不减）。
+pub async fn upsert_user_watermark(
+    transaction: &mut SqliteConnection,
+    user_id: i64,
+    revision: i64,
+    event_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO change_log_user_meta (user_id, pruned_through_revision, pruned_through_event_id)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(user_id) DO UPDATE SET
+            pruned_through_revision = excluded.pruned_through_revision,
+            pruned_through_event_id = excluded.pruned_through_event_id
+        WHERE excluded.pruned_through_revision > change_log_user_meta.pruned_through_revision
+           OR (
+               excluded.pruned_through_revision = change_log_user_meta.pruned_through_revision
+               AND excluded.pruned_through_event_id > change_log_user_meta.pruned_through_event_id
+           )
+        "#,
+    )
+    .bind(user_id)
+    .bind(revision)
+    .bind(event_id)
+    .execute(&mut *transaction)
+    .await?;
+    Ok(())
+}
+
+/// 强制某用户的设备在下一次增量拉取时全量重建（用户无法再信任旧投影时使用，
+/// 例如存储根切换导致全部 location 失效）。水位须由调用方先分配 revision，
+/// 保证高于任何已被签发过的游标。
+pub async fn force_user_resync(
+    transaction: &mut SqliteConnection,
+    user_id: i64,
+    revision: i64,
+) -> Result<(), sqlx::Error> {
+    upsert_user_watermark(transaction, user_id, revision, CHANGES_CURSOR_END).await
+}
+
+/// 保留期裁剪（幂等）。先用 created_at 索引做廉价判断，只有存在过期行时才进入
+/// `BEGIN IMMEDIATE` 写事务——避免 WAL 下「先读后写」的 `SQLITE_BUSY_SNAPSHOT`
+/// （该错误不经过 busy_timeout，会让并发的变更拉取直接失败）。
+///
+/// 水位按用户维护：只有自身变更被裁剪的用户需要全量重同步；NULL 属主的遗留行
+/// 只更新全局水位。
+pub async fn prune_change_log(pool: &SqlitePool) -> anyhow::Result<bool> {
+    let cutoff = now_millis().saturating_sub(CHANGE_RETENTION_MS);
+    let has_expired =
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM change_log WHERE created_at < ?1 LIMIT 1")
+            .bind(cutoff)
+            .fetch_optional(pool)
+            .await?
+            .is_some();
+    if !has_expired {
+        return Ok(false);
+    }
+
+    let mut transaction = begin_write(pool).await?;
+    let user_boundaries = sqlx::query_as::<_, (i64, i64, String)>(
+        r#"
+        SELECT owner_user_id, revision, event_id FROM (
+            SELECT owner_user_id, revision, event_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY owner_user_id
+                       ORDER BY revision DESC, event_id DESC
+                   ) AS boundary_rank
+            FROM change_log
+            WHERE created_at < ?1 AND owner_user_id IS NOT NULL
+        )
+        WHERE boundary_rank = 1
+        "#,
+    )
+    .bind(cutoff)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let global_boundary = sqlx::query_as::<_, (i64, String)>(
+        "SELECT revision, event_id FROM change_log WHERE created_at < ?1 ORDER BY revision DESC, event_id DESC LIMIT 1",
+    )
+    .bind(cutoff)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some((revision, event_id)) = global_boundary {
+        sqlx::query(
+            r#"
+            UPDATE change_log_meta
+            SET pruned_through_revision = ?1, pruned_through_event_id = ?2
+            WHERE id = 1
+              AND (
+                  pruned_through_revision < ?1
+                  OR (
+                      pruned_through_revision = ?1
+                      AND pruned_through_event_id < ?2
+                  )
+              )
+            "#,
+        )
+        .bind(revision)
+        .bind(event_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    for (user_id, revision, event_id) in user_boundaries {
+        upsert_user_watermark(&mut transaction, user_id, revision, &event_id).await?;
+    }
+    sqlx::query("DELETE FROM change_log WHERE created_at < ?1")
+        .bind(cutoff)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// 后台保留期裁剪：读路径之外的小时级兜底，保证没有客户端拉取时也在收缩变更表。
+pub fn spawn_change_retention_worker(pool: SqlitePool) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CHANGE_RETENTION_INTERVAL).await;
+            match prune_change_log(&pool).await {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = ?error, "变更流保留期裁剪失败");
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,9 +252,14 @@ pub async fn build_snapshot_with_lease(
             SELECT pruned_through_revision AS revision
             FROM change_log_meta
             WHERE id = 1
+            UNION ALL
+            SELECT pruned_through_revision AS revision
+            FROM change_log_user_meta
+            WHERE user_id = ?1
         )
         "#,
     )
+    .bind(user_id)
     .fetch_one(&mut *read_transaction)
     .await?;
     let media_rows = sqlx::query_as::<_, SnapshotPayloadRow>(&format!(

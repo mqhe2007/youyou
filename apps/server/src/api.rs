@@ -42,7 +42,6 @@ use crate::{
 };
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const CHANGE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const AUTH_RATE_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
 const SETUP_MAX_FAILURES: u32 = 5;
 const LOGIN_MAX_FAILURES: u32 = 10;
@@ -253,6 +252,7 @@ pub fn build_router(state: AppState) -> Router {
     );
     spawn_job_lease_watchdog(state.db.clone());
     crate::trash::spawn_cleanup_worker(state.db.clone(), state.trash.clone());
+    crate::sync::spawn_change_retention_worker(state.db.clone());
     let timed_routes = Router::new()
         .route("/api-docs/openapi.json", get(openapi_json))
         .route("/admin", get(admin_index))

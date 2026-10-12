@@ -1594,11 +1594,12 @@ pub(crate) async fn index_media_with_time(
         || time_changed
         || live.as_ref().is_some_and(|live| live.own_changed)
     {
-        let media_version =
-            sqlx::query_scalar::<_, i64>("SELECT version FROM media_assets WHERE id = ?1")
-                .bind(&media_id)
-                .fetch_one(&mut *transaction)
-                .await?;
+        let (media_version, is_favorite) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT version, is_favorite FROM media_assets WHERE id = ?1",
+        )
+        .bind(&media_id)
+        .fetch_one(&mut *transaction)
+        .await?;
         let mut payload = serde_json::json!({
             "id": media_id,
             "name": entry.name,
@@ -1617,6 +1618,8 @@ pub(crate) async fn index_media_with_time(
             "takenAt": taken_at,
             "sortAt": sort_at,
             "sortSource": time.source, "timeVersion": 1, "originalName": original_name,
+            "version": media_version,
+            "isFavorite": is_favorite == 1,
         });
         payload["livePhoto"] = crate::live_photo::payload_json(&mut transaction, &media_id)
             .await?

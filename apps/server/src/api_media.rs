@@ -1523,47 +1523,17 @@ pub(crate) async fn list_changes(
     let limit = query.limit.unwrap_or(200).clamp(1, 500) as i64;
     let explicit_cursor = query.cursor.is_some();
     let cursor = parse_changes_cursor(query.cursor.as_deref())?;
-    let retention_cutoff = now_millis().saturating_sub(CHANGE_RETENTION_MS);
-    let mut retention_transaction = state.db.begin().await?;
-    let pruned_boundary = sqlx::query_as::<_, (i64, String)>(
-        "SELECT revision, event_id FROM change_log WHERE created_at < ?1 ORDER BY revision DESC, event_id DESC LIMIT 1",
-    )
-    .bind(retention_cutoff)
-    .fetch_optional(&mut *retention_transaction)
-    .await?;
-    if let Some((revision, event_id)) = pruned_boundary {
-        sqlx::query(
-            r#"
-            UPDATE change_log_meta
-            SET pruned_through_revision = ?1, pruned_through_event_id = ?2
-            WHERE id = 1
-              AND (
-                  pruned_through_revision < ?1
-                  OR (
-                      pruned_through_revision = ?1
-                      AND pruned_through_event_id < ?2
-                  )
-              )
-            "#,
-        )
-        .bind(revision)
-        .bind(event_id)
-        .execute(&mut *retention_transaction)
-        .await?;
+    // 机会式裁剪挂在读路径之外（后台 worker 之外的双保险）：先走 created_at 索引做
+    // 廉价判断，存在过期行才进入写事务。失败只记日志不阻塞读取——未裁剪即无数据
+    // 丢失，下一次请求或后台任务会重试。
+    if let Err(error) = sync::prune_change_log(&state.db).await {
+        tracing::warn!(error = ?error, "机会式变更流裁剪失败");
     }
-    sqlx::query("DELETE FROM change_log WHERE created_at < ?1")
-        .bind(retention_cutoff)
-        .execute(&mut *retention_transaction)
-        .await?;
-    retention_transaction.commit().await?;
-    let pruned_boundary = sqlx::query_as::<_, (i64, String)>(
-        "SELECT pruned_through_revision, pruned_through_event_id FROM change_log_meta WHERE id = 1",
-    )
-    .fetch_one(&state.db)
-    .await?;
+    let pruned_boundary = sync::load_user_watermark(&state.db, user_id).await?;
     if explicit_cursor
-        && (cursor.revision < pruned_boundary.0
-            || (cursor.revision == pruned_boundary.0 && cursor.event_id < pruned_boundary.1))
+        && (cursor.revision < pruned_boundary.revision
+            || (cursor.revision == pruned_boundary.revision
+                && cursor.event_id < pruned_boundary.event_id))
     {
         return Err(AppError::ResyncRequired);
     }
@@ -1609,6 +1579,8 @@ pub(crate) async fn list_changes(
     let next_cursor = Some(match items.last() {
         Some(item) => sync::encode_changes_cursor(item.revision, &item.event_id),
         None => {
+            // 空页的游标只能由「变更表的最大 revision」和「该用户自己的裁剪水位」
+            // 决定：其他用户被裁剪不应改变本用户可安全前移的位置。
             let end_revision = sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT MAX(revision)
@@ -1619,9 +1591,14 @@ pub(crate) async fn list_changes(
                     SELECT pruned_through_revision AS revision
                     FROM change_log_meta
                     WHERE id = 1
+                    UNION ALL
+                    SELECT pruned_through_revision AS revision
+                    FROM change_log_user_meta
+                    WHERE user_id = ?1
                 )
                 "#,
             )
+            .bind(user_id)
             .fetch_one(&state.db)
             .await?;
             if explicit_cursor && cursor.revision > end_revision {
