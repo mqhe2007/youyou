@@ -6,10 +6,12 @@ import com.example.youyou_album.data.db.dao.TagDao
 import com.example.youyou_album.data.db.entity.PhotoTagEntity
 import com.example.youyou_album.domain.model.Photo
 import com.example.youyou_album.domain.model.Tag
+import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TagRepository
 import com.example.youyou_album.service.ServerConnectionStore
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
@@ -22,6 +24,7 @@ class TagRepositoryImpl @Inject constructor(
     private val serverSyncStateDao: ServerSyncStateDao,
     private val serverProjectionDao: ServerProjectionDao,
     private val connectionStore: ServerConnectionStore,
+    private val photoRepository: PhotoRepository,
 ) : TagRepository {
 
     override fun observeAll(): Flow<List<Tag>> =
@@ -66,4 +69,19 @@ class TagRepositoryImpl @Inject constructor(
 
     override suspend fun removeTagFromPhoto(tagId: String, photoId: String) =
         tagDao.removeTagFromPhoto(tagId, photoId)
+
+    override suspend fun getTagsForPhoto(photo: Photo): List<Tag> {
+        // 关联可能挂在时间线可见的本机行上，也可能挂在同一媒体的服务端投影行上
+        //（服务端下行的关联由同步引擎挂到投影行）。
+        val rowIds = linkedSetOf(photo.id)
+        val namespace = activeNamespace().first()
+        if (namespace.isNotBlank()) {
+            photoRepository.resolveServerMediaId(photo)?.let { serverMediaId ->
+                serverProjectionDao.getByMediaId(namespace, serverMediaId)?.localPhotoId?.let { rowIds += it }
+            }
+        }
+        return rowIds.flatMap { tagDao.getTagsForPhoto(it) }
+            .distinctBy { it.id }
+            .map { it.toDomain() }
+    }
 }

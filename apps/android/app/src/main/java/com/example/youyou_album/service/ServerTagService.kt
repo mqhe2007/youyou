@@ -133,6 +133,54 @@ class ServerTagService @Inject constructor(
     }
 
     /**
+     * 给照片添加标签。
+     *
+     * - 本机标签，或照片没有服务端副本：只在本机加关联（返回 Success）。
+     * - 服务端标签 + 照片有服务端副本：先写服务端（幂等；已存在同关联时服务端
+     *   返回既有关系），成功后把本机关联挂到服务端投影行（与同步下行的落点一致，
+     *   避免同一照片在标签详情出现两块磁贴）；离线返回 [ServerWriteResult.Offline]，
+     *   调用方提示用户，不产生只在本机的分叉关联。
+     */
+    suspend fun addTagToPhoto(tag: Tag, photo: Photo): ServerWriteResult<Unit> {
+        if (tag.sourceType != "server" || tag.serverRemoteId.isNullOrBlank()) {
+            tagRepository.addTagToPhoto(tag.id, photo.id)
+            return ServerWriteResult.Success(Unit)
+        }
+        val serverMediaId = photoRepository.resolveServerMediaId(photo)
+        if (serverMediaId == null) {
+            tagRepository.addTagToPhoto(tag.id, photo.id)
+            return ServerWriteResult.Success(Unit)
+        }
+        val context = onlineContext() ?: return ServerWriteResult.Offline
+        if (tag.serverNamespace != null && tag.serverNamespace != context.namespace) {
+            return ServerWriteResult.Failure("标签不属于当前服务端身份，请重新同步后再试")
+        }
+        return try {
+            context.service.addTagMedia(
+                tagId = tag.serverRemoteId,
+                mediaId = serverMediaId,
+                idempotencyKey = idempotencyKey(),
+            )
+            val targetRow = photoRepository.getByServerMediaId(context.namespace, serverMediaId)?.id
+                ?: photo.id
+            tagRepository.addTagToPhoto(tag.id, targetRow, context.namespace)
+            ServerWriteResult.Success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: HttpException) {
+            when (e.code()) {
+                404 -> ServerWriteResult.Failure("照片或标签在服务端已不存在，请同步后重试")
+                401, 403 -> ServerWriteResult.Failure("登录已失效，请重新连接服务端")
+                else -> ServerWriteResult.Failure("添加标签失败：HTTP ${e.code()}")
+            }
+        } catch (e: java.io.IOException) {
+            ServerWriteResult.Offline
+        } catch (e: Exception) {
+            ServerWriteResult.Failure("添加标签失败：${e.message ?: e.javaClass.simpleName}")
+        }
+    }
+
+    /**
      * 从照片上移除标签。
      *
      * - 本机标签，或照片没有服务端副本：只在本机移除关联（返回 Success，调用方
@@ -141,8 +189,7 @@ class ServerTagService @Inject constructor(
      *   本机两侧的关联（选中行 + 服务端投影行）一起清理；离线时返回 [ServerWriteResult.Offline]，
      *   调用方应跳过本地删除并提示，避免下次同步把关联又拉回来。
      */
-    suspend fun removeTagFromPhoto(tag: Tag, photo: Photo): ServerWriteResult<Unit> {
-        if (tag.sourceType != "server" || tag.serverRemoteId.isNullOrBlank()) {
+    suspend fun removeTagFromPhoto(tag: Tag, photo: Photo): ServerWriteResult<Unit> {        if (tag.sourceType != "server" || tag.serverRemoteId.isNullOrBlank()) {
             tagRepository.removeTagFromPhoto(tag.id, photo.id)
             return ServerWriteResult.Success(Unit)
         }

@@ -40,6 +40,8 @@ data class PhotoDetailUiState(
 class PhotoDetailViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val photoRepository: PhotoRepository,
+    private val tagRepository: com.example.youyou_album.domain.repository.TagRepository,
+    private val serverTagService: com.example.youyou_album.service.ServerTagService,
     private val apiServiceFactory: ApiServiceFactory,
     private val serverConnectionStore: ServerConnectionStore,
     private val mediaDownloadService: com.example.youyou_album.service.MediaDownloadService,
@@ -64,11 +66,65 @@ class PhotoDetailViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(PhotoDetailUiState())
     val uiState: StateFlow<PhotoDetailUiState> = _uiState.asStateFlow()
 
+    /** 当前照片已属标签（含挂在服务端投影行上的关联）。 */
+    private val _photoTags = MutableStateFlow<List<com.example.youyou_album.domain.model.Tag>>(emptyList())
+    val photoTags: StateFlow<List<com.example.youyou_album.domain.model.Tag>> = _photoTags.asStateFlow()
+
+    /** 全部标签，供选择弹窗。 */
+    val allTags: StateFlow<List<com.example.youyou_album.domain.model.Tag>> =
+        tagRepository.observeAll()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _tagMessage = MutableStateFlow<String?>(null)
+    val tagMessage: StateFlow<String?> = _tagMessage.asStateFlow()
+
+    fun clearTagMessage() {
+        _tagMessage.value = null
+    }
+
+    private var lastTagPhotoId: String? = null
+
     init {
         viewModelScope.launch {
             photoRepository.observeTimeline(null).collect { allPhotos ->
                 _uiState.value = _uiState.value.refreshPhotos(allPhotos, initialPhotoId)
+                // 翻页后同步刷新当前照片的标签。
+                val currentId = currentPhoto()?.id
+                if (currentId != lastTagPhotoId) {
+                    lastTagPhotoId = currentId
+                    refreshPhotoTags()
+                }
             }
+        }
+    }
+
+    fun refreshPhotoTags() {
+        viewModelScope.launch {
+            _photoTags.value = currentPhoto()?.let { photo ->
+                runCatching { tagRepository.getTagsForPhoto(photo) }.getOrDefault(emptyList())
+            } ?: emptyList()
+        }
+    }
+
+    /** 在信息面板/弹窗里切换某个标签与当前照片的关联。 */
+    fun togglePhotoTag(tag: com.example.youyou_album.domain.model.Tag) {
+        val photo = currentPhoto() ?: return
+        val attached = _photoTags.value.any { it.id == tag.id }
+        viewModelScope.launch {
+            val result = if (attached) {
+                serverTagService.removeTagFromPhoto(tag, photo)
+            } else {
+                serverTagService.addTagToPhoto(tag, photo)
+            }
+            when (result) {
+                is com.example.youyou_album.service.ServerWriteResult.Success -> Unit
+                com.example.youyou_album.service.ServerWriteResult.Offline ->
+                    _tagMessage.value =
+                        if (attached) "未连接服务端，暂时无法移除该标签" else "未连接服务端，无法添加到服务端标签"
+                is com.example.youyou_album.service.ServerWriteResult.Failure ->
+                    _tagMessage.value = result.message
+            }
+            refreshPhotoTags()
         }
     }
 

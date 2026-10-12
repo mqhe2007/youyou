@@ -67,6 +67,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -94,6 +95,10 @@ fun PhotoDetailPage(
     val deleteBusy by viewModel.mediaDelete.busy.collectAsStateWithLifecycle()
     val deleteMessage by viewModel.mediaDelete.message.collectAsStateWithLifecycle()
     val serverConnected by viewModel.serverConnected.collectAsStateWithLifecycle()
+    val photoTags by viewModel.photoTags.collectAsStateWithLifecycle()
+    val allTags by viewModel.allTags.collectAsStateWithLifecycle()
+    val tagMessage by viewModel.tagMessage.collectAsStateWithLifecycle()
+    var showTagPicker by remember { mutableStateOf(false) }
     MediaDeleteLauncher(
         step = deleteStep,
         onSystemConfirmation = { session, approved -> viewModel.mediaDelete.onSystemConfirmation(session, approved) },
@@ -132,6 +137,13 @@ fun PhotoDetailPage(
         snackbarHostState.showSnackbar(msg)
         viewModel.mediaDelete.clearMessage()
         if (viewModel.uiState.value.photos.isEmpty()) onBack()
+    }
+
+    LaunchedEffect(tagMessage) {
+        tagMessage?.let { msg ->
+            snackbarHostState.showSnackbar(msg)
+            viewModel.clearTagMessage()
+        }
     }
 
     if (showDeleteDialog && currentPhoto != null) {
@@ -342,13 +354,31 @@ fun PhotoDetailPage(
             onDismissRequest = { showInfoSheet = false },
             sheetState = infoSheetState,
         ) {
-            PhotoInfoSheet(photo = currentPhoto)
+            PhotoInfoSheet(
+                photo = currentPhoto,
+                tags = photoTags,
+                onEditTags = { showTagPicker = true },
+            )
         }
+    }
+
+    if (showTagPicker && currentPhoto != null) {
+        com.example.youyou_album.presentation.widgets.TagPickerDialog(
+            title = "标签",
+            tags = allTags,
+            checkedTagIds = photoTags.map { it.id }.toSet(),
+            onTagClick = { viewModel.togglePhotoTag(it) },
+            onDismiss = { showTagPicker = false },
+        )
     }
 }
 
 @Composable
-private fun PhotoInfoSheet(photo: Photo) {
+private fun PhotoInfoSheet(
+    photo: Photo,
+    tags: List<com.example.youyou_album.domain.model.Tag>,
+    onEditTags: () -> Unit,
+) {
     val context = LocalContext.current
     var exifInfo by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 
@@ -392,6 +422,7 @@ private fun PhotoInfoSheet(photo: Photo) {
             com.example.youyou_album.domain.model.MediaSyncDisplay.REMOTE_ONLY -> "仅服务器"
             com.example.youyou_album.domain.model.MediaSyncDisplay.LOCAL_ONLY -> "仅本机"
         })
+        TagInfoRow(tags = tags, onClick = onEditTags)
         if (photo.contentHash != null) InfoRow("内容哈希", photo.contentHash.take(16) + "...")
     }
 }
@@ -441,6 +472,42 @@ private fun InfoRow(label: String, value: String) {
             color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
         Spacer(modifier = Modifier.width(16.dp))
         Text(value, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(2f))
+    }
+}
+
+/** 信息面板里的「标签」行：展示当前标签，点按打开勾选编辑。 */
+@Composable
+private fun TagInfoRow(
+    tags: List<com.example.youyou_album.domain.model.Tag>,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "标签",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(modifier = Modifier.width(16.dp))
+        Text(
+            text = if (tags.isEmpty()) "无" else tags.joinToString("、") { it.name },
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(2f, fill = false),
+        )
+        Icon(
+            painter = painterResource(R.drawable.lucide_ic_chevron_right),
+            contentDescription = "编辑标签",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp),
+        )
     }
 }
 

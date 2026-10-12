@@ -94,6 +94,8 @@ fun HomePage(
     val deleteStep by viewModel.mediaDelete.step.collectAsStateWithLifecycle()
     val deletePreview by viewModel.mediaDelete.preview.collectAsStateWithLifecycle()
     val deleteMessage by viewModel.mediaDelete.message.collectAsStateWithLifecycle()
+    val tags by viewModel.tags.collectAsStateWithLifecycle()
+    val tagMessage by viewModel.tagMessage.collectAsStateWithLifecycle()
     MediaDeleteLauncher(
         step = deleteStep,
         onSystemConfirmation = { session, approved -> viewModel.mediaDelete.onSystemConfirmation(session, approved) },
@@ -115,6 +117,7 @@ fun HomePage(
         }
     }
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showTagPicker by remember { mutableStateOf(false) }
     var showMediaPermissionExplanation by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val mediaPermissions = remember {
@@ -181,6 +184,13 @@ fun HomePage(
         }
     }
 
+    LaunchedEffect(tagMessage) {
+        tagMessage?.let { msg ->
+            snackbarHostState.showSnackbar(msg)
+            viewModel.clearTagMessage()
+        }
+    }
+
     val selectedPhotos = photos.filter { it.id in uiState.selectedPhotoIds }
     val deleteOnline = trustState.reachability == ServerReachability.ONLINE
 
@@ -195,6 +205,19 @@ fun HomePage(
                 showDeleteDialog = false
                 viewModel.deleteSelected(uiState.selectedPhotoIds, scope)
             },
+        )
+    }
+
+    if (showTagPicker) {
+        com.example.youyou_album.presentation.widgets.TagPickerDialog(
+            title = "添加到标签",
+            tags = tags,
+            checkedTagIds = null,
+            onTagClick = { tag ->
+                showTagPicker = false
+                viewModel.addSelectedToTag(tag)
+            },
+            onDismiss = { showTagPicker = false },
         )
     }
     if (showMediaPermissionExplanation) {
@@ -384,6 +407,14 @@ fun HomePage(
                                 )
                             )
                         }
+                        add(
+                            BatchAction(
+                                label = "打标",
+                                icon = R.drawable.lucide_ic_tag,
+                                primary = false,
+                                onClick = { showTagPicker = true },
+                            )
+                        )
                     },
                 )
             }

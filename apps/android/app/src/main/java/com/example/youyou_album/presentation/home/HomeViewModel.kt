@@ -10,7 +10,9 @@ import androidx.work.WorkManager
 import com.example.youyou_album.domain.model.AppTask
 import com.example.youyou_album.domain.model.MediaSyncDisplay
 import com.example.youyou_album.domain.model.Photo
+import com.example.youyou_album.domain.model.Tag
 import com.example.youyou_album.domain.repository.PhotoRepository
+import com.example.youyou_album.domain.repository.TagRepository
 import com.example.youyou_album.domain.repository.TaskRepository
 import com.example.youyou_album.service.ContentHashService
 import com.example.youyou_album.service.DownloadForegroundService
@@ -19,6 +21,8 @@ import com.example.youyou_album.service.MediaScanWorker
 import com.example.youyou_album.service.MediaDeletionService
 import com.example.youyou_album.service.ServerConnectionStore
 import com.example.youyou_album.service.ServerSyncService
+import com.example.youyou_album.service.ServerTagService
+import com.example.youyou_album.service.ServerWriteResult
 import com.example.youyou_album.service.ApiServiceFactory
 import com.example.youyou_album.service.UploadForegroundService
 import com.example.youyou_album.service.UploadService
@@ -56,9 +60,11 @@ data class HomeUiState(
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     private val photoRepository: PhotoRepository,
+    private val tagRepository: TagRepository,
     private val mediaScanService: MediaScanService,
     private val serverConnectionStore: ServerConnectionStore,
     private val serverSyncService: ServerSyncService,
+    private val serverTagService: ServerTagService,
     private val serverSyncStateDao: ServerSyncStateDao,
     private val apiServiceFactory: ApiServiceFactory,
     private val uploadService: UploadService,
@@ -80,6 +86,43 @@ class HomeViewModel @Inject constructor(
     val photos: StateFlow<List<Photo>> = backupFilter
         .flatMapLatest { f -> photoRepository.observeTimeline(f) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** 全部标签，供批量「打标」弹窗。 */
+    val tags: StateFlow<List<Tag>> = tagRepository.observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _tagMessage = MutableStateFlow<String?>(null)
+    val tagMessage: StateFlow<String?> = _tagMessage.asStateFlow()
+
+    fun clearTagMessage() {
+        _tagMessage.value = null
+    }
+
+    /** 把当前选中的照片批量加入某个标签（本机标签直接加；服务端标签先写服务端）。 */
+    fun addSelectedToTag(tag: Tag) {
+        val ids = _uiState.value.selectedPhotoIds
+        if (ids.isEmpty()) return
+        viewModelScope.launch {
+            val selected = photos.value.filter { it.id in ids }
+            var added = 0
+            var failed = 0
+            var offline = false
+            for (photo in selected) {
+                when (serverTagService.addTagToPhoto(tag, photo)) {
+                    is ServerWriteResult.Success -> added++
+                    ServerWriteResult.Offline -> offline = true
+                    is ServerWriteResult.Failure -> failed++
+                }
+            }
+            _tagMessage.value = when {
+                added == 0 && offline -> "未连接服务端，无法添加到服务端标签"
+                failed > 0 -> "已添加到「${tag.name}」$added 项，$failed 项失败"
+                offline -> "已添加到「${tag.name}」$added 项，部分未添加（离线）"
+                else -> "已添加到「${tag.name}」$added 项"
+            }
+            clearSelection()
+        }
+    }
 
     private val _reachability = MutableStateFlow(ServerReachability.UNBOUND)
 

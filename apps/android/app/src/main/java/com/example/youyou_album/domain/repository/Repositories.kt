@@ -49,6 +49,12 @@ interface TagRepository {
     fun observePhotosByTag(tagId: String): Flow<List<Photo>>
     suspend fun addTagToPhoto(tagId: String, photoId: String, serverNamespace: String? = null)
     suspend fun removeTagFromPhoto(tagId: String, photoId: String)
+
+    /**
+     * 照片当前所属标签。关联可能挂在时间线可见的本机行上、也可能挂在同一媒体的
+     * 服务端投影行上，这里按两者合并返回。
+     */
+    suspend fun getTagsForPhoto(photo: Photo): List<Tag>
 }
 
 interface TaskRepository {

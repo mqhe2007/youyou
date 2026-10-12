@@ -519,6 +519,17 @@ class RealServerTransferE2ETest {
         withTimeout(10_000) {
             while (accessibilityTexts().none { it == "仅本机" }) delay(100)
         }
+        // 打标入口冒烟：信息面板的「标签」行能打开选择弹窗（本用例未创建标签 → 空态），
+        // 「完成」可关闭弹窗并回到信息面板。
+        assertTrue("tag row missing: ${accessibilityTexts()}", accessibilityTexts().contains("标签"))
+        assertTrue(tapAccessibilityText("标签"))
+        withTimeout(10_000) {
+            while (accessibilityTexts().none { it.contains("还没有标签") }) delay(100)
+        }
+        assertTrue(tapAccessibilityText("完成"))
+        withTimeout(10_000) {
+            while (accessibilityTexts().none { it == "仅本机" }) delay(100)
+        }
         InstrumentationRegistry.getInstrumentation().uiAutomation.performGlobalAction(
             android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK,
         )
