@@ -212,7 +212,7 @@ class RealServerTransferE2ETest {
                     val index = requireNotNull(item.originalName).removePrefix("upload-$salt-").removeSuffix(".jpg").toInt()
                     assertEquals(1_700_000_000_000L + index * 1000L, item.takenAt)
                     val sourceBytes = context.contentResolver.openInputStream(android.net.Uri.parse(local[index].sourceUri))!!.use { it.readBytes() }
-                    assertEquals(sourceBytes.toList(), api.openMediaContent(item.id).bytes().toList())
+                    assertEquals(sourceBytes.toList(), api.openMediaContent(item.id).body()!!.bytes().toList())
                 }
                 val timeline = photoRepository.getTimeline()
                 (remote.mapNotNull { it.contentHash } + local.mapNotNull { it.contentHash }).forEach { hash ->

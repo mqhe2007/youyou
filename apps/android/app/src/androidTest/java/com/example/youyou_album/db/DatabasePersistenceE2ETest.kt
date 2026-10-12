@@ -334,12 +334,14 @@ class DatabasePersistenceE2ETest {
         database.serverSyncStateDao().upsert(ServerSyncStateEntity(serverNamespace = "server_a", changesCursor = "cursor", snapshotRevision = 1, updatedAt = 1))
 
         RemoteAccountCacheCleaner(
+            context = TestDependencies.context,
             database = database,
             photoDao = database.photoDao(),
             tagDao = database.tagDao(),
             serverProjectionDao = database.serverProjectionDao(),
             serverExportDao = database.serverExportDao(),
             serverSyncStateDao = database.serverSyncStateDao(),
+            pendingDownloadDao = database.pendingDownloadDao(),
             thumbnailCacheService = ThumbnailCacheService(TestDependencies.context),
             originalPhotoCacheService = OriginalPhotoCacheService(
                 TestDependencies.context,

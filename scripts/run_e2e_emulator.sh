@@ -141,7 +141,9 @@ else
     fi
 
     log "启动模拟器: $AVD_NAME"
-    "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-save -no-boot-anim -gpu auto &
+    # 必须脱钩模拟器的 stdout/stderr：模拟器进程长期存活，若继承脚本的输出管道，
+    # 脚本结束后管道写端仍未关闭，`... | tail` 或 CI 捕获会等不到 EOF 而假挂起。
+    "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-save -no-boot-anim -gpu auto >/dev/null 2>&1 &
     EMULATOR_PID=$!
 
     # 等待模拟器出现在 adb devices 中
