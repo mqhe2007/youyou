@@ -3,6 +3,7 @@ package com.example.youyou_album.data.db
 import androidx.room.Database
 import androidx.room.RoomDatabase
 import com.example.youyou_album.data.db.dao.MediaOperationDao
+import com.example.youyou_album.data.db.dao.PendingDownloadDao
 import com.example.youyou_album.data.db.dao.PhotoDao
 import com.example.youyou_album.data.db.dao.ScanCursorDao
 import com.example.youyou_album.data.db.dao.ServerExportDao
@@ -10,6 +11,7 @@ import com.example.youyou_album.data.db.dao.ServerProjectionDao
 import com.example.youyou_album.data.db.dao.ServerSyncStateDao
 import com.example.youyou_album.data.db.dao.TagDao
 import com.example.youyou_album.data.db.dao.TaskDao
+import com.example.youyou_album.data.db.entity.PendingDownloadEntity
 import com.example.youyou_album.data.db.entity.PendingLocalDeletionEntity
 import com.example.youyou_album.data.db.entity.PendingMediaOperationEntity
 import com.example.youyou_album.data.db.entity.PhotoEntity
@@ -34,8 +36,9 @@ import com.example.youyou_album.data.db.entity.TaskEntity
         ServerSyncStateEntity::class,
         PendingMediaOperationEntity::class,
         PendingLocalDeletionEntity::class,
+        PendingDownloadEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -47,6 +50,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun serverExportDao(): ServerExportDao
     abstract fun serverSyncStateDao(): ServerSyncStateDao
     abstract fun mediaOperationDao(): MediaOperationDao
+    abstract fun pendingDownloadDao(): PendingDownloadDao
 
     companion object {
         const val DATABASE_NAME = "youyou_album.db"

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import com.example.youyou_album.data.db.AppDatabase
 import com.example.youyou_album.data.db.dao.MediaOperationDao
+import com.example.youyou_album.data.db.dao.PendingDownloadDao
 import com.example.youyou_album.data.db.dao.PhotoDao
 import com.example.youyou_album.data.db.dao.ScanCursorDao
 import com.example.youyou_album.data.db.dao.ServerExportDao
@@ -16,6 +17,7 @@ import com.example.youyou_album.data.db.migration.MIGRATION_2_3
 import com.example.youyou_album.data.db.migration.MIGRATION_5_6
 import com.example.youyou_album.data.db.migration.MIGRATION_6_7
 import com.example.youyou_album.data.db.migration.MIGRATION_7_8
+import com.example.youyou_album.data.db.migration.MIGRATION_8_9
 import com.example.youyou_album.data.db.migration.MIGRATION_4_5
 import com.example.youyou_album.data.db.migration.MIGRATION_3_4
 import dagger.Module
@@ -45,6 +47,7 @@ object DatabaseModule {
                 MIGRATION_5_6,
                 MIGRATION_6_7,
                 MIGRATION_7_8,
+                MIGRATION_8_9,
             )
             .build()
     }
@@ -72,4 +75,7 @@ object DatabaseModule {
 
     @Provides
     fun provideMediaOperationDao(db: AppDatabase): MediaOperationDao = db.mediaOperationDao()
+
+    @Provides
+    fun providePendingDownloadDao(db: AppDatabase): PendingDownloadDao = db.pendingDownloadDao()
 }

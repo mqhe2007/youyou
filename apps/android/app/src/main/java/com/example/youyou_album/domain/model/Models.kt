@@ -77,6 +77,10 @@ data class Tag(
     val updatedAt: Long,
     val sourceType: String = "local",
     val serverNamespace: String? = null,
+    /** 服务端标签 id；本机标签为 null。 */
+    val serverRemoteId: String? = null,
+    /** 服务端标签版本；本机标签为 0。跨端改删（If-Match）依赖它。 */
+    val version: Long = 0,
 )
 
 data class AppTask(
@@ -106,6 +110,8 @@ data class ServerConnection(
     val deviceName: String? = null,
     /** 配对时从 `/api/v1/server` 读到并落盘，供离线时仍能显示服务端版本。 */
     val serverVersion: String? = null,
+    /** 服务端确认的绑定用户 id；与实例 id 一起参与同步命名空间推导。 */
+    val userId: String? = null,
 )
 
 enum class ConnectionStatus {

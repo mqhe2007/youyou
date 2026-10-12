@@ -110,11 +110,13 @@ private fun PhotoEntity.livePhoto(): LivePhoto? {
 internal fun TagEntity.toDomain() = Tag(
     id = id, name = name, createdAt = createdAt, updatedAt = updatedAt,
     sourceType = sourceType, serverNamespace = serverNamespace,
+    serverRemoteId = serverRemoteId, version = serverVersion,
 )
 
 internal fun Tag.toEntity() = TagEntity(
     id = id, name = name, createdAt = createdAt, updatedAt = updatedAt,
     sourceType = sourceType, serverNamespace = serverNamespace,
+    serverRemoteId = serverRemoteId, serverVersion = version,
 )
 
 internal fun TaskEntity.toDomain() = AppTask(
