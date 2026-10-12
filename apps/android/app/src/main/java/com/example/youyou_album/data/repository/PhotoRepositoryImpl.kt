@@ -97,18 +97,27 @@ class PhotoRepositoryImpl @Inject constructor(
         serverProjectionDao.deleteByMediaId(namespace, serverMediaId)
     }
 
-    override suspend fun toggleFavorite(id: String, isFavorite: Boolean) =
+    override suspend fun toggleFavorite(id: String, isFavorite: Boolean) {
+        // 收藏按「内容」生效：同一哈希的本机孪生行与服务端投影行一起翻转，
+        // 否则时间线（显示本机行）与收藏页（可能以服务端行呈现）会分叉。
+        val hash = photoDao.getById(id)?.contentHash
+        if (!hash.isNullOrBlank()) {
+            photoDao.updateFavoriteByHash(hash, isFavorite, activeNamespace().first())
+        }
         photoDao.updateFavorite(id, isFavorite)
+    }
 
     override suspend fun getFavorites(): List<Photo> =
-        getAll().filter { it.isFavorite }
+        collapseHashTwins(getAll(), { it.contentHash }, { it.sourceType == "server" })
+            .filter { it.isFavorite }
 
     override fun observeFavorites(): Flow<List<Photo>> =
         activeNamespace().flatMapLatest { namespace ->
             photoDao.observeFavorites(namespace)
                 .map { list ->
                     val baseUrl = connectionStore.getConnection()?.baseUrl
-                    list.map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview(namespace, baseUrl) }
+                    collapseHashTwins(list, { it.contentHash }, { it.sourceType == "server" })
+                        .map { it.toDomain() }.withSyncDisplay().map { it.withRemotePreview(namespace, baseUrl) }
                 }
         }
 
@@ -145,4 +154,28 @@ class PhotoRepositoryImpl @Inject constructor(
 
     override suspend fun getVideos(): List<Photo> =
         photoDao.getVideos().map { it.toDomain() }
+}
+
+/**
+ * 同一内容哈希只保留一行：优先保留本机行（时间线里可见的那一行），否则保留首个
+ * 出现的行。哈希未知的行原样保留。用于收藏列表——避免「已同步」照片的本机行与
+ * 服务端投影行同时出现在收藏页。
+ */
+internal fun <T> collapseHashTwins(
+    rows: List<T>,
+    hashOf: (T) -> String?,
+    isServerRow: (T) -> Boolean,
+): List<T> {
+    val preferred = HashMap<String, T>()
+    for (row in rows) {
+        val hash = hashOf(row) ?: continue
+        val current = preferred[hash]
+        if (current == null || (isServerRow(current) && !isServerRow(row))) {
+            preferred[hash] = row
+        }
+    }
+    return rows.filter { row ->
+        val hash = hashOf(row)
+        hash == null || preferred[hash] === row
+    }
 }

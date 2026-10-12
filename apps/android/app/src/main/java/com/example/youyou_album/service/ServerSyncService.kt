@@ -5,6 +5,7 @@ import androidx.room.withTransaction
 import com.example.youyou_album.data.db.AppDatabase
 import com.example.youyou_album.data.api.YouyouApiService
 import com.example.youyou_album.data.api.dto.ChangeEnvelopeDto
+import com.example.youyou_album.data.api.dto.ServerInfoDto
 import com.example.youyou_album.data.api.dto.ServerMediaDto
 import com.example.youyou_album.data.api.dto.ServerRelationDto
 import com.example.youyou_album.data.api.dto.ServerTagDto
@@ -71,6 +72,7 @@ class ServerSyncService @Inject constructor(
     private val tagRepository: TagRepository,
     private val serverProjectionDao: ServerProjectionDao,
     private val serverSyncStateDao: ServerSyncStateDao,
+    private val serverConnectionStore: ServerConnectionStore,
     private val contentHashService: ContentHashService,
     private val json: Json,
     private val mediaTaskCoordinator: MediaTaskCoordinator,
@@ -101,6 +103,7 @@ class ServerSyncService @Inject constructor(
 
     private lateinit var serverNamespace: String
     private var apiService: YouyouApiService? = null
+    private var apiServiceBaseUrl: String? = null
 
     /**
      * 页面退出不会取消这里的同步。连接页返回后清单仍继续写，远程媒体数量会在写入过程中增加。
@@ -149,7 +152,7 @@ class ServerSyncService @Inject constructor(
         localPhoto: Photo,
         upload: UploadService.UploadResult,
     ) {
-        val namespace = computeServerNamespace(baseUrl)
+        val namespace = resolveNamespace(baseUrl)
         if (mediaTaskCoordinator.shouldDiscardRemoteUpsert(namespace, upload.mediaId, 0)) {
             Log.d(TAG, "discard uploaded media upsert for deleted media ${upload.mediaId}")
             return
@@ -198,11 +201,20 @@ class ServerSyncService @Inject constructor(
 
     suspend fun sync(baseUrl: String): ServerSyncReport? = syncMutex.withLock {
         try {
-            val service = apiService?.takeIf {
-                ::serverNamespace.isInitialized && serverNamespace == computeServerNamespace(baseUrl)
-            } ?: apiServiceFactory.create(baseUrl)
+            val normalizedUrl = baseUrl.trimEnd('/')
+            val service = apiService?.takeIf { apiServiceBaseUrl == normalizedUrl }
+                ?: apiServiceFactory.create(normalizedUrl)
             apiService = service
-            serverNamespace = computeServerNamespace(baseUrl)
+            apiServiceBaseUrl = normalizedUrl
+            // 身份快照（地址 + 服务端实例 + 用户）参与命名空间推导：同一地址换用户
+            // （不经连接页）时必须隔离旧投影，而不是继续用旧游标增量。
+            val info = service.serverInfo()
+            serverNamespace = computeServerNamespace(
+                normalizedUrl,
+                info.serverInstanceId.ifBlank { null },
+                info.userId?.takeIf { it.isNotBlank() },
+            )
+            repairStoredIdentity(normalizedUrl, info)
             _activity.value = ServerSyncActivity(phase = ServerSyncPhase.APPLYING)
             val previousState = serverSyncStateDao.get()
             val report = if (hasIncrementalCursor(
@@ -238,6 +250,19 @@ class ServerSyncService @Inject constructor(
             _activity.value = ServerSyncActivity(lastError = e.message ?: "同步失败")
             throw e
         }
+    }
+
+    /**
+     * 补齐持久化的服务端身份（同址换实例/换用户）。只改身份字段，不动首连引导标记。
+     */
+    private suspend fun repairStoredIdentity(baseUrl: String, info: ServerInfoDto) {
+        val connection = serverConnectionStore.getConnection() ?: return
+        if (connection.baseUrl.trimEnd('/') != baseUrl) return
+        val instanceId = info.serverInstanceId.ifBlank { null }
+        val userId = info.userId?.takeIf { it.isNotBlank() }
+        if (connection.serverInstanceId == instanceId && connection.userId == userId) return
+        Log.d(TAG, "server identity changed; repairing stored connection")
+        serverConnectionStore.updateIdentity(serverInstanceId = instanceId, userId = userId)
     }
 
     /**
@@ -388,7 +413,16 @@ class ServerSyncService @Inject constructor(
                             photoRepository.deleteServerProjection(serverNamespace, change.entityId)
                             removedCount++
                         } else if (change.operation == "upsert") {
-                            val media = service.getMedia(change.entityId)
+                            // 变更信封已携带完整媒体载荷，直接落库，避免每条媒体变更一次
+                            // GET 的 N+1；旧服务端载荷缺 `version` 字段时回源拉取兜底
+                            // （版本缺失会把删除的乐观并发校验带偏）。
+                            val data = change.data
+                            val media = if (data != null && data.containsKey("version")) {
+                                json.decodeFromJsonElement(ServerMediaDto.serializer(), data)
+                            } else {
+                                service.getMedia(change.entityId)
+                            }
+                            if (media.id.isEmpty()) throw IllegalStateException("changes media 缺少 id: $raw")
                             upsertMedia(media, lastRevision)
                             appliedCount++
                         }
@@ -426,6 +460,7 @@ class ServerSyncService @Inject constructor(
             }
             val nextCursor = page.nextCursor
             if (nextCursor != null && nextCursor.isNotEmpty()) {
+                if (nextCursor == cursor) throw IllegalStateException("变更分页没有前进")
                 cursor = nextCursor
                 serverSyncStateDao.upsert(
                     ServerSyncStateEntity(
@@ -485,6 +520,7 @@ class ServerSyncService @Inject constructor(
         val now = System.currentTimeMillis()
         val photos = mutableListOf<Photo>()
         val projections = mutableListOf<ServerMediaProjectionEntity>()
+        val favoriteUpdates = mutableListOf<Pair<String, Boolean>>()
         for (media in items) {
             if (media.id.isEmpty()) continue
             val existing = photoRepository.getByServerMediaId(serverNamespace, media.id)
@@ -508,6 +544,9 @@ class ServerSyncService @Inject constructor(
                     updatedAt = now,
                 ),
             )
+            media.contentHash?.let { hash ->
+                media.isFavorite?.let { favoriteUpdates.add(hash to it) }
+            }
         }
         if (photos.isEmpty()) return
         // 图片与远程映射一起提交，防止观察者先收到缺少预览地址的图片。
@@ -516,6 +555,11 @@ class ServerSyncService @Inject constructor(
             serverProjectionDao.upsertAll(projections)
             photos.mapNotNull { it.contentHash }.distinct().forEach { hash ->
                 photoDao.reconcileTimeForNamespace(hash, serverNamespace)
+            }
+            // 收藏以服务端为事实来源：本机孪生行跟随服务端的收藏状态（时间线里
+            // 可见的是本机行，收藏页可能呈现服务端行，两处必须一致）。
+            favoriteUpdates.distinct().forEach { (hash, favorite) ->
+                photoDao.applyServerFavoriteToLocals(hash, favorite)
             }
         }
     }
@@ -574,6 +618,8 @@ class ServerSyncService @Inject constructor(
                 updatedAt = tag.updatedAt,
                 sourceType = "server",
                 serverNamespace = serverNamespace,
+                serverRemoteId = tag.id,
+                version = tag.version.toLong(),
             )
         )
     }
@@ -634,14 +680,66 @@ class ServerSyncService @Inject constructor(
         } while (true)
     }
 
-    private fun serverEntityId(entity: String, remoteId: String): String {
-        val digest = contentHashService.sha256HexForString("$serverNamespace:$entity:$remoteId")
-        return "t${digest.substring(0, 32)}"
+    private fun serverEntityId(entity: String, remoteId: String): String =
+        serverEntityLocalId(contentHashService, serverNamespace, entity, remoteId)
+
+    /**
+     * 当前生效的服务端命名空间（地址 + 服务端实例 + 用户）。
+     * 优先使用本轮同步推导的身份，其次读持久化的同步状态；都没有（尚未完成
+     * 任何一次同步）时返回 null。
+     */
+    suspend fun activeServerNamespace(): String? {
+        if (::serverNamespace.isInitialized && serverNamespace.isNotBlank()) return serverNamespace
+        return serverSyncStateDao.get()?.serverNamespace?.takeIf { it.isNotBlank() }
     }
 
-    private fun computeServerNamespace(baseUrl: String): String {
-        return "server_${contentHashService.sha256HexForString(baseUrl).substring(0, 16)}"
+    /**
+     * 解析某个服务端地址对应的命名空间；本轮尚未同步且状态为空时按持久化身份
+     * 字段直接推导（旧服务端无身份字段时退回仅地址推导，保持兼容）。
+     */
+    private suspend fun resolveNamespace(baseUrl: String): String {
+        activeServerNamespace()?.let { return it }
+        val normalizedUrl = baseUrl.trimEnd('/')
+        val connection = serverConnectionStore.getConnection()
+            ?.takeIf { it.baseUrl.trimEnd('/') == normalizedUrl }
+        return computeServerNamespace(
+            normalizedUrl,
+            connection?.serverInstanceId,
+            connection?.userId,
+        )
     }
+
+    /**
+     * 命名空间同时绑定地址、服务端实例与用户：同一地址换实例/换用户都会得到新
+     * 命名空间，旧投影随 `purgeOtherNamespaces` 回收。旧服务端（无身份字段）
+     * 保持仅地址推导，避免无谓的整库重拉。
+     */
+    private fun computeServerNamespace(
+        baseUrl: String,
+        serverInstanceId: String?,
+        userId: String?,
+    ): String {
+        val url = baseUrl.trimEnd('/')
+        val identity = if (serverInstanceId.isNullOrBlank() && userId.isNullOrBlank()) {
+            url
+        } else {
+            "$url\n${serverInstanceId.orEmpty()}\n${userId.orEmpty()}"
+        }
+        return "server_${contentHashService.sha256HexForString(identity).substring(0, 16)}"
+    }
+}
+
+/**
+ * 服务端实体 id 到本机稳定 id 的推导，同步引擎与标签写路径共用同一算法。
+ */
+internal fun serverEntityLocalId(
+    contentHashService: ContentHashService,
+    namespace: String,
+    entity: String,
+    remoteId: String,
+): String {
+    val digest = contentHashService.sha256HexForString("$namespace:$entity:$remoteId")
+    return "t${digest.substring(0, 32)}"
 }
 
 /**

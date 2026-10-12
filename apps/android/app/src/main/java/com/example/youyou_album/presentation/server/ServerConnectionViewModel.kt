@@ -202,6 +202,7 @@ class ServerConnectionViewModel @Inject constructor(
                     deviceId = credentials.deviceId,
                     deviceName = deviceName,
                     serverVersion = serverInfo.serverVersion.ifBlank { null },
+                    userId = serverInfo.userId?.takeIf { it.isNotBlank() },
                 )
                 serverSyncService.prepareAccountSwitch {
                     remoteAccountCacheCleaner.clear()

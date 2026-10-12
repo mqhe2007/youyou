@@ -539,11 +539,41 @@ interface PhotoDao {
     @Query("UPDATE photos_table SET is_favorite = :isFavorite WHERE id = :id")
     suspend fun updateFavorite(id: String, isFavorite: Boolean)
 
-    // 收藏的照片：服务端行同样受当前身份作用域约束（未绑定时不展示服务端收藏）
+    /**
+     * 收藏按「内容」生效而不是按行：把同一内容哈希的所有行（本机行 + 当前身份内
+     * 的服务端投影行）一起更新。内容相同即同一张照片，否则时间线隐藏服务端孪生行
+     * 的规则会让收藏状态在两个入口分叉。
+     */
+    @Query(
+        """
+        UPDATE photos_table SET is_favorite = :isFavorite
+        WHERE content_hash = :hash
+          AND (
+              source_type != 'server'
+              OR EXISTS(
+                  SELECT 1 FROM server_media_projection sp
+                  WHERE sp.local_photo_id = photos_table.id
+                    AND sp.server_namespace = :namespace
+              )
+          )
+        """,
+    )
+    suspend fun updateFavoriteByHash(hash: String, isFavorite: Boolean, namespace: String)
+
+    /**
+     * 服务端收藏同步到本机孪生行：服务端是收藏的事实来源，本机行跟随
+     * 同一内容哈希的服务端投影更新（时间线里可见的那一行）。
+     */
+    @Query("UPDATE photos_table SET is_favorite = :isFavorite WHERE content_hash = :hash AND source_type != 'server'")
+    suspend fun applyServerFavoriteToLocals(hash: String, isFavorite: Boolean)
+
+    // 收藏的照片：服务端行同样受当前身份作用域约束（未绑定时不展示服务端收藏）；
+    // 动态部分行与时间线一致不作为独立媒体项展示。
     @Query(
         """
         SELECT * FROM photos_table p
         WHERE p.is_favorite = 1
+          AND COALESCE(p.live_role, 'none') != 'motion'
           AND (
               p.source_type != 'server'
               OR EXISTS(
