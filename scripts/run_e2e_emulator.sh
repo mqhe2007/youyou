@@ -15,6 +15,7 @@
 #   ./scripts/run_e2e_emulator.sh --tests com.example.youyou_album.server.ServerConnectionE2ETest
 #   ./scripts/run_e2e_emulator.sh --no-start   # 不自动启动模拟器（要求已有设备）
 #   ./scripts/run_e2e_emulator.sh --avd <name> # 指定 AVD 名称
+#   ./scripts/run_e2e_emulator.sh --boot-only  # 只启动/等待模拟器就绪后退出（供真服务端 E2E 链式调用）
 # =============================================================================
 
 set -euo pipefail
@@ -31,6 +32,7 @@ ANDROID_DIR="$PROJECT_ROOT/apps/android"
 AVD_NAME="$DEFAULT_AVD"
 AUTO_START=true
 TEST_FILTER=""
+BOOT_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +47,10 @@ while [[ $# -gt 0 ]]; do
         --tests)
             TEST_FILTER="$2"
             shift 2
+            ;;
+        --boot-only)
+            BOOT_ONLY=true
+            shift
             ;;
         -h|--help)
             grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -182,6 +188,12 @@ if [[ "${DEVICE_API_LEVEL:-0}" -lt 31 ]]; then
     exit 1
 fi
 
+# 3.5 仅启动模式：给真服务端 E2E（scripts/e2e_android_server.py）提供已就绪的模拟器。
+if [[ "$BOOT_ONLY" == "true" ]]; then
+    log "仅启动模式：模拟器 $TARGET_SERIAL 已就绪，退出。"
+    exit 0
+fi
+
 # 4. 构建并运行测试
 log "开始构建并运行 E2E 测试..."
 cd "$ANDROID_DIR"
@@ -238,6 +250,10 @@ if [[ -d "$RESULT_DIR" ]]; then
             ERRORS=$((ERRORS + $(n errors)))
         done <<< "$FRESH_XMLS"
         log "本次运行：总计 ${TOTAL} | 通过 $((TOTAL - SKIPPED - FAILURES - ERRORS)) | 跳过 ${SKIPPED} | 失败 ${FAILURES} | 错误 ${ERRORS}"
+        if [[ "${SKIPPED:-0}" -gt 0 ]]; then
+            warn "本次跳过 ${SKIPPED} 项：需要服务端参数的真服务端用例不会在本次真实执行，"
+            warn "完整验收请用 make e2e-android-server（会自动准备模拟器并跑真服务端三件套）。"
+        fi
     else
         warn "未找到本次运行的测试结果 XML（构建可能在测试前就失败了）"
     fi

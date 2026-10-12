@@ -26,9 +26,23 @@ def png_for(index: int, salt: int = 0) -> bytes:
     )
 
 
+def resolve_serial(adb: Path) -> str:
+    """未显式指定 ANDROID_SERIAL 时自动选择第一台在线模拟器（与 run_e2e_emulator.sh 口径一致）。"""
+    serial = os.environ.get("ANDROID_SERIAL", "").strip()
+    if serial:
+        return serial
+    devices = subprocess.check_output([str(adb), "devices"], text=True)
+    match = re.search(r"^(emulator-\d+)\s+device$", devices, re.MULTILINE)
+    if not match:
+        raise RuntimeError(
+            "未检测到在线模拟器：先运行 ./scripts/run_e2e_emulator.sh --boot-only（或 make e2e-android-server）"
+        )
+    return match.group(1)
+
+
 def main() -> None:
-    serial = os.environ.get("ANDROID_SERIAL", "emulator-5554")
     adb = Path(os.environ.get("ANDROID_HOME", str(Path.home() / "Library/Android/sdk"))) / "platform-tools/adb"
+    serial = resolve_serial(adb)
     model = subprocess.check_output([str(adb), "-s", serial, "shell", "getprop", "ro.product.model"], text=True).strip()
     if not model.startswith("sdk_gphone"):
         raise RuntimeError(f"isolated test requires an emulator, got {model}")

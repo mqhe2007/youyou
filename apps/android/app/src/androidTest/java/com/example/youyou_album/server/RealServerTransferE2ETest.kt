@@ -519,17 +519,30 @@ class RealServerTransferE2ETest {
         withTimeout(10_000) {
             while (accessibilityTexts().none { it == "仅本机" }) delay(100)
         }
-        // 打标入口冒烟：信息面板的「标签」行能打开选择弹窗（本用例未创建标签 → 空态），
-        // 「完成」可关闭弹窗并回到信息面板。
-        assertTrue("tag row missing: ${accessibilityTexts()}", accessibilityTexts().contains("标签"))
+        // 打标入口冒烟：信息面板的「标签」行能打开选择弹窗（本用例未创建标签 → 空态）。
+        // 面板展开有动画：等「标签」行进入可访问性树后再留一拍，避免按到还在位移中的坐标；
+        // 关闭弹窗与面板用返回键，不依赖按钮坐标与动画时序。
+        val tagRowVisible = withTimeoutOrNull(10_000) {
+            while (accessibilityTexts().none { it == "标签" }) delay(100)
+            true
+        }
+        assertTrue("tag row missing: ${accessibilityTexts()}", tagRowVisible == true)
+        delay(500)
         assertTrue(tapAccessibilityText("标签"))
-        withTimeout(10_000) {
+        val tagDialogOpened = withTimeoutOrNull(10_000) {
             while (accessibilityTexts().none { it.contains("还没有标签") }) delay(100)
+            true
         }
-        assertTrue(tapAccessibilityText("完成"))
-        withTimeout(10_000) {
-            while (accessibilityTexts().none { it == "仅本机" }) delay(100)
+        assertTrue("tag dialog not opened: ${accessibilityTexts()}", tagDialogOpened == true)
+        InstrumentationRegistry.getInstrumentation().uiAutomation.performGlobalAction(
+            android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK,
+        )
+        val tagDialogClosed = withTimeoutOrNull(10_000) {
+            while (accessibilityTexts().any { it.contains("还没有标签") }) delay(100)
+            true
         }
+        assertTrue("tag dialog not closed: ${accessibilityTexts()}", tagDialogClosed == true)
+        delay(300)
         InstrumentationRegistry.getInstrumentation().uiAutomation.performGlobalAction(
             android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK,
         )

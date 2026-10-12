@@ -1,4 +1,4 @@
-.PHONY: web-build server-check server-test contract-check docker-build docker-check client-check client-test e2e e2e-android benchmark acceptance beta-check beta-apk
+.PHONY: web-build server-check server-test contract-check docker-build docker-check client-check client-test e2e e2e-android e2e-android-server benchmark acceptance beta-check beta-apk
 
 web-build:
 	cd apps/server/web && npm ci && npm run build
@@ -44,13 +44,21 @@ e2e-android:
 		./scripts/run_e2e_emulator.sh; \
 	fi
 
+# 真服务端 Android 验收（连接/双向传输/失败重试/删除/换绑全链路）。
+# 与 e2e-android 的区别：这些用例需要 scripts/e2e_android_server.py 注入服务端参数，
+# 在 connectedDebugAndroidTest 全量里会被 assumeTrue 静默跳过——发版检查必须走这个目标。
+# 前置：本机有 Pixel_10_Pro AVD（或先设 ANDROID_SERIAL 指向已运行模拟器）。
+e2e-android-server:
+	./scripts/run_e2e_emulator.sh --boot-only
+	python3 scripts/e2e_android_server.py
+
 benchmark: web-build
 	cargo build --manifest-path apps/server/Cargo.toml --locked
 	YOUYOU_BENCHMARK_ENFORCE=1 python3 scripts/acceptance_benchmark.py
 
 acceptance: server-check server-test client-check client-test contract-check e2e benchmark docker-check
 
-beta-check: server-check server-test client-check client-test contract-check e2e e2e-android
+beta-check: server-check server-test client-check client-test contract-check e2e e2e-android e2e-android-server
 
 beta-apk:
 	cd apps/android && ./gradlew test assembleRelease
