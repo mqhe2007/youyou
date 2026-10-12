@@ -81,6 +81,14 @@ fun TagDetailPage(
         }
     }
 
+    val tagMessage by viewModel.message.collectAsStateWithLifecycle()
+    LaunchedEffect(tagMessage) {
+        tagMessage?.let { msg ->
+            snackbarHostState.showSnackbar(msg)
+            viewModel.clearMessage()
+        }
+    }
+
     val allIds = photos.map { it.id }
     val allSelected = allIds.isNotEmpty() && allIds.size == selectedIds.size && allIds.all { it in selectedIds }
 
