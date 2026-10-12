@@ -58,6 +58,10 @@ interface ServerProjectionDao {
     @Query("DELETE FROM server_media_projection WHERE server_namespace != :namespace")
     suspend fun deleteProjectionsOutsideNamespace(namespace: String): Int
 
+    /** 命名空间升级迁移：把旧式命名空间整批改名（保留投影与游标，避免全量重建）。 */
+    @Query("UPDATE server_media_projection SET server_namespace = :newNamespace WHERE server_namespace = :oldNamespace")
+    suspend fun renameNamespace(oldNamespace: String, newNamespace: String): Int
+
     /** 当前身份下的远程媒体条数（连接管理状态头展示用），随同步结果自动刷新。 */
     @Query("SELECT COUNT(*) FROM server_media_projection WHERE server_namespace = :namespace")
     fun observeCount(namespace: String): kotlinx.coroutines.flow.Flow<Int>

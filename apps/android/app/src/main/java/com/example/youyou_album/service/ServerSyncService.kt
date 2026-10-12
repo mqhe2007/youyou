@@ -216,7 +216,7 @@ class ServerSyncService @Inject constructor(
             )
             repairStoredIdentity(normalizedUrl, info)
             _activity.value = ServerSyncActivity(phase = ServerSyncPhase.APPLYING)
-            val previousState = serverSyncStateDao.get()
+            val previousState = migrateLegacyNamespace(serverSyncStateDao.get(), normalizedUrl)
             val report = if (hasIncrementalCursor(
                     previousState?.serverNamespace,
                     previousState?.changesCursor,
@@ -263,6 +263,49 @@ class ServerSyncService @Inject constructor(
         if (connection.serverInstanceId == instanceId && connection.userId == userId) return
         Log.d(TAG, "server identity changed; repairing stored connection")
         serverConnectionStore.updateIdentity(serverInstanceId = instanceId, userId = userId)
+    }
+
+    /**
+     * 命名空间从「仅地址」升级为「地址+实例+用户」后的平滑迁移。
+     *
+     * 旧投影挂在旧式命名空间下；若旧命名空间恰好是本地址的旧式推导且游标有效，
+     * 就把本机所有身份行（投影/标签/关联/导出/同步状态）整批改名到新命名空间并
+     * 保留游标——升级后的首次同步继续走增量，不做整库重建。
+     *
+     * 可达场景（配对/换绑都经连接页清库）中旧数据必然属于同一身份；同址换用户
+     * 的盲区在这里延续旧行为，自本次迁移后由身份化命名空间覆盖。改名失败会退化为
+     * 正常的整库重建（hasIncrementalCursor 不成立），不丢数据。
+     */
+    private suspend fun migrateLegacyNamespace(
+        state: ServerSyncStateEntity?,
+        baseUrl: String,
+    ): ServerSyncStateEntity? {
+        if (state == null) return null
+        val oldNamespace = state.serverNamespace
+        if (oldNamespace.isBlank() || oldNamespace == serverNamespace) return null
+        if (state.changesCursor.isBlank()) return null
+        if (!isLegacyStyleNamespace(oldNamespace, baseUrl, contentHashService::sha256HexForString)) {
+            return null
+        }
+        return try {
+            database.withTransaction {
+                serverProjectionDao.renameNamespace(oldNamespace, serverNamespace)
+                database.tagDao().renameNamespace(oldNamespace, serverNamespace)
+                database.tagDao().renameRelationNamespace(oldNamespace, serverNamespace)
+                database.serverExportDao().renameNamespace(oldNamespace, serverNamespace)
+                serverSyncStateDao.upsert(
+                    state.copy(
+                        serverNamespace = serverNamespace,
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                )
+            }
+            Log.d(TAG, "legacy namespace migrated: $oldNamespace -> $serverNamespace")
+            state.copy(serverNamespace = serverNamespace)
+        } catch (e: Exception) {
+            Log.w(TAG, "legacy namespace migration failed; falling back to bootstrap", e)
+            null
+        }
     }
 
     /**
@@ -740,6 +783,19 @@ internal fun serverEntityLocalId(
 ): String {
     val digest = contentHashService.sha256HexForString("$namespace:$entity:$remoteId")
     return "t${digest.substring(0, 32)}"
+}
+
+/**
+ * 旧式命名空间判定（升级迁移用）：命名空间必须确实由旧算法「仅地址哈希」产生。
+ * [sha256Hex] 参数化以便单测；生产传入 ContentHashService.sha256HexForString。
+ */
+internal fun isLegacyStyleNamespace(
+    namespace: String,
+    baseUrl: String,
+    sha256Hex: (String) -> String,
+): Boolean {
+    val candidates = setOf(baseUrl, baseUrl.trimEnd('/'))
+    return candidates.any { "server_${sha256Hex(it).substring(0, 16)}" == namespace }
 }
 
 /**

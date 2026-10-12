@@ -48,6 +48,14 @@ interface TagDao {
     @Query("SELECT t.* FROM tags_table t INNER JOIN photo_tags_table pt ON t.id = pt.tag_id WHERE pt.photo_id = :photoId")
     suspend fun getTagsForPhoto(photoId: String): List<TagEntity>
 
+    /** 命名空间升级迁移：服务端标签整批改名。 */
+    @Query("UPDATE tags_table SET server_namespace = :newNamespace WHERE server_namespace = :oldNamespace")
+    suspend fun renameNamespace(oldNamespace: String, newNamespace: String): Int
+
+    /** 命名空间升级迁移：标签关联整批改名。 */
+    @Query("UPDATE photo_tags_table SET server_namespace = :newNamespace WHERE server_namespace = :oldNamespace")
+    suspend fun renameRelationNamespace(oldNamespace: String, newNamespace: String): Int
+
     /**
      * 标签详情与时间线同源派生三态，避免同一媒体在不同入口显示成不同同步状态。
      */

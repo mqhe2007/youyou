@@ -23,6 +23,10 @@ interface ServerExportDao {
     @Query("DELETE FROM server_media_exports WHERE server_namespace = :namespace")
     suspend fun deleteByNamespace(namespace: String)
 
+    /** 命名空间升级迁移：把旧式命名空间整批改名。 */
+    @Query("UPDATE server_media_exports SET server_namespace = :newNamespace WHERE server_namespace = :oldNamespace")
+    suspend fun renameNamespace(oldNamespace: String, newNamespace: String): Int
+
     @Query("DELETE FROM server_media_exports")
     suspend fun deleteAll()
 }
