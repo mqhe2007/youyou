@@ -35,7 +35,7 @@ struct UploadRow {
     expected_sha256: String,
     mime_type: Option<String>,
     file_name: String,
-    taken_at: Option<i64>,
+    naming_at: Option<i64>,
 }
 
 struct UploadTarget {
@@ -162,7 +162,14 @@ async fn stream_upload_with_destination(
         expected_sha256: expected_sha256.clone(),
         mime_type: mime_type.map(|s| s.to_owned()),
         file_name: file_name.to_owned(),
-        taken_at,
+        // A download may only have a stable fallback time. Use it for the path while
+        // keeping the original capture metadata and timeline source for indexing.
+        naming_at: crate::media_time::valid(taken_at).or_else(|| {
+            timeline
+                .as_ref()
+                .filter(|time| crate::media_time::rank(&time.source) > 0)
+                .and_then(|time| crate::media_time::valid(time.at))
+        }),
     };
 
     let staged_path = tmp_dir.join(format!("{}.stream", upload.id));
@@ -246,7 +253,7 @@ async fn stream_upload_with_destination(
         storage,
         &entry,
         upload.mime_type.as_deref().map(Some),
-        upload.taken_at.map(Some),
+        taken_at.map(Some),
         timeline,
         Some(original_name.unwrap_or(file_name)),
         declared,
@@ -283,7 +290,7 @@ async fn resolve_upload_target(
     library_root: Option<&str>,
 ) -> AppResult<UploadTarget> {
     let canonical_name = canonical_upload_name(upload);
-    let date_directory = upload_date_directory(&canonical_name, upload.taken_at);
+    let date_directory = upload_date_directory(&canonical_name, upload.naming_at);
     let base_directory = match library_root {
         Some(root) => format!("{root}/{USER_UPLOAD_SUBDIRECTORY}/{date_directory}"),
         None => format!("{USER_UPLOAD_SUBDIRECTORY}/{date_directory}"),
@@ -449,7 +456,7 @@ fn canonical_upload_name(upload: &UploadRow) -> String {
         "IMG_"
     };
     if let Some((year, month, day, hour, minute, second, millisecond)) =
-        upload_timestamp_components(upload.taken_at)
+        upload_timestamp_components(upload.naming_at)
     {
         let stamp = if millisecond > 0 {
             format!("{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}_{millisecond:03}")
@@ -465,11 +472,11 @@ fn canonical_upload_name(upload: &UploadRow) -> String {
     )
 }
 
-fn upload_date_directory(file_name: &str, taken_at: Option<i64>) -> String {
+fn upload_date_directory(file_name: &str, naming_at: Option<i64>) -> String {
     parse_rule_name(file_name)
         .map(|parts| format!("{:04}/{:02}", parts.0, parts.1))
         .or_else(|| {
-            upload_timestamp_components(taken_at)
+            upload_timestamp_components(naming_at)
                 .map(|parts| format!("{:04}/{:02}", parts.0, parts.1))
         })
         .unwrap_or_else(|| "unknown".to_owned())

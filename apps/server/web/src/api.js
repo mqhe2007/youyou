@@ -4,7 +4,7 @@ const ERROR_MESSAGES = {
   unauthorized: '登录已失效，请重新登录。',
   forbidden: '当前会话没有执行这项操作的权限。',
   invalid_request: '提交的信息不完整或格式不正确。',
-  conflict: '当前操作暂时无法进行，请先检查正在运行的任务。',
+  conflict: '当前操作与现有状态冲突，请刷新后重试。',
   storage_read_only: '存储目录为只读，无法执行写入操作。',
   storage_unavailable: '存储目录暂时不可用，请检查目录和权限。',
   invalid_path: '路径无效。',
@@ -28,6 +28,10 @@ function readCookie(name) {
 }
 
 export function getApiErrorMessage(error) {
+  if (error?.code === 'conflict' && typeof error.message === 'string' && error.message.trim()) {
+    return error.message.trim();
+  }
+
   if (error?.code && ERROR_MESSAGES[error.code]) {
     return ERROR_MESSAGES[error.code];
   }

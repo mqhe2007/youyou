@@ -405,7 +405,11 @@ async function deleteTargets(preferred = null) {
       ? `文件夹「${targets[0].item.name}」`
       : `「${targets[0].item.name}」`)
     : `${targets.length} 项`;
-  if (!window.confirm(`确定删除${label}？此操作不可撤销。`)) return;
+  const notice = [
+    targets.some((target) => target.kind === 'media') ? '照片和视频将移入回收站，30 天内可恢复。' : '',
+    targets.some((target) => target.kind === 'folder') ? '仅可删除空文件夹。' : '',
+  ].join('');
+  if (!window.confirm(`确定删除${label}？${notice}`)) return;
 
   closeContextMenu();
   busy.value = 'delete';

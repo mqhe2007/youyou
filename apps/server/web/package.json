@@ -5,6 +5,7 @@
   "description": "柚柚相册管理端",
   "type": "module",
   "scripts": {
+    "test": "node --test src/*.test.js",
     "build": "vite build",
     "dev": "vite",
     "preview": "vite preview"

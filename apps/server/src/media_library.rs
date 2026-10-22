@@ -1056,7 +1056,7 @@ async fn delete_empty_folder(
     .fetch_one(pool)
     .await?;
     if indexed == 1 {
-        return Err(AppError::Conflict("folder is not empty".to_owned()));
+        return Err(crate::storage::StorageError::NotEmpty(path.to_owned()).into());
     }
     storage.delete_empty_dir(path).await?;
     Ok(())

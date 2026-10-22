@@ -525,6 +525,56 @@ def run_acceptance() -> None:
                     f"upload did not land in the user library: {upload_result}"
                 )
 
+            # A downloaded photo can have a stable modified time without any capture metadata.
+            fallback_bytes = PNG_1X1 + b"downloaded-photo-fallback-time"
+            fallback_name = "mmexport-fallback.png"
+            fallback_at = 1791815181000  # 2026-10-12 22:26:21 +08:00
+            fallback_headers = {
+                "Content-Type": "application/octet-stream",
+                "X-Expected-Size": str(len(fallback_bytes)),
+                "X-Expected-SHA256": hashlib.sha256(fallback_bytes).hexdigest(),
+                "X-File-Name": fallback_name,
+                "X-Mime-Type": "image/png",
+                "X-Original-Name": fallback_name,
+                "X-Time-Version": "1",
+                "X-Sort-At": str(fallback_at),
+                "X-Sort-Source": "modified",
+            }
+            expected_path = "nested/uploads/2026/10/IMG_20261012_142621.png"
+            fallback_id = None
+            for _ in range(2):
+                body = assert_status(
+                    client.request(
+                        "POST",
+                        "/api/v1/media/upload",
+                        body=fallback_bytes,
+                        headers=fallback_headers,
+                        bearer=device_token,
+                    ),
+                    200,
+                    "upload photo with fallback time",
+                )
+                result = json.loads(body)
+                if result["path"] != expected_path:
+                    raise AcceptanceError(f"fallback upload path is incorrect: {result}")
+                if fallback_id is not None and result["mediaId"] != fallback_id:
+                    raise AcceptanceError("fallback upload retry created a second media asset")
+                fallback_id = result["mediaId"]
+            if (media_root / expected_path).read_bytes() != fallback_bytes:
+                raise AcceptanceError("fallback upload content changed")
+            detail = assert_status(
+                client.json("GET", f"/api/v1/media/{fallback_id}", bearer=device_token),
+                200,
+                "fallback upload detail",
+            )
+            if (
+                detail.get("sortAt") != fallback_at
+                or detail.get("sortSource") != "modified"
+                or detail.get("takenAt") is not None
+                or detail.get("originalName") != fallback_name
+            ):
+                raise AcceptanceError(f"fallback upload time provenance changed: {detail}")
+
             forbidden = client.json(
                 "GET",
                 "/api/v1/admin/storage",
@@ -630,7 +680,7 @@ def run_acceptance() -> None:
 
         print("real HTTP E2E passed: setup, user+library binding, per-user pairing, scan,")
         print("bootstrap, changes, media, range, thumbnail, tag relation, stream upload,")
-        print("authorization, storage switch, restart")
+        print("fallback-time upload and retry, authorization, storage switch, restart")
 
 
 def main() -> int:

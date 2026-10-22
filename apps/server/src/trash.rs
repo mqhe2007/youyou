@@ -2,7 +2,7 @@
 //!
 //! 设计约束（需求 UoN5J--JHK_R §5/§6）：
 //!
-//! * 回收站位于全部可扫描用户库树之外，且与媒体源同文件系统；不满足则在启动/
+//! * 回收站位于全部可扫描用户库树之外，且与媒体源可双向原子移动；不满足则在启动/
 //!   配置校验阶段禁用删除能力，绝不隐式 `copy + delete`。
 //! * 文件系统与 SQLite 不能共用原子事务，因此以 `media_operations` 持久化操作
 //!   阶段（`initiated` / `files_moved` / `committed`），崩溃后按阶段与文件系统
@@ -166,7 +166,55 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
             ));
         }
     }
+    // Bind mounts can report the same device number while rename still fails with EXDEV.
+    // Exercise the same no-replace primitive used by deletion and restore before enabling them.
+    let probe_storage = storage.clone();
+    let probe_trash = canonical.clone();
+    tokio::task::spawn_blocking(move || probe_atomic_move(&probe_storage, &probe_trash))
+        .await
+        .map_err(|error| format!("回收站文件移动检查失败：{error}"))?
+        .map_err(|error| {
+            format!(
+                "媒体目录 {} 与回收站 {} 之间无法安全移动文件：{}",
+                storage.display(),
+                canonical.display(),
+                move_error_reason(&error)
+            )
+        })?;
     Ok(canonical)
+}
+
+fn probe_atomic_move(storage_root: &Path, trash_root: &Path) -> std::io::Result<()> {
+    let name = format!(".youyou-trash-probe-{}", Uuid::new_v4());
+    let source = storage_root.join(&name);
+    let target = trash_root.join(&name);
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source)?,
+    );
+    let mut current = &source;
+    let result = (|| {
+        rename_without_replace(&source, &target)?;
+        current = &target;
+        rename_without_replace(&target, &source)?;
+        current = &source;
+        Ok(())
+    })();
+    // Only remove the probe we created, at its last successfully moved location.
+    let cleanup = std::fs::remove_file(current);
+    result.and(cleanup)
+}
+
+fn move_error_reason(error: &std::io::Error) -> String {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EXDEV) {
+        return format!(
+            "媒体目录和回收站位于不同挂载点。请将两者放在同一个挂载卷内，并将 {TRASH_DIR_ENV} 设置为该卷内、媒体存储根之外的回收站目录"
+        );
+    }
+    error.to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1445,8 +1493,9 @@ async fn move_same_device(source: &Path, target: &Path) -> Result<(), MoveError>
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Err(MoveError::Missing),
         Err(error) => Err(MoveError::Other(format!(
-            "移动 {} 失败：{error}",
-            source.display()
+            "移动 {} 失败：{}",
+            source.display(),
+            move_error_reason(&error)
         ))),
     }
 }

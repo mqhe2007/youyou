@@ -1,9 +1,12 @@
-.PHONY: web-build server-check server-test contract-check docker-build docker-check client-check client-test e2e e2e-android e2e-android-server benchmark acceptance beta-check beta-apk
+.PHONY: web-build web-test server-check server-test contract-check docker-build docker-check client-check client-test e2e e2e-trash-docker e2e-android e2e-android-server benchmark acceptance beta-check beta-apk
 
 web-build:
 	cd apps/server/web && npm ci && npm run build
 
-server-check: web-build
+web-test:
+	cd apps/server/web && npm test
+
+server-check: web-build web-test
 	cd apps/server && cargo fmt --all -- --check && cargo check --all-targets --locked && cargo clippy --all-targets --locked -- -D warnings
 
 server-test: web-build
@@ -28,6 +31,11 @@ client-test:
 e2e: web-build contract-check
 	cargo build --manifest-path apps/server/Cargo.toml --locked
 	python3 scripts/e2e_http.py
+
+# 回收站真实容器验证：共同挂载内上传/删除/恢复，以及跨挂载点的能力校验。
+e2e-trash-docker:
+	docker build --file apps/server/Dockerfile --tag youyou-server:delete-regression .
+	python3 scripts/e2e_trash_docker.py
 
 # Android E2E 测试（默认走模拟器路径）
 # 自动检测/启动模拟器，运行全部 androidTest（UI + 业务功能）

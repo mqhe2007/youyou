@@ -3668,6 +3668,11 @@ async fn admin_media_library_browse_mkdir_move_upload_and_delete() {
     )
     .await;
     assert_eq!(nonempty_delete.status(), StatusCode::CONFLICT);
+    let body = to_bytes(nonempty_delete.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["code"], "directory_not_empty");
 
     let upload_hash = hex::encode(Sha256::digest(&jpeg_bytes));
     let upload_builder = Request::builder()
@@ -3713,6 +3718,226 @@ async fn admin_media_library_browse_mkdir_move_upload_and_delete() {
 }
 
 #[tokio::test]
+async fn admin_unknown_photo_delete_reports_storage_failure_without_active_jobs() {
+    let data = tempdir().unwrap();
+    let media = tempdir().unwrap();
+    let state = initialize(data.path(), media.path()).await.unwrap();
+    let token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+    let (admin, csrf, device) = establish_user_device(&app, token.trim(), "library").await;
+    let bytes = photo_bytes(b"admin-delete-unknown-photo");
+    let response = stream_upload_request(
+        &app,
+        &device,
+        "mmexport.jpg",
+        Some("image/jpeg"),
+        None,
+        &bytes,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let uploaded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id = uploaded["mediaId"].as_str().unwrap();
+    let path = uploaded["path"].as_str().unwrap();
+    assert!(path.starts_with("library/uploads/unknown/IMG_nodate_"));
+
+    let trash = state.trash.snapshot().await;
+    assert!(trash.enabled);
+    // A real filesystem obstacle introduced after configuration passed validation.
+    let obstacle = trash.root.join(id);
+    tokio::fs::write(&obstacle, b"occupied directory path")
+        .await
+        .unwrap();
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running', 'interrupted')",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(active_jobs, 0);
+
+    let endpoint = format!("/api/v1/admin/media-library/entries?kind=media&target={id}");
+    let response = request(
+        &app,
+        Method::DELETE,
+        &endpoint,
+        None,
+        Some(&admin),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["code"], "conflict");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("创建目标目录失败")
+    );
+    assert_eq!(
+        tokio::fs::read(media.path().join(path)).await.unwrap(),
+        bytes
+    );
+    assert_eq!(media_detail(&app, &device, id).await["id"], id);
+
+    tokio::fs::remove_file(&obstacle).await.unwrap();
+    let response = request(
+        &app,
+        Method::DELETE,
+        &endpoint,
+        None,
+        Some(&admin),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!media.path().join(path).exists());
+    let trash_path: String = sqlx::query_scalar(
+        "SELECT trash_path FROM trash_entries WHERE media_id = ?1 AND state = 'active'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::fs::read(trash.root.join(trash_path)).await.unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn modern_upload_uses_fallback_time_for_name_and_directory() {
+    let data = tempdir().unwrap();
+    let media = tempdir().unwrap();
+    let state = initialize(data.path(), media.path()).await.unwrap();
+    let token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+    let (_, _, device) = establish_user_device(&app, token.trim(), "library").await;
+    // 2026-10-12 22:26:21 +08:00; generated names follow the existing UTC convention.
+    let fallback_at = 1_791_815_181_000_i64;
+    let mut uploaded = Vec::new();
+
+    for source in ["modified", "added"] {
+        let original_name = format!("mmexport-{source}.jpg");
+        let bytes = photo_bytes(original_name.as_bytes());
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let headers = [
+            ("X-Time-Version", "1"),
+            ("X-Sort-Source", source),
+            ("X-Sort-At", "1791815181000"),
+            ("X-Original-Name", original_name.as_str()),
+        ];
+        let expected_path = if source == "modified" {
+            "library/uploads/2026/10/IMG_20261012_142621.jpg".to_owned()
+        } else {
+            // Different photos with the same fallback second must not overwrite each other.
+            format!(
+                "library/uploads/2026/10/IMG_20261012_142621_h{}.jpg",
+                &hash[..8]
+            )
+        };
+        let mut media_id = None;
+        for _ in 0..2 {
+            let response = stream_upload_request_with_headers(
+                &app,
+                &device,
+                &original_name,
+                Some("image/jpeg"),
+                None,
+                &headers,
+                &bytes,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["path"], expected_path);
+            let id = result["mediaId"].as_str().unwrap().to_owned();
+            if let Some(previous) = &media_id {
+                assert_eq!(&id, previous, "retry must return the same media");
+            }
+            media_id = Some(id);
+            assert_eq!(
+                tokio::fs::read(media.path().join(&expected_path))
+                    .await
+                    .unwrap(),
+                bytes
+            );
+        }
+        uploaded.push((media_id.unwrap(), original_name, source));
+    }
+
+    // A later directory scan must retain the fallback source, even though the new name has a date.
+    for rescan in [false, true] {
+        if rescan {
+            scan::scan_directory(&state.db, state.storage.clone(), "fallback-upload-rescan")
+                .await
+                .unwrap();
+        }
+        for (id, original_name, source) in &uploaded {
+            let detail = media_detail(&app, &device, id).await;
+            assert_eq!(detail["sortAt"], fallback_at);
+            assert_eq!(detail["sortSource"], *source);
+            assert_eq!(detail["originalName"], *original_name);
+            assert!(detail["takenAt"].is_null());
+        }
+    }
+    assert_ne!(uploaded[0].0, uploaded[1].0);
+    assert!(!media.path().join("library/uploads/unknown").exists());
+}
+
+#[tokio::test]
+async fn modern_upload_without_usable_time_keeps_unknown_path() {
+    let data = tempdir().unwrap();
+    let media = tempdir().unwrap();
+    let state = initialize(data.path(), media.path()).await.unwrap();
+    let token = tokio::fs::read_to_string(&state.setup_token_path)
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (_, _, device) = establish_user_device(&app, token.trim(), "library").await;
+
+    for (source, sort_at) in [
+        ("unknown", None),
+        ("modified", Some("0")),
+        ("added", Some("1791815181")), // Seconds must not be accepted as milliseconds.
+        ("modified", Some("9223372036854775807")),
+        ("unknown", Some("1791815181000")),
+    ] {
+        let bytes = photo_bytes(format!("{source}-{sort_at:?}").as_bytes());
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut headers = vec![("X-Time-Version", "1"), ("X-Sort-Source", source)];
+        if let Some(at) = sort_at {
+            headers.push(("X-Sort-At", at));
+        }
+        let response = stream_upload_request_with_headers(
+            &app,
+            &device,
+            "plain.jpg",
+            Some("image/jpeg"),
+            None,
+            &headers,
+            &bytes,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            result["path"],
+            format!("library/uploads/unknown/IMG_nodate_h{}.jpg", &hash[..8])
+        );
+    }
+}
+
+#[tokio::test]
 async fn modern_upload_preserves_original_time_provenance() {
     let data = tempdir().unwrap();
     let media = tempdir().unwrap();
@@ -3744,6 +3969,12 @@ async fn modern_upload_preserves_original_time_provenance() {
     assert_eq!(response.status(), StatusCode::OK);
     let json: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        json["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/uploads/2025/01/IMG_20250101_000000.jpg")
+    );
     let id = json["mediaId"].as_str().unwrap();
     let detail = request(
         &app,
