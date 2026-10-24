@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     db::{begin_write, now_millis},
     error::{AppError, AppResult},
+    storage::{LocalFilesystemStorageDriver, StorageDriver},
     sync,
 };
 
@@ -64,7 +65,8 @@ pub async fn create_user(
 
     // 媒体库目录与用户绑死后随创建落盘；同名目录已存在则直接复用。
     let directory = storage_root.join(&library_name);
-    tokio::fs::create_dir_all(&directory)
+    LocalFilesystemStorageDriver::new(storage_root)?
+        .mkdir(&library_name)
         .await
         .map_err(|error| {
             AppError::Conflict(format!("无法创建媒体库目录 {library_name}: {error}"))
@@ -308,8 +310,8 @@ pub async fn bind_user_library(
     let library_name = validate_library_name(library_name)?;
     ensure_no_active_scan(pool).await?;
 
-    let directory = storage_root.join(&library_name);
-    tokio::fs::create_dir_all(&directory)
+    LocalFilesystemStorageDriver::new(storage_root)?
+        .mkdir(&library_name)
         .await
         .map_err(|error| {
             AppError::Conflict(format!("无法创建媒体库目录 {library_name}: {error}"))

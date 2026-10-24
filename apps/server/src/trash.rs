@@ -2,7 +2,7 @@
 //!
 //! 设计约束（需求 UoN5J--JHK_R §5/§6）：
 //!
-//! * 回收站位于全部可扫描用户库树之外，且与媒体源可双向原子移动；不满足则在启动/
+//! * 回收站使用存储层隔离的专用目录或位于媒体存储根之外，且与媒体源可双向原子移动；不满足则在启动/
 //!   配置校验阶段禁用删除能力，绝不隐式 `copy + delete`。
 //! * 文件系统与 SQLite 不能共用原子事务，因此以 `media_operations` 持久化操作
 //!   阶段（`initiated` / `files_moved` / `committed`），崩溃后按阶段与文件系统
@@ -64,7 +64,7 @@ impl TrashConfig {
 #[derive(Clone)]
 pub struct TrashRuntime {
     config: Arc<RwLock<TrashConfig>>,
-    lock: Arc<Mutex<()>>,
+    pub(crate) lock: Arc<Mutex<()>>,
 }
 
 impl TrashRuntime {
@@ -87,8 +87,8 @@ impl TrashRuntime {
     }
 }
 
-/// 解析回收站目录：`YOUYOU_TRASH_DIR` 优先，缺省为服务端目录下的 `trash/`。
-pub fn resolve_trash_dir(server_dir: &Path) -> PathBuf {
+/// 显式配置优先；保留既有外置回收站，新实例默认使用媒体根内的保留目录。
+pub fn resolve_trash_dir(server_dir: &Path, storage_root: &Path) -> PathBuf {
     match std::env::var_os(TRASH_DIR_ENV) {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);
@@ -98,13 +98,14 @@ pub fn resolve_trash_dir(server_dir: &Path) -> PathBuf {
                 server_dir.join(path)
             }
         }
-        _ => server_dir.join("trash"),
+        _ if server_dir.join("trash").exists() => server_dir.join("trash"),
+        _ => storage_root.join(crate::storage::INTERNAL_TRASH_DIR),
     }
 }
 
 /// 校验并准备回收站目录。任一项不满足都返回禁用原因，由调用方禁用删除能力。
 pub async fn prepare(server_dir: &Path, storage_root: &Path) -> TrashConfig {
-    let root = resolve_trash_dir(server_dir);
+    let root = resolve_trash_dir(server_dir, storage_root);
     let configured = root.display().to_string();
     match inspect(&root, storage_root).await {
         Ok(canonical) => TrashConfig {
@@ -131,6 +132,15 @@ pub async fn prepare(server_dir: &Path, storage_root: &Path) -> TrashConfig {
 }
 
 async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
+    if root
+        .file_name()
+        .is_some_and(|name| name == crate::storage::INTERNAL_TRASH_DIR)
+        && tokio::fs::symlink_metadata(root)
+            .await
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err("内置回收站不能使用符号链接".to_owned());
+    }
     tokio::fs::create_dir_all(root)
         .await
         .map_err(|error| format!("无法创建回收站目录 {}：{error}", root.display()))?;
@@ -140,9 +150,19 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
     let storage = tokio::fs::canonicalize(storage_root)
         .await
         .map_err(|error| format!("无法解析媒体存储根 {}：{error}", storage_root.display()))?;
-    if canonical == storage || canonical.starts_with(&storage) {
+    let internal = storage.join(crate::storage::INTERNAL_TRASH_DIR);
+    if canonical == internal
+        && tokio::fs::symlink_metadata(root)
+            .await
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+    {
+        return Err("内置回收站不能使用符号链接".to_owned());
+    }
+    if canonical == storage || (canonical.starts_with(&storage) && canonical != internal) {
         return Err(format!(
-            "回收站目录 {} 位于媒体存储根 {} 之内（属于可扫描树），请配置到存储根之外（环境变量 {TRASH_DIR_ENV}）",
+            "回收站目录 {} 位于媒体存储根 {} 之内（属于可扫描树），请使用存储根下的 .youyou-trash 或配置到存储根之外（环境变量 {TRASH_DIR_ENV}）",
             canonical.display(),
             storage.display()
         ));
@@ -211,7 +231,7 @@ fn move_error_reason(error: &std::io::Error) -> String {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::EXDEV) {
         return format!(
-            "媒体目录和回收站位于不同挂载点。请将两者放在同一个挂载卷内，并将 {TRASH_DIR_ENV} 设置为该卷内、媒体存储根之外的回收站目录"
+            "媒体目录和回收站位于不同挂载点。请将两者放在同一个挂载卷内，并将 {TRASH_DIR_ENV} 设置为照片存储根下的 .youyou-trash 目录"
         );
     }
     error.to_string()
@@ -1642,6 +1662,7 @@ async fn verify_parent_within_storage(
     storage: &LocalFilesystemStorageDriver,
     target_path: &str,
 ) -> AppResult<()> {
+    LocalFilesystemStorageDriver::normalize_relative(target_path)?;
     // 存储根自身可能包含符号链接（例如 macOS 的 /var → /private/var），
     // 必须与目标一起规范化后再比较，否则合法路径会被误判为越界。
     let canonical_root = tokio::fs::canonicalize(storage.root())
@@ -1658,7 +1679,13 @@ async fn verify_parent_within_storage(
             let canonical = tokio::fs::canonicalize(&absolute)
                 .await
                 .map_err(|error| AppError::Internal(error.into()))?;
-            if !canonical.starts_with(&canonical_root) {
+            if !canonical.starts_with(&canonical_root)
+                || crate::storage::is_reserved_path(
+                    canonical
+                        .strip_prefix(&canonical_root)
+                        .unwrap_or(&canonical),
+                )
+            {
                 return Err(AppError::Conflict(format!(
                     "恢复目标目录解析后越出存储根：{probe}"
                 )));

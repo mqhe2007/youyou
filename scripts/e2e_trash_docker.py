@@ -13,13 +13,13 @@ import tempfile
 import time
 import uuid
 
-from e2e_http import AcceptanceError, HttpClient, PASSWORD, PNG_1X1, assert_status, find_free_port
+from e2e_http import AcceptanceError, HttpClient, PASSWORD, PNG_1X1, assert_status, find_free_port, poll_job
 
 
 IMAGE = os.environ.get("YOUYOU_TRASH_TEST_IMAGE", "youyou-server:delete-regression")
 
 
-def verify_layout(split_mount: bool) -> None:
+def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
     with tempfile.TemporaryDirectory(prefix="youyou-trash-docker-") as temporary:
         root = Path(temporary)
         (root / "media").mkdir()
@@ -34,6 +34,8 @@ def verify_layout(split_mount: bool) -> None:
             "--env", "RUST_LOG=warn",
             "--volume", f"{root}:/srv/youyou",
         ]
+        if external_trash:
+            command += ["--env", "YOUYOU_TRASH_DIR=trash"]
         if split_mount:
             command += ["--volume", f"{root / 'media'}:/srv/youyou/media"]
         subprocess.run(command + [IMAGE], check=True, capture_output=True)
@@ -93,7 +95,7 @@ def verify_layout(split_mount: bool) -> None:
                 "DELETE", f"/api/v1/admin/media-library/entries?kind=media&target={upload['mediaId']}",
                 bearer=admin, csrf=csrf,
             )
-            if split_mount:
+            if split_mount and external_trash:
                 error = json.loads(assert_status(deleted, 409, "reject cross-mount deletion"))
                 assert original.read_bytes() == content
                 if capability["enabled"]:
@@ -109,6 +111,12 @@ def verify_layout(split_mount: bool) -> None:
             assert capability["enabled"], capability
             assert_status(deleted, 204, "delete unknown photo")
             assert not original.exists()
+            scan = assert_status(client.json("POST", "/api/v1/admin/jobs/scan",
+                                 bearer=admin, csrf=csrf), 202, "rescan with internal trash")
+            poll_job(client, scan["id"], bearer=admin, admin=True)
+            media = assert_status(client.json("GET", "/api/v1/media", bearer=device),
+                                  200, "read media after rescan")
+            assert not media["items"], "deleted photo was indexed from trash"
             trash = assert_status(client.json("GET", "/api/v1/admin/trash", bearer=admin),
                                   200, "read deleted photo")
             entries = [entry for entry in trash["entries"] if entry["mediaId"] == upload["mediaId"]]
@@ -120,7 +128,8 @@ def verify_layout(split_mount: bool) -> None:
             assert not restored["failures"]
             assert original.read_bytes() == content
             assert not list(root.rglob(".youyou-trash-probe-*")), "probe files were not cleaned up"
-            print("Docker shared mount: unknown photo uploaded, deleted, and restored with identical bytes")
+            assert (root / "media/.youyou-trash").is_dir()
+            print(f"Docker internal trash (split_mount={split_mount}): uploaded, deleted, restored with identical bytes")
         finally:
             subprocess.run(["docker", "rm", "--force", "--volumes", name],
                            check=False, capture_output=True)
@@ -129,4 +138,5 @@ def verify_layout(split_mount: bool) -> None:
 if __name__ == "__main__":
     verify_layout(False)
     verify_layout(True)
+    verify_layout(True, external_trash=True)
     print("real Docker trash E2E passed")

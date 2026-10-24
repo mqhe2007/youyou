@@ -21,6 +21,13 @@ use tokio::{
 };
 use uuid::Uuid;
 
+/// Reserved on every level, including canonical paths reached through symlinks.
+pub const INTERNAL_TRASH_DIR: &str = ".youyou-trash";
+
+pub fn is_reserved_path(path: &Path) -> bool {
+    path.components().any(|part| matches!(part, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(INTERNAL_TRASH_DIR)))
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("invalid storage path: {0}")]
@@ -121,6 +128,11 @@ pub struct LocalFilesystemStorageDriver {
 impl LocalFilesystemStorageDriver {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let root = std::fs::canonicalize(root.as_ref())?;
+        if is_reserved_path(&root) {
+            return Err(StorageError::InvalidPath(
+                "reserved trash directory".to_owned(),
+            ));
+        }
         let metadata = std::fs::metadata(&root)?;
         if !metadata.is_dir() {
             return Err(StorageError::NotDirectory(root.display().to_string()));
@@ -135,6 +147,11 @@ impl LocalFilesystemStorageDriver {
     pub fn normalize_relative(relative: &str) -> Result<String, StorageError> {
         if relative.is_empty() || relative == "." {
             return Ok(String::new());
+        }
+        if is_reserved_path(Path::new(relative)) {
+            return Err(StorageError::InvalidPath(
+                "reserved trash directory".to_owned(),
+            ));
         }
         if relative.contains('\0') {
             return Err(StorageError::InvalidPath("path contains NUL".to_owned()));
@@ -175,7 +192,9 @@ impl LocalFilesystemStorageDriver {
             }
             Err(error) => return Err(StorageError::Io(error)),
         };
-        if !canonical.starts_with(&self.root) {
+        if !canonical.starts_with(&self.root)
+            || is_reserved_path(canonical.strip_prefix(&self.root).unwrap_or(&canonical))
+        {
             return Err(StorageError::OutsideRoot);
         }
         Ok((normalized, canonical))
@@ -195,6 +214,21 @@ impl LocalFilesystemStorageDriver {
         let parent = target
             .parent()
             .ok_or_else(|| StorageError::InvalidPath("path has no parent".to_owned()))?;
+        // Validate the nearest existing ancestor before creating any directories.
+        let mut ancestor = parent;
+        while !fs::try_exists(ancestor).await? {
+            ancestor = ancestor.parent().ok_or(StorageError::OutsideRoot)?;
+        }
+        let canonical_ancestor = fs::canonicalize(ancestor).await?;
+        if !canonical_ancestor.starts_with(&self.root)
+            || is_reserved_path(
+                canonical_ancestor
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&canonical_ancestor),
+            )
+        {
+            return Err(StorageError::OutsideRoot);
+        }
         fs::create_dir_all(parent).await?;
         let canonical_parent = fs::canonicalize(parent).await?;
         if !canonical_parent.starts_with(&self.root) {
@@ -202,7 +236,13 @@ impl LocalFilesystemStorageDriver {
         }
         if fs::symlink_metadata(&target).await.is_ok() {
             let canonical_target = fs::canonicalize(&target).await?;
-            if !canonical_target.starts_with(&self.root) {
+            if !canonical_target.starts_with(&self.root)
+                || is_reserved_path(
+                    canonical_target
+                        .strip_prefix(&self.root)
+                        .unwrap_or(&canonical_target),
+                )
+            {
                 return Err(StorageError::OutsideRoot);
             }
         }
@@ -257,6 +297,9 @@ impl LocalFilesystemStorageDriver {
             let mut entries = fs::read_dir(&directory).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
+                if is_reserved_path(path.strip_prefix(&self.root).unwrap_or(&path)) {
+                    continue;
+                }
                 let link_metadata = fs::symlink_metadata(&path).await?;
                 if link_metadata.file_type().is_symlink() {
                     continue;
@@ -416,6 +459,7 @@ impl StorageDriver for LocalFilesystemStorageDriver {
         let stream = try_stream! {
             while let Some(entry) = entries.next_entry().await? {
                 let entry_path = entry.path();
+                if is_reserved_path(entry_path.strip_prefix(&root).unwrap_or(&entry_path)) { continue; }
                 // 目录枚举与逐项读取之间文件可能被删除（删除/恢复正在移动原件），
                 // 消失的条目直接跳过，不能让整次列举失败。
                 let link_metadata = match fs::symlink_metadata(&entry_path).await {
@@ -577,7 +621,9 @@ impl StorageDriver for LocalFilesystemStorageDriver {
         let (_, target, _) = self.writable_parent(&normalized).await?;
         fs::create_dir_all(&target).await?;
         let canonical = fs::canonicalize(&target).await?;
-        if !canonical.starts_with(&self.root) {
+        if !canonical.starts_with(&self.root)
+            || is_reserved_path(canonical.strip_prefix(&self.root).unwrap_or(&canonical))
+        {
             return Err(StorageError::OutsideRoot);
         }
         Ok(())
@@ -690,6 +736,46 @@ mod tests {
                 io::ErrorKind::Interrupted,
                 "simulated interrupted write",
             )))
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_trash_is_hidden_and_inaccessible() {
+        let directory = tempdir().unwrap();
+        let trash = directory.path().join(INTERNAL_TRASH_DIR);
+        std::fs::create_dir(&trash).unwrap();
+        std::fs::write(trash.join("photo.jpg"), b"deleted").unwrap();
+        let driver = LocalFilesystemStorageDriver::new(directory.path()).unwrap();
+        assert!(driver.list("").await.unwrap().next().await.is_none());
+        assert!(driver.list(INTERNAL_TRASH_DIR).await.is_err());
+        assert!(
+            driver
+                .read_all(".youyou-trash/photo.jpg", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            driver
+                .write_atomic(".youyou-trash/new/file", reader(b"new"))
+                .await
+                .is_err()
+        );
+        assert!(driver.mkdir(".youyou-trash/new").await.is_err());
+        assert!(driver.delete(INTERNAL_TRASH_DIR).await.is_err());
+        assert!(LocalFilesystemStorageDriver::new(&trash).is_err());
+        assert_eq!(std::fs::read(trash.join("photo.jpg")).unwrap(), b"deleted");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&trash, directory.path().join("alias")).unwrap();
+            assert!(driver.read_all("alias/photo.jpg", None).await.is_err());
+            assert!(
+                driver
+                    .write_atomic("alias/new/file", reader(b"new"))
+                    .await
+                    .is_err()
+            );
+            assert!(driver.delete("alias").await.is_err());
+            assert!(!trash.join("new").exists());
         }
     }
 

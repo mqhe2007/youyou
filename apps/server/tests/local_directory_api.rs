@@ -4134,7 +4134,11 @@ async fn device_delete_moves_original_into_trash_and_blocks_rescan() {
     .await
     .expect("trash row");
     assert!(
-        data.path().join("trash").join(&trash_path).exists(),
+        media
+            .path()
+            .join(".youyou-trash")
+            .join(&trash_path)
+            .exists(),
         "回收站应存在原件"
     );
 
@@ -4358,6 +4362,19 @@ async fn admin_trash_restore_preserves_media_id_and_reindexes() {
     let media_id = item["id"].as_str().expect("media id").to_owned();
     let version = item["version"].as_i64().expect("version");
     device_delete(&app, &device_token, &media_id, "op-trash", Some(version)).await;
+
+    // Changing the root must not strand the originals in its internal trash.
+    let other_media = tempdir().unwrap();
+    let change_root = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/admin/storage",
+        serde_json::json!({"rootPath": other_media.path()}),
+        Some(&admin_token),
+        Some(&csrf_token),
+    )
+    .await;
+    assert_eq!(change_root.status(), StatusCode::CONFLICT);
 
     let list = request(
         &app,
@@ -4584,6 +4601,9 @@ async fn trash_prepare_disables_directory_inside_storage_tree() {
     tokio::fs::create_dir_all(&server_dir)
         .await
         .expect("server dir");
+    tokio::fs::create_dir_all(server_dir.join("trash"))
+        .await
+        .unwrap();
     let config = youyou_server::trash::prepare(&server_dir, storage.path()).await;
     assert!(!config.enabled, "回收站位于扫描树内必须禁用删除能力");
     assert!(config.blocked_reason.is_some());
@@ -4598,6 +4618,9 @@ async fn trash_prepare_enables_sibling_directory() {
     tokio::fs::create_dir_all(&server_dir)
         .await
         .expect("server");
+    tokio::fs::create_dir_all(server_dir.join("trash"))
+        .await
+        .unwrap();
     let config = youyou_server::trash::prepare(&server_dir, &storage).await;
     assert!(config.enabled, "同文件系统且扫描树之外应启用删除能力");
     assert!(config.blocked_reason.is_none());
@@ -5544,4 +5567,26 @@ async fn live_photo_real_iphone_pair_pairs_by_content_identifier() {
         still["sortAt"], still["takenAt"],
         "实况项排序时间应来自静态帧的拍摄时间"
     );
+}
+
+#[tokio::test]
+async fn trash_prepare_defaults_to_reserved_directory_inside_media() {
+    let server = tempdir().unwrap();
+    let media = tempdir().unwrap();
+    let config = youyou_server::trash::prepare(server.path(), media.path()).await;
+    assert!(config.enabled, "{:?}", config.blocked_reason);
+    assert_eq!(
+        config.root,
+        media.path().canonicalize().unwrap().join(".youyou-trash")
+    );
+    #[cfg(unix)]
+    {
+        tokio::fs::remove_dir(&config.root).await.unwrap();
+        std::os::unix::fs::symlink(server.path(), &config.root).unwrap();
+        assert!(
+            !youyou_server::trash::prepare(server.path(), media.path())
+                .await
+                .enabled
+        );
+    }
 }

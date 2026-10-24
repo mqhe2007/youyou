@@ -234,6 +234,19 @@ pub(crate) async fn update_admin_storage(
         ));
     }
     validate_storage_root(root_path, &state.data_dir)?;
+    let _trash_guard = state.trash.lock.lock().await;
+    let candidate_root = std::fs::canonicalize(root_path)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if candidate_root != state.storage.snapshot().await.root() {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM trash_entries WHERE state = 'active') OR EXISTS(SELECT 1 FROM media_operations WHERE finished_at IS NULL)",
+        ).fetch_one(&state.db).await?;
+        if pending {
+            return Err(AppError::Conflict(
+                "请先恢复或清空回收站，并完成待恢复的文件操作，再修改媒体存储根".to_owned(),
+            ));
+        }
+    }
     let active = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT EXISTS(
@@ -335,7 +348,7 @@ pub(crate) async fn update_admin_storage(
         state.storage.restore(previous).await;
         return Err(error.into());
     }
-    // 存储根变了，回收站的「同文件系统 / 不在扫描树内」校验必须重做；
+    // 存储根变了，回收站的目录隔离与原子移动校验必须重做；
     // 不满足则本机删除能力自动禁用，并在回收站接口上明确暴露原因。
     let current_storage_root = state.storage.snapshot().await.root().to_path_buf();
     let trash_config = state
