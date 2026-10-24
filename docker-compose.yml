@@ -13,10 +13,9 @@ services:
     environment:
       YOUYOU_SERVER_PORT: "${YOUYOU_SERVER_PORT:-8989}"
       YOUYOU_SERVER_DIR: /srv/youyou
-      YOUYOU_TRASH_DIR: "${YOUYOU_TRASH_DIR:-}"
       RUST_LOG: info
     volumes:
-      # Runtime directory; new instances keep trash inside the configured media root.
+      # Runtime directory; trash is always .youyou-trash inside the configured media root.
       - "${YOUYOU_SERVER_DIR:-${HOME}/youyou-server}:/srv/youyou"
     restart: unless-stopped
     healthcheck:

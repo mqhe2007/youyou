@@ -2,7 +2,7 @@
 //!
 //! 设计约束（需求 UoN5J--JHK_R §5/§6）：
 //!
-//! * 回收站使用存储层隔离的专用目录或位于媒体存储根之外，且与媒体源可双向原子移动；不满足则在启动/
+//! * 回收站固定使用媒体存储根下由存储层隔离的 .youyou-trash 目录，且与媒体源可双向原子移动；不满足则在启动/
 //!   配置校验阶段禁用删除能力，绝不隐式 `copy + delete`。
 //! * 文件系统与 SQLite 不能共用原子事务，因此以 `media_operations` 持久化操作
 //!   阶段（`initiated` / `files_moved` / `committed`），崩溃后按阶段与文件系统
@@ -35,7 +35,6 @@ use crate::{
 pub const TRASH_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const TRASH_DIR_ENV: &str = "YOUYOU_TRASH_DIR";
 
 #[derive(Debug, Clone)]
 pub struct TrashConfig {
@@ -87,27 +86,30 @@ impl TrashRuntime {
     }
 }
 
-/// 显式配置优先；保留既有外置回收站，新实例默认使用媒体根内的保留目录。
-pub fn resolve_trash_dir(server_dir: &Path, storage_root: &Path) -> PathBuf {
-    match std::env::var_os(TRASH_DIR_ENV) {
-        Some(value) if !value.is_empty() => {
-            let path = PathBuf::from(value);
-            if path.is_absolute() {
-                path
-            } else {
-                server_dir.join(path)
-            }
-        }
-        _ if server_dir.join("trash").exists() => server_dir.join("trash"),
-        _ => storage_root.join(crate::storage::INTERNAL_TRASH_DIR),
-    }
+/// 回收站固定在照片存储根内，不读取环境变量或采用旧目录。
+pub fn resolve_trash_dir(storage_root: &Path) -> PathBuf {
+    storage_root.join(crate::storage::INTERNAL_TRASH_DIR)
 }
 
 /// 校验并准备回收站目录。任一项不满足都返回禁用原因，由调用方禁用删除能力。
 pub async fn prepare(server_dir: &Path, storage_root: &Path) -> TrashConfig {
-    let root = resolve_trash_dir(server_dir, storage_root);
+    let root = resolve_trash_dir(storage_root);
     let configured = root.display().to_string();
-    match inspect(&root, storage_root).await {
+    let result = async {
+        // Do not strand originals from releases that used server_dir/trash.
+        let legacy = server_dir.join("trash");
+        match tokio::fs::read_dir(&legacy).await {
+            Ok(mut entries) => {
+                if entries.next_entry().await.map_err(|error| error.to_string())?.is_some() {
+                    return Err(format!("旧回收站 {} 仍有文件。请先使用旧版恢复或清空回收站，再升级；原件和恢复记录已保留", legacy.display()));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("无法检查旧回收站 {}：{error}", legacy.display())),
+        }
+        inspect(&root, storage_root).await
+    }.await;
+    match result {
         Ok(canonical) => TrashConfig {
             root: canonical,
             configured,
@@ -131,6 +133,30 @@ pub async fn prepare(server_dir: &Path, storage_root: &Path) -> TrashConfig {
     }
 }
 
+/// 检查旧版本自定义目录中的活跃原件，防止切换路径后到期清理误删恢复记录。
+pub async fn validate_existing_entries(
+    pool: &SqlitePool,
+    config: &mut TrashConfig,
+) -> AppResult<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT trash_path FROM trash_entries WHERE state = 'active' AND media_id NOT IN (SELECT media_id FROM media_operations WHERE finished_at IS NULL)",
+    ).fetch_all(pool).await?;
+    for path in paths {
+        if !tokio::fs::try_exists(config.root.join(&path))
+            .await
+            .unwrap_or(false)
+        {
+            config.enabled = false;
+            config.blocked_reason = Some("回收站记录对应的原件不在 .youyou-trash 内。请先使用旧版恢复或清空旧回收站，再升级；恢复记录已保留".to_owned());
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
     if root
         .file_name()
@@ -150,22 +176,8 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
     let storage = tokio::fs::canonicalize(storage_root)
         .await
         .map_err(|error| format!("无法解析媒体存储根 {}：{error}", storage_root.display()))?;
-    let internal = storage.join(crate::storage::INTERNAL_TRASH_DIR);
-    if canonical == internal
-        && tokio::fs::symlink_metadata(root)
-            .await
-            .map_err(|error| error.to_string())?
-            .file_type()
-            .is_symlink()
-    {
-        return Err("内置回收站不能使用符号链接".to_owned());
-    }
-    if canonical == storage || (canonical.starts_with(&storage) && canonical != internal) {
-        return Err(format!(
-            "回收站目录 {} 位于媒体存储根 {} 之内（属于可扫描树），请使用存储根下的 .youyou-trash 或配置到存储根之外（环境变量 {TRASH_DIR_ENV}）",
-            canonical.display(),
-            storage.display()
-        ));
+    if canonical != storage.join(crate::storage::INTERNAL_TRASH_DIR) {
+        return Err("回收站必须是照片存储根下的 .youyou-trash 实体目录".to_owned());
     }
     #[cfg(unix)]
     {
@@ -180,7 +192,7 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
             .dev();
         if trash_device != storage_device {
             return Err(format!(
-                "回收站目录 {} 与媒体存储根 {} 不在同一文件系统，无法保证原子 rename；请把 {TRASH_DIR_ENV} 配置到同一文件系统",
+                "回收站目录 {} 与媒体存储根 {} 不在同一文件系统，无法保证原子 rename；请勿单独挂载 .youyou-trash",
                 canonical.display(),
                 storage.display()
             ));
@@ -230,9 +242,7 @@ fn probe_atomic_move(storage_root: &Path, trash_root: &Path) -> std::io::Result<
 fn move_error_reason(error: &std::io::Error) -> String {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::EXDEV) {
-        return format!(
-            "媒体目录和回收站位于不同挂载点。请将两者放在同一个挂载卷内，并将 {TRASH_DIR_ENV} 设置为照片存储根下的 .youyou-trash 目录"
-        );
+        return "媒体目录和回收站位于不同挂载点。请勿单独挂载 .youyou-trash，确保它与照片目录共用挂载卷".to_owned();
     }
     error.to_string()
 }
@@ -1075,6 +1085,9 @@ pub async fn recover_pending_operations(
     runtime: &TrashRuntime,
 ) -> AppResult<()> {
     let config = runtime.snapshot().await;
+    if !config.enabled {
+        return Ok(());
+    }
     let pending = sqlx::query_as::<_, (String, String, String, Option<String>)>(
         r#"
         SELECT scope_key, id, kind, payload

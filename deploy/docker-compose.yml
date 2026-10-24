@@ -22,11 +22,10 @@ services:
     environment:
       YOUYOU_SERVER_PORT: "${YOUYOU_SERVER_PORT:-8989}"
       YOUYOU_SERVER_DIR: /srv/youyou
-      YOUYOU_TRASH_DIR: "${YOUYOU_TRASH_DIR:-}"
       RUST_LOG: info
     volumes:
       # 运行时目录：data/ 存 SQLite 与备份，media/ 是默认媒体根。
-      # 已有照片可独立挂载；新实例在媒体根内自动创建 .youyou-trash。
+      # 已有照片可独立挂载；回收站固定在媒体根内的 .youyou-trash。
       - "${YOUYOU_SERVER_DIR:-./youyou-server}:/srv/youyou"
     restart: unless-stopped
     healthcheck:

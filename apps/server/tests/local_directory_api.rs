@@ -4394,6 +4394,48 @@ async fn admin_trash_restore_preserves_media_id_and_reindexes() {
     assert_eq!(json["capability"]["retentionDays"], 30);
     assert_eq!(json["entries"].as_array().expect("entries").len(), 1);
 
+    // An upgrade from a custom external trash must not purge missing originals' records.
+    let trash_path: String = sqlx::query_scalar(
+        "SELECT trash_path FROM trash_entries WHERE media_id = ?1 AND state = 'active'",
+    )
+    .bind(&media_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let mut config = youyou_server::trash::prepare(data.path(), media.path()).await;
+    let saved = other_media.path().join("legacy-original.jpg");
+    tokio::fs::rename(config.root.join(&trash_path), &saved)
+        .await
+        .unwrap();
+    youyou_server::trash::validate_existing_entries(&db, &mut config)
+        .await
+        .unwrap();
+    assert!(!config.enabled);
+    assert!(config.blocked_reason.as_deref().unwrap().contains("原件"));
+    sqlx::query("UPDATE trash_entries SET expires_at = 0 WHERE media_id = ?1")
+        .bind(&media_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let disabled = youyou_server::trash::TrashRuntime::new(config.clone());
+    assert_eq!(
+        youyou_server::trash::run_expiry_cleanup(&db, &disabled)
+            .await
+            .unwrap(),
+        0
+    );
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trash_entries WHERE media_id = ?1 AND state = 'active'",
+    )
+    .bind(&media_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(active, 1);
+    tokio::fs::rename(&saved, config.root.join(&trash_path))
+        .await
+        .unwrap();
+
     let restore = json_request(
         &app,
         Method::POST,
@@ -4595,7 +4637,7 @@ async fn admin_purge_and_expiry_cleanup_remove_trashed_files() {
 }
 
 #[tokio::test]
-async fn trash_prepare_disables_directory_inside_storage_tree() {
+async fn trash_prepare_preserves_nonempty_legacy_directory() {
     let storage = tempdir().expect("storage");
     let server_dir = storage.path().join("server");
     tokio::fs::create_dir_all(&server_dir)
@@ -4604,13 +4646,16 @@ async fn trash_prepare_disables_directory_inside_storage_tree() {
     tokio::fs::create_dir_all(server_dir.join("trash"))
         .await
         .unwrap();
+    tokio::fs::write(server_dir.join("trash/legacy.jpg"), b"legacy")
+        .await
+        .unwrap();
     let config = youyou_server::trash::prepare(&server_dir, storage.path()).await;
-    assert!(!config.enabled, "回收站位于扫描树内必须禁用删除能力");
+    assert!(!config.enabled, "旧回收站有原件时必须保留恢复入口");
     assert!(config.blocked_reason.is_some());
 }
 
 #[tokio::test]
-async fn trash_prepare_enables_sibling_directory() {
+async fn trash_prepare_ignores_empty_legacy_directory() {
     let root = tempdir().expect("root");
     let storage = root.path().join("media");
     let server_dir = root.path().join("data");
@@ -4624,6 +4669,10 @@ async fn trash_prepare_enables_sibling_directory() {
     let config = youyou_server::trash::prepare(&server_dir, &storage).await;
     assert!(config.enabled, "同文件系统且扫描树之外应启用删除能力");
     assert!(config.blocked_reason.is_none());
+    assert_eq!(
+        config.root,
+        storage.canonicalize().unwrap().join(".youyou-trash")
+    );
 }
 
 /// 轮询到终态为止（比 wait_admin_job 更宽容：自动恢复要等 worker 的下一轮唤醒）。

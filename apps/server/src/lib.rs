@@ -77,11 +77,12 @@ pub async fn initialize(
         Err(error) => tracing::error!(error = ?error, "实况照片历史配对收敛失败"),
     }
 
-    // 回收站：先校验配置（同文件系统 + 位于扫描树之外），再恢复未完成文件操作，
+    // 回收站：先校验配置（目录隔离与原子移动），再恢复未完成文件操作，
     // 最后补一次到期清理。扫描任务在 HTTP 服务起来之后才可能被触发，因此
     // 「先恢复操作、再允许扫描」在这里得到保证。
     let server_dir = config::infer_server_dir(data_dir);
-    let trash_config = trash::prepare(&server_dir, storage_driver.root()).await;
+    let mut trash_config = trash::prepare(&server_dir, storage_driver.root()).await;
+    trash::validate_existing_entries(&db, &mut trash_config).await?;
     let trash_runtime = trash::TrashRuntime::new(trash_config);
     if let Err(error) =
         trash::recover_pending_operations(&db, storage_driver.as_ref(), &trash_runtime).await

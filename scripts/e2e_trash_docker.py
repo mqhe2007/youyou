@@ -19,7 +19,7 @@ from e2e_http import AcceptanceError, HttpClient, PASSWORD, PNG_1X1, assert_stat
 IMAGE = os.environ.get("YOUYOU_TRASH_TEST_IMAGE", "youyou-server:delete-regression")
 
 
-def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
+def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bool = False) -> None:
     with tempfile.TemporaryDirectory(prefix="youyou-trash-docker-") as temporary:
         root = Path(temporary)
         (root / "media").mkdir()
@@ -34,10 +34,13 @@ def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
             "--env", "RUST_LOG=warn",
             "--volume", f"{root}:/srv/youyou",
         ]
-        if external_trash:
+        if obsolete_env:
             command += ["--env", "YOUYOU_TRASH_DIR=trash"]
         if split_mount:
             command += ["--volume", f"{root / 'media'}:/srv/youyou/media"]
+        if mount_trash:
+            (root / "isolated-trash").mkdir()
+            command += ["--volume", f"{root / 'isolated-trash'}:/srv/youyou/media/.youyou-trash"]
         subprocess.run(command + [IMAGE], check=True, capture_output=True)
         try:
             client = HttpClient(f"http://127.0.0.1:{port}")
@@ -95,19 +98,13 @@ def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
                 "DELETE", f"/api/v1/admin/media-library/entries?kind=media&target={upload['mediaId']}",
                 bearer=admin, csrf=csrf,
             )
-            if split_mount and external_trash:
-                error = json.loads(assert_status(deleted, 409, "reject cross-mount deletion"))
-                assert original.read_bytes() == content
-                if capability["enabled"]:
-                    raise AcceptanceError(
-                        f"trash advertised as usable across separate mounts: {error['message']}"
-                    )
-                assert "挂载" in capability["blockedReason"], capability
+            if mount_trash:
+                error = json.loads(assert_status(deleted, 409, "reject separately mounted trash"))
+                assert not capability["enabled"], capability
                 assert "挂载" in error["message"], error
-                assert not list(root.rglob(".youyou-trash-probe-*")), "probe files were not cleaned up"
-                print("Docker split mount: deletion disabled with actionable reason; original preserved")
+                assert original.read_bytes() == content
+                print("Docker separately mounted trash: blocked, original preserved")
                 return
-
             assert capability["enabled"], capability
             assert_status(deleted, 204, "delete unknown photo")
             assert not original.exists()
@@ -129,6 +126,7 @@ def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
             assert original.read_bytes() == content
             assert not list(root.rglob(".youyou-trash-probe-*")), "probe files were not cleaned up"
             assert (root / "media/.youyou-trash").is_dir()
+            assert not (root / "trash").exists(), "obsolete setting created an external trash directory"
             print(f"Docker internal trash (split_mount={split_mount}): uploaded, deleted, restored with identical bytes")
         finally:
             subprocess.run(["docker", "rm", "--force", "--volumes", name],
@@ -138,5 +136,6 @@ def verify_layout(split_mount: bool, external_trash: bool = False) -> None:
 if __name__ == "__main__":
     verify_layout(False)
     verify_layout(True)
-    verify_layout(True, external_trash=True)
+    verify_layout(True, obsolete_env=True)
+    verify_layout(False, mount_trash=True)
     print("real Docker trash E2E passed")
