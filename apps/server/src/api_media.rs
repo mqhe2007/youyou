@@ -873,7 +873,7 @@ pub(crate) async fn media_thumbnail(
         size,
     )
     .await?;
-    let bytes = match render {
+    let response = match render {
         ThumbnailRender::Rendered(bytes) => {
             tokio::fs::create_dir_all(&cache_dir)
                 .await
@@ -886,12 +886,12 @@ pub(crate) async fn media_thumbnail(
                 let _ = tokio::fs::remove_file(&temporary).await;
                 return Err(AppError::Internal(error.into()));
             }
-            bytes
+            image_response(bytes)
         }
-        // 占位图不落缓存：文件修复/补上解码器后能自然恢复为真实缩略图。
-        ThumbnailRender::Placeholder(bytes) => bytes,
+        // 占位图不落磁盘缓存：文件修复/补上解码器后能自然恢复为真实缩略图。
+        ThumbnailRender::Placeholder(bytes) => placeholder_response(bytes),
     };
-    Ok(image_response(bytes))
+    Ok(response)
 }
 
 /// 缩略图渲染结果：正常渲染进入磁盘缓存，占位图不缓存。
@@ -1051,6 +1051,21 @@ pub(crate) fn image_response(bytes: Vec<u8>) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    response
+}
+
+/// 占位图响应：与真实缩略图相反，必须禁止客户端缓存。
+///
+/// 真实缩略图是 `immutable` 一年，但占位图代表「这次没能渲染」——抽帧超时、
+/// 解码器缺失、文件暂时读不到。若沿用同一套缓存头，客户端（Coil 尊重
+/// Cache-Control）会把灰块存一年，等 CPU 空闲下来也不会重新请求，用户只能
+/// 手动清缓存。`no-store` 让每次进入页面都重新尝试渲染。
+pub(crate) fn placeholder_response(bytes: Vec<u8>) -> Response {
+    let mut response = image_response(bytes);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
     );
     response
 }
@@ -1617,4 +1632,33 @@ pub(crate) async fn list_changes(
         next_cursor,
         has_more,
     }))
+}
+
+#[cfg(test)]
+mod thumbnail_cache_tests {
+    use super::*;
+
+    /// 占位图必须禁止客户端缓存，否则一次抽帧超时就会让该格子长期停在灰块上。
+    #[test]
+    fn placeholder_response_is_not_cacheable() {
+        let response = placeholder_response(vec![1, 2, 3]);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+    }
+
+    /// 真实缩略图仍按内容寻址长期缓存（URL 里带 version，换版本即换 URL）。
+    #[test]
+    fn rendered_response_stays_immutable() {
+        let response = image_response(vec![1, 2, 3]);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=31536000, immutable"
+        );
+    }
 }
