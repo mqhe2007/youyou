@@ -48,11 +48,23 @@ pub struct MediaDeleteResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TrashRootStatus {
+    /// 库名；空串表示 media 根回收站。
+    pub library: String,
+    pub directory: String,
+    pub enabled: bool,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct TrashCapability {
     pub enabled: bool,
     pub directory: String,
     pub blocked_reason: Option<String>,
     pub retention_days: u32,
+    /// 各回收站根状态（默认根 + 已登记的库内根）。
+    pub roots: Vec<TrashRootStatus>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -96,11 +108,26 @@ pub struct TrashPurgeResponse {
 }
 
 fn capability_of(config: &trash::TrashConfig) -> TrashCapability {
+    let mut roots = vec![TrashRootStatus {
+        library: String::new(),
+        directory: config.configured.clone(),
+        enabled: config.enabled,
+        blocked_reason: config.blocked_reason.clone(),
+    }];
+    for (key, root) in &config.roots {
+        roots.push(TrashRootStatus {
+            library: key.clone(),
+            directory: root.root.display().to_string(),
+            enabled: root.enabled,
+            blocked_reason: root.blocked_reason.clone(),
+        });
+    }
     TrashCapability {
         enabled: config.enabled,
         directory: config.configured.clone(),
         blocked_reason: config.blocked_reason.clone(),
         retention_days: u32::try_from(TRASH_RETENTION_MS / (24 * 60 * 60 * 1000)).unwrap_or(30),
+        roots,
     }
 }
 

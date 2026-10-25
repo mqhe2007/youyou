@@ -19,10 +19,17 @@ from e2e_http import AcceptanceError, HttpClient, PASSWORD, PNG_1X1, assert_stat
 IMAGE = os.environ.get("YOUYOU_TRASH_TEST_IMAGE", "youyou-server:delete-regression")
 
 
-def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bool = False) -> None:
+def verify_layout(
+    split_mount: bool,
+    obsolete_env: bool = False,
+    mount_trash: bool = False,
+    library_mount: bool = False,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="youyou-trash-docker-") as temporary:
         root = Path(temporary)
         (root / "media").mkdir()
+        library_host = root / "photos"
+        library_host.mkdir()
         name = f"youyou-trash-test-{uuid.uuid4().hex[:12]}"
         port = find_free_port()
         command = [
@@ -38,6 +45,9 @@ def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bo
             command += ["--env", "YOUYOU_TRASH_DIR=trash"]
         if split_mount:
             command += ["--volume", f"{root / 'media'}:/srv/youyou/media"]
+        if library_mount:
+            # README 姿势：已有照片目录单独挂载，不挂公共父目录。
+            command += ["--volume", f"{library_host}:/srv/youyou/media/library"]
         if mount_trash:
             (root / "isolated-trash").mkdir()
             command += ["--volume", f"{root / 'isolated-trash'}:/srv/youyou/media/.youyou-trash"]
@@ -86,7 +96,11 @@ def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bo
                 },
             ), 200, "upload photo without media time"))
             assert upload["path"].startswith("library/uploads/unknown/IMG_nodate_")
-            original = root / "media" / upload["path"]
+            if library_mount:
+                # 库目录在容器内是独立挂载：主机上文件落在 photos 卷，而非 media/library。
+                original = library_host / upload["path"].split("/", 1)[1]
+            else:
+                original = root / "media" / upload["path"]
             assert original.read_bytes() == content
             jobs = assert_status(client.json("GET", "/api/v1/admin/jobs", bearer=admin),
                                  200, "read jobs")
@@ -99,15 +113,28 @@ def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bo
                 bearer=admin, csrf=csrf,
             )
             if mount_trash:
-                error = json.loads(assert_status(deleted, 409, "reject separately mounted trash"))
+                # 单独挂载 media 根 .youyou-trash 会使默认根失效，但库内回收站
+                # 仍可承接库目录内的删除（issue #2：单库/单根故障隔离）。
                 assert not capability["enabled"], capability
-                assert "挂载" in error["message"], error
-                assert original.read_bytes() == content
-                print("Docker separately mounted trash: blocked, original preserved")
+                assert_status(deleted, 204, "library delete falls back to library-local trash")
+                assert not original.exists()
+                library_trash = root / "media" / "library" / ".youyou-trash"
+                assert library_trash.is_dir(), library_trash
+                assert any(p.is_file() for p in library_trash.rglob("*"))
+                print("Docker separately mounted media-root trash: library-local trash absorbed delete")
                 return
             assert capability["enabled"], capability
             assert_status(deleted, 204, "delete unknown photo")
             assert not original.exists()
+            if library_mount:
+                # 回收站跟随库目录：原件应落在库挂载卷内的 .youyou-trash。
+                library_trash = library_host / ".youyou-trash"
+                assert library_trash.is_dir(), "library-local trash was not created"
+                trashed_files = [p for p in library_trash.rglob("*") if p.is_file()]
+                assert trashed_files, f"original missing from {library_trash}"
+                assert not (root / "media/.youyou-trash").exists() or not any(
+                    (root / "media/.youyou-trash").rglob("*")
+                ), "library file must not land in media-root trash"
             scan = assert_status(client.json("POST", "/api/v1/admin/jobs/scan",
                                  bearer=admin, csrf=csrf), 202, "rescan with internal trash")
             poll_job(client, scan["id"], bearer=admin, admin=True)
@@ -118,6 +145,8 @@ def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bo
                                   200, "read deleted photo")
             entries = [entry for entry in trash["entries"] if entry["mediaId"] == upload["mediaId"]]
             assert len(entries) == 1
+            if library_mount:
+                assert entries[0].get("trashRootRel") == "library", entries[0]
             restored = assert_status(client.json("POST", "/api/v1/admin/trash/restore", {
                 "mediaIds": [upload["mediaId"]],
             }, bearer=admin, csrf=csrf), 200, "restore unknown photo")
@@ -125,9 +154,15 @@ def verify_layout(split_mount: bool, obsolete_env: bool = False, mount_trash: bo
             assert not restored["failures"]
             assert original.read_bytes() == content
             assert not list(root.rglob(".youyou-trash-probe-*")), "probe files were not cleaned up"
-            assert (root / "media/.youyou-trash").is_dir()
+            if library_mount:
+                assert (library_host / ".youyou-trash").is_dir()
+            else:
+                assert (root / "media/.youyou-trash").is_dir()
             assert not (root / "trash").exists(), "obsolete setting created an external trash directory"
-            print(f"Docker internal trash (split_mount={split_mount}): uploaded, deleted, restored with identical bytes")
+            print(
+                f"Docker internal trash (split_mount={split_mount}, library_mount={library_mount}): "
+                "uploaded, deleted, restored with identical bytes"
+            )
         finally:
             subprocess.run(["docker", "rm", "--force", "--volumes", name],
                            check=False, capture_output=True)
@@ -138,4 +173,7 @@ if __name__ == "__main__":
     verify_layout(True)
     verify_layout(True, obsolete_env=True)
     verify_layout(False, mount_trash=True)
+    # GitHub #2：照片目录单独挂载时回收站跟随库目录。
+    verify_layout(False, library_mount=True)
+    verify_layout(True, library_mount=True)
     print("real Docker trash E2E passed")

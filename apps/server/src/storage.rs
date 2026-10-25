@@ -745,12 +745,30 @@ mod tests {
         let trash = directory.path().join(INTERNAL_TRASH_DIR);
         std::fs::create_dir(&trash).unwrap();
         std::fs::write(trash.join("photo.jpg"), b"deleted").unwrap();
+        // 库内回收站（issue #2）：任意层级的 .youyou-trash 同样不可见。
+        let library_trash = directory.path().join("qingjin").join(INTERNAL_TRASH_DIR);
+        std::fs::create_dir_all(&library_trash).unwrap();
+        std::fs::write(library_trash.join("photo.jpg"), b"deleted").unwrap();
         let driver = LocalFilesystemStorageDriver::new(directory.path()).unwrap();
-        assert!(driver.list("").await.unwrap().next().await.is_none());
+        // 根级只应看到库目录 qingjin，两个 .youyou-trash 都必须被隐藏。
+        let mut root_entries = driver.list("").await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = root_entries.next().await {
+            names.push(entry.unwrap().name);
+        }
+        assert_eq!(names, vec!["qingjin".to_owned()]);
         assert!(driver.list(INTERNAL_TRASH_DIR).await.is_err());
+        assert!(driver.list("qingjin").await.unwrap().next().await.is_none());
+        assert!(driver.list("qingjin/.youyou-trash").await.is_err());
         assert!(
             driver
                 .read_all(".youyou-trash/photo.jpg", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            driver
+                .read_all("qingjin/.youyou-trash/photo.jpg", None)
                 .await
                 .is_err()
         );
@@ -760,10 +778,23 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            driver
+                .write_atomic("qingjin/.youyou-trash/new/file", reader(b"new"))
+                .await
+                .is_err()
+        );
         assert!(driver.mkdir(".youyou-trash/new").await.is_err());
+        assert!(driver.mkdir("qingjin/.youyou-trash/new").await.is_err());
         assert!(driver.delete(INTERNAL_TRASH_DIR).await.is_err());
+        assert!(driver.delete("qingjin/.youyou-trash").await.is_err());
         assert!(LocalFilesystemStorageDriver::new(&trash).is_err());
+        assert!(LocalFilesystemStorageDriver::new(&library_trash).is_err());
         assert_eq!(std::fs::read(trash.join("photo.jpg")).unwrap(), b"deleted");
+        assert_eq!(
+            std::fs::read(library_trash.join("photo.jpg")).unwrap(),
+            b"deleted"
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&trash, directory.path().join("alias")).unwrap();

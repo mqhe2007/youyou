@@ -351,6 +351,15 @@ pub async fn require_user_library_root(pool: &SqlitePool, user_id: i64) -> AppRe
     })
 }
 
+/// 全部已绑定媒体库目录名（相对存储根），供回收站按库解析挂载与回收根。
+pub async fn list_library_names(pool: &SqlitePool) -> AppResult<Vec<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT root_path FROM user_libraries ORDER BY root_path ASC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 /// 按目录前缀解析媒体归属（路径为相对存储根的相对路径）。
 ///
 /// 前缀匹配必须大小写敏感（`substr` 为二进制比较）：`LIKE` 对 ASCII 大小写

@@ -175,6 +175,14 @@ pub(crate) async fn create_user(
     )
     .await;
     let user = result?;
+    // 新库目录可能落在独立挂载点上，回收站根需要重新探测。
+    let libraries = users::list_library_names(&state.db)
+        .await
+        .unwrap_or_default();
+    let _ = state
+        .trash
+        .reconfigure(&state.server_dir, storage.root(), &libraries)
+        .await;
     Ok((StatusCode::CREATED, Json(user)))
 }
 

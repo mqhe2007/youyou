@@ -81,7 +81,8 @@ pub async fn initialize(
     // 最后补一次到期清理。扫描任务在 HTTP 服务起来之后才可能被触发，因此
     // 「先恢复操作、再允许扫描」在这里得到保证。
     let server_dir = config::infer_server_dir(data_dir);
-    let mut trash_config = trash::prepare(&server_dir, storage_driver.root()).await;
+    let libraries = users::list_library_names(&db).await.unwrap_or_default();
+    let mut trash_config = trash::prepare(&server_dir, storage_driver.root(), &libraries).await;
     trash::validate_existing_entries(&db, &mut trash_config).await?;
     let trash_runtime = trash::TrashRuntime::new(trash_config);
     if let Err(error) =

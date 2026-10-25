@@ -36,12 +36,35 @@ pub const TRASH_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// 单个回收站根：media 根（key=""）或某个库目录（key=库名）。
+#[derive(Debug, Clone)]
+pub struct TrashRoot {
+    pub key: String,
+    pub root: PathBuf,
+    pub enabled: bool,
+    pub blocked_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrashConfig {
+    /// 默认根：`<media_root>/.youyou-trash`。历史条目与未单独挂载库都走这里。
     pub root: PathBuf,
     pub configured: String,
     pub enabled: bool,
     pub blocked_reason: Option<String>,
+    /// 仅登记「需要库内回收站」的库（库目录与 media 根跨挂载）。
+    /// 未登记的库与非库路径一律走默认根，保持既有部署零变化。
+    pub roots: std::collections::BTreeMap<String, TrashRoot>,
+}
+
+/// 取 normalized_path 的第一段作为库段；空段/`.`/`..` 不算库。
+pub fn library_segment(normalized_path: &str) -> Option<&str> {
+    let first = normalized_path.split('/').next()?;
+    if first.is_empty() || first == "." || first == ".." {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 impl TrashConfig {
@@ -52,6 +75,67 @@ impl TrashConfig {
             Err(AppError::Conflict(format!(
                 "服务端删除能力未启用：{}",
                 self.blocked_reason.as_deref().unwrap_or("回收站配置无效")
+            )))
+        }
+    }
+
+    /// 为一次新删除选择回收站根。
+    /// 库段命中已登记的库内根 → 用该库回收站（含禁用时给出该库原因）；
+    /// 否则回退默认根。返回 `(绝对根, trash_root_rel)`。
+    pub fn root_for_new_deletion(&self, original_path: &str) -> AppResult<(PathBuf, String)> {
+        if let Some(key) = library_segment(original_path)
+            && let Some(root) = self.roots.get(key)
+        {
+            if root.enabled {
+                return Ok((root.root.clone(), key.to_owned()));
+            }
+            return Err(AppError::Conflict(format!(
+                "库 {key} 的回收站不可用：{}",
+                root.blocked_reason.as_deref().unwrap_or("回收站配置无效")
+            )));
+        }
+        if self.enabled {
+            Ok((self.root.clone(), String::new()))
+        } else {
+            Err(AppError::Conflict(format!(
+                "服务端删除能力未启用：{}",
+                self.blocked_reason.as_deref().unwrap_or("回收站配置无效")
+            )))
+        }
+    }
+
+    /// 按条目已持久化的 `trash_root_rel` 解析回收站根（恢复/清理/崩溃恢复）。
+    /// 不重推 original_path：库绑定可能已变，存储的 rel 才是权威。
+    pub fn resolve_trash_dir(&self, trash_root_rel: &str) -> AppResult<PathBuf> {
+        if trash_root_rel.is_empty() {
+            return Ok(self.root.clone());
+        }
+        self.roots
+            .get(trash_root_rel)
+            .map(|root| root.root.clone())
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "回收站根 {trash_root_rel} 未配置，无法定位回收原件",
+                ))
+            })
+    }
+
+    /// 与 [`Self::resolve_trash_dir`] 相同，但要求该根当前可原子移动（恢复需要同盘 rename）。
+    pub fn require_movable_trash_dir(&self, trash_root_rel: &str) -> AppResult<PathBuf> {
+        if trash_root_rel.is_empty() {
+            return Ok(self.require_enabled()?.to_path_buf());
+        }
+        let root = self.roots.get(trash_root_rel).ok_or_else(|| {
+            AppError::Conflict(format!(
+                "回收站根 {trash_root_rel} 未配置，无法定位回收原件",
+            ))
+        })?;
+        if root.enabled {
+            Ok(root.root.clone())
+        } else {
+            Err(AppError::Conflict(format!(
+                "库 {trash_root_rel} 的回收站不可用：{}",
+                root.blocked_reason.as_deref().unwrap_or("回收站配置无效")
             )))
         }
     }
@@ -78,86 +162,210 @@ impl TrashRuntime {
         self.config.read().await.clone()
     }
 
-    /// 存储根变更后重新校验回收站配置。
-    pub async fn reconfigure(&self, server_dir: &Path, storage_root: &Path) -> TrashConfig {
-        let config = prepare(server_dir, storage_root).await;
+    /// 存储根或媒体库变更后重新校验回收站配置。
+    pub async fn reconfigure(
+        &self,
+        server_dir: &Path,
+        storage_root: &Path,
+        libraries: &[String],
+    ) -> TrashConfig {
+        let config = prepare(server_dir, storage_root, libraries).await;
         *self.config.write().await = config.clone();
         config
     }
 }
 
-/// 回收站固定在照片存储根内，不读取环境变量或采用旧目录。
+/// 默认回收站固定在照片存储根内，不读取环境变量或采用旧目录。
 pub fn resolve_trash_dir(storage_root: &Path) -> PathBuf {
     storage_root.join(crate::storage::INTERNAL_TRASH_DIR)
 }
 
-/// 校验并准备回收站目录。任一项不满足都返回禁用原因，由调用方禁用删除能力。
-pub async fn prepare(server_dir: &Path, storage_root: &Path) -> TrashConfig {
+/// 库内回收站：`<media_root>/<library>/.youyou-trash`。
+fn library_trash_dir(storage_root: &Path, library: &str) -> PathBuf {
+    storage_root
+        .join(library)
+        .join(crate::storage::INTERNAL_TRASH_DIR)
+}
+
+/// 校验并准备回收站目录。
+///
+/// 默认根：`<media_root>/.youyou-trash`（未单独挂载的部署零变化）。
+/// 仅当某个库目录与默认回收站跨挂载、无法同盘 rename 时，才在该库内
+/// 建 `<library>/.youyou-trash` 并登记为独立根；单库故障只禁用该库。
+pub async fn prepare(server_dir: &Path, storage_root: &Path, libraries: &[String]) -> TrashConfig {
     let root = resolve_trash_dir(storage_root);
     let configured = root.display().to_string();
-    let result = async {
-        // Do not strand originals from releases that used server_dir/trash.
-        let legacy = server_dir.join("trash");
-        match tokio::fs::read_dir(&legacy).await {
-            Ok(mut entries) => {
-                if entries.next_entry().await.map_err(|error| error.to_string())?.is_some() {
-                    return Err(format!("旧回收站 {} 仍有文件。请先使用旧版恢复或清空回收站，再升级；原件和恢复记录已保留", legacy.display()));
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("无法检查旧回收站 {}：{error}", legacy.display())),
-        }
-        inspect(&root, storage_root).await
-    }.await;
-    match result {
+    let legacy_reason = check_legacy_trash(server_dir).await;
+    let default_result = match legacy_reason {
+        Some(reason) => Err(reason),
+        None => inspect(&root, storage_root).await,
+    };
+    let mut config = match default_result {
         Ok(canonical) => TrashConfig {
             root: canonical,
             configured,
             enabled: true,
             blocked_reason: None,
+            roots: std::collections::BTreeMap::new(),
         },
         Err(reason) => {
             tracing::error!(
                 trash_dir = %configured,
                 storage_root = %storage_root.display(),
                 reason = %reason,
-                "回收站目录校验失败；服务端删除能力已禁用"
+                "默认回收站目录校验失败；非库路径删除能力已禁用"
             );
             TrashConfig {
                 root,
                 configured,
                 enabled: false,
                 blocked_reason: Some(reason),
+                roots: std::collections::BTreeMap::new(),
+            }
+        }
+    };
+    configure_library_roots(&mut config, storage_root, libraries).await;
+    config
+}
+
+/// 旧版 `server_dir/trash` 仍有文件时禁止启用，防止升级后丢失原件。
+async fn check_legacy_trash(server_dir: &Path) -> Option<String> {
+    let legacy = server_dir.join("trash");
+    match tokio::fs::read_dir(&legacy).await {
+        Ok(mut entries) => {
+            if entries
+                .next_entry()
+                .await
+                .map_err(|error| error.to_string())
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Some(format!(
+                    "旧回收站 {} 仍有文件。请先使用旧版恢复或清空回收站，再升级；原件和恢复记录已保留",
+                    legacy.display()
+                ));
+            }
+            None
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => Some(format!("无法检查旧回收站 {}：{error}", legacy.display())),
+    }
+}
+
+/// 为需要库内回收站的库登记独立根。
+/// 判据：从库目录到默认回收站无法同盘原子移动（独立 bind mount 的 EXDEV 场景）。
+async fn configure_library_roots(
+    config: &mut TrashConfig,
+    storage_root: &Path,
+    libraries: &[String],
+) {
+    for library in libraries {
+        let library_dir = storage_root.join(library);
+        if !tokio::fs::try_exists(&library_dir).await.unwrap_or(false) {
+            continue;
+        }
+        // 库目录与默认回收站同盘时走默认根，行为与历史部署一致。
+        if config.enabled {
+            let probe_source = library_dir.clone();
+            let probe_trash = config.root.clone();
+            let same_device =
+                tokio::task::spawn_blocking(move || probe_atomic_move(&probe_source, &probe_trash))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| move_error_reason(&error)));
+            match same_device {
+                Ok(()) => continue,
+                Err(reason) => {
+                    tracing::info!(
+                        library = %library,
+                        reason = %reason,
+                        "库目录与媒体根回收站跨挂载，改用库内回收站"
+                    );
+                }
+            }
+        }
+        let trash = library_trash_dir(storage_root, library);
+        match inspect(&trash, &library_dir).await {
+            Ok(canonical) => {
+                config.roots.insert(
+                    library.clone(),
+                    TrashRoot {
+                        key: library.clone(),
+                        root: canonical,
+                        enabled: true,
+                        blocked_reason: None,
+                    },
+                );
+            }
+            Err(reason) => {
+                tracing::error!(
+                    library = %library,
+                    trash_dir = %trash.display(),
+                    reason = %reason,
+                    "库内回收站校验失败；该库删除能力已禁用"
+                );
+                config.roots.insert(
+                    library.clone(),
+                    TrashRoot {
+                        key: library.clone(),
+                        root: trash,
+                        enabled: false,
+                        blocked_reason: Some(reason),
+                    },
+                );
             }
         }
     }
 }
 
-/// 检查旧版本自定义目录中的活跃原件，防止切换路径后到期清理误删恢复记录。
+/// 检查活跃回收条目的原件仍在各自回收站根内，防止切换路径后到期清理误删恢复记录。
 pub async fn validate_existing_entries(
     pool: &SqlitePool,
     config: &mut TrashConfig,
 ) -> AppResult<()> {
-    if !config.enabled {
-        return Ok(());
-    }
-    let paths: Vec<String> = sqlx::query_scalar(
-        "SELECT trash_path FROM trash_entries WHERE state = 'active' AND media_id NOT IN (SELECT media_id FROM media_operations WHERE finished_at IS NULL)",
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT trash_root_rel, trash_path FROM trash_entries WHERE state = 'active' AND media_id NOT IN (SELECT media_id FROM media_operations WHERE finished_at IS NULL)",
     ).fetch_all(pool).await?;
-    for path in paths {
-        if !tokio::fs::try_exists(config.root.join(&path))
+    for (trash_root_rel, path) in rows {
+        let root = match config.resolve_trash_dir(&trash_root_rel) {
+            Ok(root) => root,
+            Err(_) => {
+                disable_root(
+                    config,
+                    &trash_root_rel,
+                    "回收站记录对应的原件不在 .youyou-trash 内。请先使用旧版恢复或清空旧回收站，再升级；恢复记录已保留",
+                );
+                break;
+            }
+        };
+        if !tokio::fs::try_exists(root.join(&path))
             .await
             .unwrap_or(false)
         {
-            config.enabled = false;
-            config.blocked_reason = Some("回收站记录对应的原件不在 .youyou-trash 内。请先使用旧版恢复或清空旧回收站，再升级；恢复记录已保留".to_owned());
+            disable_root(
+                config,
+                &trash_root_rel,
+                "回收站记录对应的原件不在 .youyou-trash 内。请先使用旧版恢复或清空旧回收站，再升级；恢复记录已保留",
+            );
             break;
         }
     }
     Ok(())
 }
 
-async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
+fn disable_root(config: &mut TrashConfig, trash_root_rel: &str, reason: &str) {
+    if trash_root_rel.is_empty() {
+        config.enabled = false;
+        config.blocked_reason = Some(reason.to_owned());
+    } else if let Some(root) = config.roots.get_mut(trash_root_rel) {
+        root.enabled = false;
+        root.blocked_reason = Some(reason.to_owned());
+    }
+}
+
+/// 校验 `source_dir/.youyou-trash`：实体目录、与 source 同盘、可同盘原子移动。
+async fn inspect(root: &Path, source_dir: &Path) -> Result<PathBuf, String> {
     if root
         .file_name()
         .is_some_and(|name| name == crate::storage::INTERNAL_TRASH_DIR)
@@ -173,11 +381,11 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
     let canonical = tokio::fs::canonicalize(root)
         .await
         .map_err(|error| format!("无法解析回收站目录 {}：{error}", root.display()))?;
-    let storage = tokio::fs::canonicalize(storage_root)
+    let source = tokio::fs::canonicalize(source_dir)
         .await
-        .map_err(|error| format!("无法解析媒体存储根 {}：{error}", storage_root.display()))?;
-    if canonical != storage.join(crate::storage::INTERNAL_TRASH_DIR) {
-        return Err("回收站必须是照片存储根下的 .youyou-trash 实体目录".to_owned());
+        .map_err(|error| format!("无法解析照片目录 {}：{error}", source_dir.display()))?;
+    if canonical != source.join(crate::storage::INTERNAL_TRASH_DIR) {
+        return Err("回收站必须是照片目录下的 .youyou-trash 实体目录".to_owned());
     }
     #[cfg(unix)]
     {
@@ -186,29 +394,29 @@ async fn inspect(root: &Path, storage_root: &Path) -> Result<PathBuf, String> {
             .await
             .map_err(|error| format!("无法读取回收站目录元信息：{error}"))?
             .dev();
-        let storage_device = tokio::fs::metadata(&storage)
+        let source_device = tokio::fs::metadata(&source)
             .await
-            .map_err(|error| format!("无法读取媒体存储根元信息：{error}"))?
+            .map_err(|error| format!("无法读取照片目录元信息：{error}"))?
             .dev();
-        if trash_device != storage_device {
+        if trash_device != source_device {
             return Err(format!(
-                "回收站目录 {} 与媒体存储根 {} 不在同一文件系统，无法保证原子 rename；请勿单独挂载 .youyou-trash",
+                "回收站目录 {} 与照片目录 {} 不在同一文件系统，无法保证原子 rename；请勿单独挂载 .youyou-trash",
                 canonical.display(),
-                storage.display()
+                source.display()
             ));
         }
     }
     // Bind mounts can report the same device number while rename still fails with EXDEV.
     // Exercise the same no-replace primitive used by deletion and restore before enabling them.
-    let probe_storage = storage.clone();
+    let probe_storage = source.clone();
     let probe_trash = canonical.clone();
     tokio::task::spawn_blocking(move || probe_atomic_move(&probe_storage, &probe_trash))
         .await
         .map_err(|error| format!("回收站文件移动检查失败：{error}"))?
         .map_err(|error| {
             format!(
-                "媒体目录 {} 与回收站 {} 之间无法安全移动文件：{}",
-                storage.display(),
+                "照片目录 {} 与回收站 {} 之间无法安全移动文件：{}",
+                source.display(),
                 canonical.display(),
                 move_error_reason(&error)
             )
@@ -242,7 +450,7 @@ fn probe_atomic_move(storage_root: &Path, trash_root: &Path) -> std::io::Result<
 fn move_error_reason(error: &std::io::Error) -> String {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::EXDEV) {
-        return "媒体目录和回收站位于不同挂载点。请勿单独挂载 .youyou-trash，确保它与照片目录共用挂载卷".to_owned();
+        return "媒体目录和回收站位于不同挂载点。请确认回收站与目标库目录在同一挂载卷".to_owned();
     }
     error.to_string()
 }
@@ -323,6 +531,9 @@ pub struct PayloadEntry {
     pub original_path: String,
     pub file_name: String,
     pub trash_path: String,
+    /// 所属回收站根：`""` = media 根回收站，否则为库名。
+    #[serde(default)]
+    pub trash_root_rel: String,
     pub size: i64,
 }
 
@@ -343,6 +554,8 @@ pub struct DeletePayload {
 pub struct RestoreMove {
     pub entry_id: String,
     pub trash_path: String,
+    #[serde(default)]
+    pub trash_root_rel: String,
     pub target_path: String,
     #[serde(default)]
     pub modified_at: Option<i64>,
@@ -361,6 +574,8 @@ pub struct RestorePayload {
 pub struct PurgePayload {
     pub entry_id: String,
     pub trash_path: String,
+    #[serde(default)]
+    pub trash_root_rel: String,
     pub media_id: String,
 }
 
@@ -438,6 +653,7 @@ pub struct TrashEntryRow {
     pub file_name: String,
     pub original_path: String,
     pub trash_path: String,
+    pub trash_root_rel: String,
     pub size: i64,
 }
 
@@ -450,6 +666,7 @@ pub struct TrashEntryView {
     pub name: String,
     pub original_path: String,
     pub trash_path: String,
+    pub trash_root_rel: String,
     pub size: i64,
     pub mime_type: Option<String>,
     pub is_video: i64,
@@ -482,7 +699,6 @@ pub async fn delete_media(
 ) -> AppResult<DeleteOutcome> {
     let _guard = runtime.lock.lock().await;
     let config = runtime.snapshot().await;
-    let trash_root = config.require_enabled()?.to_path_buf();
 
     if let Some(existing) = get_operation(pool, scope_key, operation_id).await? {
         return Ok(outcome_from_operation(existing));
@@ -571,6 +787,19 @@ pub async fn delete_media(
 
     let tags = load_tag_snapshot(pool, media_id).await?;
     let now = now_millis();
+    let mut entries = Vec::with_capacity(locations.len());
+    for location in &locations {
+        let (_, trash_root_rel) = config.root_for_new_deletion(&location.normalized_path)?;
+        entries.push(PayloadEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            location_id: location.id.clone(),
+            original_path: location.normalized_path.clone(),
+            file_name: location.file_name.clone(),
+            trash_path: trash_relative(media_id, &location.file_name),
+            trash_root_rel,
+            size: location.size,
+        });
+    }
     let mut payload = DeletePayload {
         media: MediaSnapshot {
             media_id: asset.id.clone(),
@@ -594,17 +823,7 @@ pub async fn delete_media(
         },
         deleted_by: deleted_by.to_owned(),
         tags,
-        entries: locations
-            .iter()
-            .map(|location| PayloadEntry {
-                entry_id: Uuid::new_v4().to_string(),
-                location_id: location.id.clone(),
-                original_path: location.normalized_path.clone(),
-                file_name: location.file_name.clone(),
-                trash_path: trash_relative(media_id, &location.file_name),
-                size: location.size,
-            })
-            .collect(),
+        entries,
         missing_paths: Vec::new(),
     };
 
@@ -626,6 +845,7 @@ pub async fn delete_media(
     let mut missing: Vec<String> = Vec::new();
     for entry in payload.entries.clone() {
         let source = storage.root().join(&entry.original_path);
+        let trash_root = config.require_movable_trash_dir(&entry.trash_root_rel)?;
         let target = trash_root.join(&entry.trash_path);
         let outcome = match move_same_device(&source, &target).await {
             Ok(()) => {
@@ -642,7 +862,10 @@ pub async fn delete_media(
         if let Some(message) = outcome {
             // 回滚已移动文件，保持「全部目标移出后才算删除」的语义。
             for done in moved.iter().rev() {
-                let back_source = trash_root.join(&done.trash_path);
+                let back_source = config
+                    .resolve_trash_dir(&done.trash_root_rel)
+                    .unwrap_or_else(|_| config.root.clone())
+                    .join(&done.trash_path);
                 let back_target = storage.root().join(&done.original_path);
                 let _ = move_same_device(&back_source, &back_target).await;
             }
@@ -775,7 +998,6 @@ pub async fn restore_media(
 ) -> AppResult<RestoreOutcome> {
     let _guard = runtime.lock.lock().await;
     let config = runtime.snapshot().await;
-    let trash_root = config.require_enabled()?.to_path_buf();
 
     let entries = load_active_entries(pool, media_id).await?;
     if entries.is_empty() {
@@ -826,11 +1048,14 @@ pub async fn restore_media(
 
     let mut moves: Vec<RestoreMove> = Vec::new();
     for entry in &entries {
+        // 先确认该条目的回收站根可原子移动，再分配目标路径。
+        config.require_movable_trash_dir(&entry.trash_root_rel)?;
         let target_path = allocate_target_path(pool, storage, &entry.original_path).await?;
         verify_parent_within_storage(storage, &target_path).await?;
         moves.push(RestoreMove {
             entry_id: entry.id.clone(),
             trash_path: entry.trash_path.clone(),
+            trash_root_rel: entry.trash_root_rel.clone(),
             target_path,
             modified_at: None,
         });
@@ -859,12 +1084,13 @@ pub async fn restore_media(
 
     let mut done: Vec<RestoreMove> = Vec::new();
     for item in &moves {
+        let trash_root = config.require_movable_trash_dir(&item.trash_root_rel)?;
         let source = trash_root.join(&item.trash_path);
         let target = storage.root().join(&item.target_path);
         if let Some(parent) = target.parent()
             && let Err(error) = tokio::fs::create_dir_all(parent).await
         {
-            rollback_restore(trash_root.as_path(), storage, &done).await;
+            rollback_restore(&config, storage, &done).await;
             fail_operation(pool, "admin", &operation_id, &error.to_string()).await?;
             return Err(AppError::Internal(error.into()));
         }
@@ -880,7 +1106,7 @@ pub async fn restore_media(
             Err(MoveError::Other(message)) => Some(message),
         };
         if let Some(message) = failure {
-            rollback_restore(trash_root.as_path(), storage, &done).await;
+            rollback_restore(&config, storage, &done).await;
             clear_operation_pending_paths(pool, &operation_id).await?;
             fail_operation(pool, "admin", &operation_id, &message).await?;
             return Err(AppError::Conflict(format!(
@@ -942,6 +1168,7 @@ pub async fn restore_media(
 }
 
 /// 管理端彻底删除 / 清空：先删文件，再置条目为 `purged`。
+/// unlink 不要求同盘，故即使该回收站根的原子移动被禁用仍可清理。
 pub async fn purge_entries(
     pool: &SqlitePool,
     runtime: &TrashRuntime,
@@ -949,22 +1176,26 @@ pub async fn purge_entries(
 ) -> AppResult<u64> {
     let _guard = runtime.lock.lock().await;
     let config = runtime.snapshot().await;
-    let trash_root = config.require_enabled()?.to_path_buf();
     let mut purged = 0_u64;
     for entry_id in entry_ids {
-        let row = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, trash_path, media_id FROM trash_entries WHERE id = ?1 AND state = 'active'",
+        let row = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT id, trash_path, trash_root_rel, media_id FROM trash_entries WHERE id = ?1 AND state = 'active'",
         )
         .bind(entry_id)
         .fetch_optional(pool)
         .await?;
-        let Some((id, trash_path, media_id)) = row else {
+        let Some((id, trash_path, trash_root_rel, media_id)) = row else {
+            continue;
+        };
+        // 该根被禁用时跳过并保留记录（原件可能在旧路径待人工恢复），不静默清掉恢复入口。
+        let Ok(trash_root) = config.require_movable_trash_dir(&trash_root_rel) else {
             continue;
         };
         let operation_id = Uuid::new_v4().to_string();
         let payload = PurgePayload {
             entry_id: id.clone(),
             trash_path: trash_path.clone(),
+            trash_root_rel: trash_root_rel.clone(),
             media_id: media_id.clone(),
         };
         let payload_value = to_value(&payload)?;
@@ -1028,7 +1259,7 @@ pub async fn list_entries(pool: &SqlitePool) -> AppResult<Vec<TrashEntryView>> {
     let rows = sqlx::query_as::<_, TrashEntryView>(
         r#"
         SELECT t.id, t.media_id, t.owner_user_id, COALESCE(a.name, t.file_name) AS name,
-               t.original_path, t.trash_path, t.size, t.mime_type, t.is_video,
+               t.original_path, t.trash_path, t.trash_root_rel, t.size, t.mime_type, t.is_video,
                t.sort_at, t.deleted_by, t.deleted_at, t.expires_at, t.state
         FROM trash_entries t
         LEFT JOIN media_assets a ON a.id = t.media_id
@@ -1050,11 +1281,8 @@ pub async fn list_all_active_entry_ids(pool: &SqlitePool) -> AppResult<Vec<Strin
 }
 
 /// 到期清理：停机期间无法保证精确时刻清理，启动后与每小时各补一次。
+/// 不按默认根 `enabled` 短路——库内回收站可能仍可用，unlink 也不要求同盘。
 pub async fn run_expiry_cleanup(pool: &SqlitePool, runtime: &TrashRuntime) -> AppResult<u64> {
-    let config = runtime.snapshot().await;
-    if !config.enabled {
-        return Ok(0);
-    }
     let expired = sqlx::query_scalar::<_, String>(
         "SELECT id FROM trash_entries WHERE state = 'active' AND expires_at <= ?1 ORDER BY expires_at ASC",
     )
@@ -1131,15 +1359,10 @@ async fn recover_delete(
 ) -> AppResult<()> {
     let payload: DeletePayload = serde_json::from_str(payload)
         .map_err(|error| AppError::Internal(anyhow::anyhow!("解析删除操作载荷失败：{error}")))?;
-    if !config.enabled {
-        return Err(AppError::Conflict(
-            "回收站未启用，无法前滚删除操作".to_owned(),
-        ));
-    }
-    let trash_root = config.root.as_path();
     let mut committed: Vec<PayloadEntry> = Vec::new();
     let mut missing = payload.missing_paths.clone();
     for entry in &payload.entries {
+        let trash_root = config.require_movable_trash_dir(&entry.trash_root_rel)?;
         let source = storage.root().join(&entry.original_path);
         let target = trash_root.join(&entry.trash_path);
         let source_exists = tokio::fs::symlink_metadata(&source).await.is_ok();
@@ -1199,13 +1422,8 @@ async fn recover_restore(
 ) -> AppResult<()> {
     let payload: RestorePayload = serde_json::from_str(payload)
         .map_err(|error| AppError::Internal(anyhow::anyhow!("解析恢复操作载荷失败：{error}")))?;
-    if !config.enabled {
-        return Err(AppError::Conflict(
-            "回收站未启用，无法前滚恢复操作".to_owned(),
-        ));
-    }
-    let trash_root = config.root.as_path();
     for item in &payload.moves {
+        let trash_root = config.require_movable_trash_dir(&item.trash_root_rel)?;
         let source = trash_root.join(&item.trash_path);
         let target = storage.root().join(&item.target_path);
         let source_exists = tokio::fs::symlink_metadata(&source).await.is_ok();
@@ -1269,8 +1487,8 @@ async fn recover_purge(
 ) -> AppResult<()> {
     let payload: PurgePayload = serde_json::from_str(payload)
         .map_err(|error| AppError::Internal(anyhow::anyhow!("解析清理操作载荷失败：{error}")))?;
-    if config.enabled {
-        let absolute = config.root.join(&payload.trash_path);
+    if let Ok(trash_root) = config.resolve_trash_dir(&payload.trash_root_rel) {
+        let absolute = trash_root.join(&payload.trash_path);
         match tokio::fs::remove_file(&absolute).await {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -1316,11 +1534,13 @@ async fn commit_delete_tx(
             r#"
             INSERT OR IGNORE INTO trash_entries
                 (id, media_id, owner_user_id, storage_id, original_path, file_name, trash_path,
+                 trash_root_rel,
                  size, blob_id, content_hash, mime_type, is_video, duration_ms, video_codec,
                  width, height, taken_at, sort_at, sort_source, time_version, original_name,
                  is_favorite, asset_version, deleted_by, operation_id, state, deleted_at,
                  expires_at, created_at, updated_at)
-            VALUES (?1, ?2, ?3, 'local', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            VALUES (?1, ?2, ?3, 'local', ?4, ?5, ?6, ?26,
+                    ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'active', ?24, ?25, ?24, ?24)
             "#,
         )
@@ -1349,6 +1569,7 @@ async fn commit_delete_tx(
         .bind(&payload.deleted_by)
         .bind(now)
         .bind(now + TRASH_RETENTION_MS)
+        .bind(&entry.trash_root_rel)
         .execute(&mut *transaction)
         .await?;
         for tag in &payload.tags {
@@ -1569,11 +1790,14 @@ fn rename_without_replace(_source: &Path, _target: &Path) -> std::io::Result<()>
 }
 
 async fn rollback_restore(
-    trash_root: &Path,
+    config: &TrashConfig,
     storage: &LocalFilesystemStorageDriver,
     done: &[RestoreMove],
 ) {
     for item in done.iter().rev() {
+        let Ok(trash_root) = config.resolve_trash_dir(&item.trash_root_rel) else {
+            continue;
+        };
         let back_source = storage.root().join(&item.target_path);
         let back_target = trash_root.join(&item.trash_path);
         let _ = move_same_device(&back_source, &back_target).await;
@@ -1769,7 +1993,7 @@ async fn load_tag_snapshot(pool: &SqlitePool, media_id: &str) -> AppResult<Vec<T
 async fn load_active_entries(pool: &SqlitePool, media_id: &str) -> AppResult<Vec<TrashEntryRow>> {
     Ok(sqlx::query_as::<_, TrashEntryRow>(
         r#"
-        SELECT id, media_id, owner_user_id, file_name, original_path, trash_path, size
+        SELECT id, media_id, owner_user_id, file_name, original_path, trash_path, trash_root_rel, size
         FROM trash_entries
         WHERE media_id = ?1 AND state = 'active'
         ORDER BY original_path ASC, id ASC
@@ -2047,6 +2271,120 @@ pub async fn path_has_pending_operation(
 #[cfg(test)]
 mod exclusive_move_tests {
     use super::*;
+
+    #[test]
+    fn library_segment_takes_first_path_component() {
+        assert_eq!(library_segment("qingjin/uploads/a.jpg"), Some("qingjin"));
+        assert_eq!(library_segment("qingjin"), Some("qingjin"));
+        assert_eq!(library_segment(""), None);
+        assert_eq!(library_segment("/abs/path.jpg"), None);
+        assert_eq!(library_segment("../escape.jpg"), None);
+    }
+
+    #[test]
+    fn root_for_new_deletion_routes_by_library() {
+        let default_root = PathBuf::from("/media/.youyou-trash");
+        let mut roots = std::collections::BTreeMap::new();
+        roots.insert(
+            "qingjin".to_owned(),
+            TrashRoot {
+                key: "qingjin".to_owned(),
+                root: PathBuf::from("/media/qingjin/.youyou-trash"),
+                enabled: true,
+                blocked_reason: None,
+            },
+        );
+        roots.insert(
+            "blocked".to_owned(),
+            TrashRoot {
+                key: "blocked".to_owned(),
+                root: PathBuf::from("/media/blocked/.youyou-trash"),
+                enabled: false,
+                blocked_reason: Some("跨挂载不可用".to_owned()),
+            },
+        );
+        let config = TrashConfig {
+            root: default_root.clone(),
+            configured: default_root.display().to_string(),
+            enabled: true,
+            blocked_reason: None,
+            roots,
+        };
+        // 未登记库与非库路径走默认根，trash_root_rel 为空。
+        let (root, rel) = config
+            .root_for_new_deletion("bob/uploads/a.jpg")
+            .expect("default root");
+        assert_eq!(root, default_root);
+        assert_eq!(rel, "");
+        // 登记且启用的库走库内回收站。
+        let (root, rel) = config
+            .root_for_new_deletion("qingjin/uploads/a.jpg")
+            .expect("library root");
+        assert_eq!(root, PathBuf::from("/media/qingjin/.youyou-trash"));
+        assert_eq!(rel, "qingjin");
+        // 库根被禁用时拒绝，并给出该库原因，不静默回退默认根。
+        let error = config
+            .root_for_new_deletion("blocked/uploads/a.jpg")
+            .expect_err("blocked library");
+        assert!(error.to_string().contains("blocked"));
+        assert!(error.to_string().contains("跨挂载不可用"));
+    }
+
+    #[test]
+    fn resolve_trash_dir_uses_stored_root_rel() {
+        let default_root = PathBuf::from("/media/.youyou-trash");
+        let mut roots = std::collections::BTreeMap::new();
+        roots.insert(
+            "qingjin".to_owned(),
+            TrashRoot {
+                key: "qingjin".to_owned(),
+                root: PathBuf::from("/media/qingjin/.youyou-trash"),
+                enabled: true,
+                blocked_reason: None,
+            },
+        );
+        let config = TrashConfig {
+            root: default_root.clone(),
+            configured: default_root.display().to_string(),
+            enabled: true,
+            blocked_reason: None,
+            roots,
+        };
+        assert_eq!(
+            config.resolve_trash_dir("").unwrap(),
+            default_root,
+            "历史条目仍走 media 根"
+        );
+        assert_eq!(
+            config.resolve_trash_dir("qingjin").unwrap(),
+            PathBuf::from("/media/qingjin/.youyou-trash")
+        );
+        assert!(config.resolve_trash_dir("missing").is_err());
+    }
+
+    #[tokio::test]
+    async fn prepare_skips_library_roots_when_same_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let server = root.path().join("data");
+        tokio::fs::create_dir_all(&media).await.unwrap();
+        tokio::fs::create_dir_all(&server).await.unwrap();
+        tokio::fs::create_dir_all(media.join("qingjin"))
+            .await
+            .unwrap();
+        let config = prepare(&server, &media, &["qingjin".to_owned()]).await;
+        assert!(config.enabled);
+        assert!(
+            config.roots.is_empty(),
+            "同挂载库不得另建库内回收站，保持历史行为：{:?}",
+            config.roots
+        );
+        let (root, rel) = config
+            .root_for_new_deletion("qingjin/uploads/a.jpg")
+            .unwrap();
+        assert_eq!(rel, "");
+        assert!(root.ends_with(".youyou-trash"));
+    }
 
     #[tokio::test]
     async fn occupied_target_preserves_both_files() {

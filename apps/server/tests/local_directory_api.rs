@@ -4402,7 +4402,7 @@ async fn admin_trash_restore_preserves_media_id_and_reindexes() {
     .fetch_one(&db)
     .await
     .unwrap();
-    let mut config = youyou_server::trash::prepare(data.path(), media.path()).await;
+    let mut config = youyou_server::trash::prepare(data.path(), media.path(), &[]).await;
     let saved = other_media.path().join("legacy-original.jpg");
     tokio::fs::rename(config.root.join(&trash_path), &saved)
         .await
@@ -4649,7 +4649,7 @@ async fn trash_prepare_preserves_nonempty_legacy_directory() {
     tokio::fs::write(server_dir.join("trash/legacy.jpg"), b"legacy")
         .await
         .unwrap();
-    let config = youyou_server::trash::prepare(&server_dir, storage.path()).await;
+    let config = youyou_server::trash::prepare(&server_dir, storage.path(), &[]).await;
     assert!(!config.enabled, "旧回收站有原件时必须保留恢复入口");
     assert!(config.blocked_reason.is_some());
 }
@@ -4666,7 +4666,7 @@ async fn trash_prepare_ignores_empty_legacy_directory() {
     tokio::fs::create_dir_all(server_dir.join("trash"))
         .await
         .unwrap();
-    let config = youyou_server::trash::prepare(&server_dir, &storage).await;
+    let config = youyou_server::trash::prepare(&server_dir, &storage, &[]).await;
     assert!(config.enabled, "同文件系统且扫描树之外应启用删除能力");
     assert!(config.blocked_reason.is_none());
     assert_eq!(
@@ -5622,7 +5622,7 @@ async fn live_photo_real_iphone_pair_pairs_by_content_identifier() {
 async fn trash_prepare_defaults_to_reserved_directory_inside_media() {
     let server = tempdir().unwrap();
     let media = tempdir().unwrap();
-    let config = youyou_server::trash::prepare(server.path(), media.path()).await;
+    let config = youyou_server::trash::prepare(server.path(), media.path(), &[]).await;
     assert!(config.enabled, "{:?}", config.blocked_reason);
     assert_eq!(
         config.root,
@@ -5633,7 +5633,7 @@ async fn trash_prepare_defaults_to_reserved_directory_inside_media() {
         tokio::fs::remove_dir(&config.root).await.unwrap();
         std::os::unix::fs::symlink(server.path(), &config.root).unwrap();
         assert!(
-            !youyou_server::trash::prepare(server.path(), media.path())
+            !youyou_server::trash::prepare(server.path(), media.path(), &[])
                 .await
                 .enabled
         );

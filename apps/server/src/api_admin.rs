@@ -351,9 +351,16 @@ pub(crate) async fn update_admin_storage(
     // 存储根变了，回收站的目录隔离与原子移动校验必须重做；
     // 不满足则本机删除能力自动禁用，并在回收站接口上明确暴露原因。
     let current_storage_root = state.storage.snapshot().await.root().to_path_buf();
+    let libraries = crate::users::list_library_names(&state.db)
+        .await
+        .unwrap_or_default();
     let trash_config = state
         .trash
-        .reconfigure(&state.server_dir, current_storage_root.as_path())
+        .reconfigure(
+            &state.server_dir,
+            current_storage_root.as_path(),
+            &libraries,
+        )
         .await;
     if !trash_config.enabled {
         tracing::error!(
