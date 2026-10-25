@@ -137,8 +137,20 @@ async fn run_backfill(
         on_batch(batch_rows, batch_started.elapsed().as_millis());
     }
     // Also recover a crash between the last backfill batch and scheduling verification.
-    sqlx::query("INSERT INTO jobs(id,kind,status,created_at,updated_at) SELECT ?1,'scan','queued',?2,?2 WHERE EXISTS(SELECT 1 FROM media_assets WHERE time_version=-1) AND NOT EXISTS(SELECT 1 FROM jobs WHERE kind='scan' AND status IN ('queued','running'))")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(crate::db::now_millis()).execute(pool).await?;
+    // `interrupted` must count as an active scan: recover_running_jobs marks leftover
+    // running jobs interrupted before this runs, and jobs_active_scan_idx includes it.
+    // A failed compensating INSERT must not abort backfill — the batches already committed.
+    match sqlx::query("INSERT INTO jobs(id,kind,status,created_at,updated_at) SELECT ?1,'scan','queued',?2,?2 WHERE EXISTS(SELECT 1 FROM media_assets WHERE time_version=-1) AND NOT EXISTS(SELECT 1 FROM jobs WHERE kind='scan' AND status IN ('queued','running','interrupted'))")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(crate::db::now_millis()).execute(pool).await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = ?error,
+                "media time backfill: scheduling verification scan failed; batches already committed"
+            );
+        }
+    }
     Ok(count)
 }
 pub async fn emit(tx: &mut sqlx::SqliteConnection, id: &str, revision: i64) -> anyhow::Result<()> {
@@ -251,6 +263,77 @@ mod tests {
         assert_eq!(valid(Some(i64::MAX)), None);
         assert_eq!(resolve("unknown", None, None).at, None);
     }
+    /// 回归（GitHub #1）：启动时遗留 scan 被标成 `interrupted` 后，补扫 INSERT
+    /// 的 NOT EXISTS 必须把它算作活跃扫描，不得撞上 jobs_active_scan_idx。
+    #[tokio::test]
+    async fn backfill_skips_scan_insert_when_interrupted_job_exists() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        sqlx::query("INSERT INTO media_assets(id,name,identity_state,taken_at,sort_at,created_at,updated_at) VALUES ('old','IMG_20240101_000000.jpg','pending',?1,?1,?1,?1)")
+            .bind(crate::db::now_millis())
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO jobs(id,kind,status,created_at,updated_at) VALUES ('leftover','scan','interrupted',1,1)",
+        )
+        .execute(&pool)
+        .await?;
+        backfill(&pool).await?;
+        let scans = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE kind='scan' AND status='queued'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            scans, 0,
+            "interrupted scan must block the compensating insert"
+        );
+        sqlx::query("DELETE FROM jobs WHERE id='leftover'")
+            .execute(&pool)
+            .await?;
+        backfill(&pool).await?;
+        let scans = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE kind='scan' AND status='queued'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            scans, 1,
+            "without an active scan a verification job is scheduled"
+        );
+        pool.close().await;
+        Ok(())
+    }
+
+    /// 补扫 INSERT 失败不得让整个 backfill 中止（批次已提交的进度必须保留）。
+    #[tokio::test]
+    async fn backfill_survives_scan_schedule_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = crate::db::connect(dir.path()).await?;
+        sqlx::query("INSERT INTO media_assets(id,name,identity_state,taken_at,sort_at,created_at,updated_at) VALUES ('old','IMG_20240101_000000.jpg','pending',?1,?1,?1,?1)")
+            .bind(crate::db::now_millis())
+            .execute(&pool)
+            .await?;
+        // Force a unique-index collision the NOT EXISTS guard would normally prevent:
+        // an active scan already exists, so the INSERT should no-op; if the guard is
+        // wrong the unique index raises and must not abort the already-committed backfill.
+        sqlx::query(
+            "INSERT INTO jobs(id,kind,status,created_at,updated_at) VALUES ('busy','scan','queued',1,1)",
+        )
+        .execute(&pool)
+        .await?;
+        backfill(&pool).await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT time_version FROM media_assets WHERE id='old'")
+                .fetch_one(&pool)
+                .await?,
+            -1,
+            "committed backfill batches must be preserved"
+        );
+        pool.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn history_batches_are_idempotent_and_emit_changes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
