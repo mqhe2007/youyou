@@ -1010,8 +1010,12 @@ pub(crate) async fn generate_video_thumbnail(
     size: u32,
 ) -> AppResult<Vec<u8>> {
     let filter = format!("scale={size}:{size}:force_original_aspect_ratio=decrease");
+    // 抽帧上限必须小于客户端的读超时（Coil 用的是 OkHttp 默认 read timeout 10s）：
+    // 原先设 15s，服务端还在等 ffmpeg 时客户端已经断开，真机上表现为个别老视频
+    // 一直「暂无预览」。超时错误会被 render_thumbnail 转成中性占位图 —— 那才是
+    // 本来设计好的兜底路径，前提是服务端先于客户端放弃。
     let output = tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(8),
         Command::new("ffmpeg")
             .args(["-v", "error", "-ss", "0", "-i"])
             .arg(storage.root().join(normalized_path))
