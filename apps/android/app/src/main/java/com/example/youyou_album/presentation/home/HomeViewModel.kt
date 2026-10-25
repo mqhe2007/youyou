@@ -15,7 +15,6 @@ import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TagRepository
 import com.example.youyou_album.domain.repository.TaskRepository
 import com.example.youyou_album.service.ContentHashService
-import com.example.youyou_album.service.DownloadForegroundService
 import com.example.youyou_album.service.MediaScanService
 import com.example.youyou_album.service.MediaScanWorker
 import com.example.youyou_album.service.MediaDeletionService
@@ -24,7 +23,7 @@ import com.example.youyou_album.service.ServerSyncService
 import com.example.youyou_album.service.ServerTagService
 import com.example.youyou_album.service.ServerWriteResult
 import com.example.youyou_album.service.ApiServiceFactory
-import com.example.youyou_album.service.UploadForegroundService
+import com.example.youyou_album.service.TransferTaskLauncher
 import com.example.youyou_album.service.UploadService
 import com.example.youyou_album.data.db.dao.ServerSyncStateDao
 import com.example.youyou_album.presentation.common.ServerReachability
@@ -41,6 +40,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -70,6 +71,7 @@ class HomeViewModel @Inject constructor(
     private val uploadService: UploadService,
     private val taskRepository: TaskRepository,
     private val contentHashService: ContentHashService,
+    private val transferLauncher: TransferTaskLauncher,
     mediaDeletionService: MediaDeletionService,
     application: Application,
 ) : AndroidViewModel(application) {
@@ -149,10 +151,8 @@ class HomeViewModel @Inject constructor(
     }
 
     /** 批量下载选中的「仅远程」媒体到本机。 */
-    fun downloadSelected(photoIds: Set<String>) {
-        if (photoIds.isNotEmpty()) {
-            DownloadForegroundService.start(getApplication(), photoIds)
-        }
+    fun downloadSelected(photos: List<Photo>) {
+        startTransfer("download", photos.filter { it.syncDisplay == MediaSyncDisplay.REMOTE_ONLY })
     }
 
     /** 正在进行和需要处理的任务数量，用于首页后台活动入口的角标提醒。 */
@@ -343,11 +343,22 @@ class HomeViewModel @Inject constructor(
     }
 
     /**
-     * 启动前台服务上传选中的照片到服务端。
-     * 上传在前台服务中执行，显示通知进度，不受页面生命周期影响。
+     * 上传选中的照片到服务端：只挑有本机原件的项落库（排除服务端投影，那正是撑爆 Binder 的来源），
+     * 已同步项留给服务按内容哈希过滤；半同步实况的动态部分靠这一步才能带上。
      */
-    fun syncSelectedToServer(photoIds: Set<String>) {
-        UploadForegroundService.start(getApplication(), photoIds)
+    fun syncSelectedToServer(photos: List<Photo>) {
+        startTransfer("upload", photos.filter { it.sourceType == "local" && it.sourceUri != null })
+    }
+
+    private fun startTransfer(kind: String, photos: List<Photo>) {
+        viewModelScope.launch {
+            // 落库与启服务不能被页面销毁掐断，否则会留下没人执行的 pending 任务。
+            withContext(NonCancellable) {
+                transferLauncher.launch(kind, photos)?.let { message ->
+                    _uiState.value = _uiState.value.copy(scanMessage = message)
+                }
+            }
+        }
     }
 
     fun clearScanMessage() {

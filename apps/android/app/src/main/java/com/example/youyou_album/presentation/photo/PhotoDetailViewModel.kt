@@ -11,7 +11,7 @@ import com.example.youyou_album.data.api.YouyouApiService
 import com.example.youyou_album.data.api.interceptor.TokenProvider
 import com.example.youyou_album.service.ApiServiceFactory
 import com.example.youyou_album.service.ServerConnectionStore
-import com.example.youyou_album.service.UploadForegroundService
+import com.example.youyou_album.service.TransferTaskLauncher
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -47,6 +47,7 @@ class PhotoDetailViewModel @Inject constructor(
     private val mediaDownloadService: com.example.youyou_album.service.MediaDownloadService,
     private val mediaDeletionService: com.example.youyou_album.service.MediaDeletionService,
     private val tokenProvider: TokenProvider,
+    private val transferLauncher: TransferTaskLauncher,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -215,11 +216,7 @@ class PhotoDetailViewModel @Inject constructor(
      */
     suspend fun syncToServer(): String {
         val photo = currentPhoto() ?: return "照片不存在"
-        if (serverConnectionStore.getConnection() == null) {
-            return "未连接服务端，请先在设置中完成连接"
-        }
-        UploadForegroundService.start(context, setOf(photo.id))
-        return "正在上传到服务器…"
+        return transferLauncher.launch("upload", listOf(photo)) ?: "正在上传到服务器…"
     }
 }
 

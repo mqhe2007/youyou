@@ -12,6 +12,7 @@ import com.example.youyou_album.service.RemoteAccountCacheCleaner
 import com.example.youyou_album.service.SecureStorageService
 import com.example.youyou_album.service.ServerConnectionStore
 import com.example.youyou_album.service.ServerSyncService
+import com.example.youyou_album.service.TransferTaskLauncher
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
@@ -32,4 +33,5 @@ interface AcceptanceEntryPoint {
     fun serverProjectionDao(): ServerProjectionDao
     fun mediaDeletionService(): MediaDeletionService
     fun mediaOperationDao(): MediaOperationDao
+    fun transferTaskLauncher(): TransferTaskLauncher
 }

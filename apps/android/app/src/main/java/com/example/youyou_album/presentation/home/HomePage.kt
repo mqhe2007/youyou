@@ -382,7 +382,7 @@ fun HomePage(
                                     icon = R.drawable.lucide_ic_cloud_upload,
                                     primary = true,
                                     onClick = {
-                                        viewModel.syncSelectedToServer(uiState.selectedPhotoIds)
+                                        viewModel.syncSelectedToServer(selectedPhotos)
                                         coroutineScope.launch {
                                             snackbarHostState.showSnackbar("正在上传…")
                                         }
@@ -398,7 +398,7 @@ fun HomePage(
                                     icon = R.drawable.lucide_ic_cloud_download,
                                     primary = selectedPhotos.none { it.syncDisplay == MediaSyncDisplay.LOCAL_ONLY },
                                     onClick = {
-                                        viewModel.downloadSelected(uiState.selectedPhotoIds)
+                                        viewModel.downloadSelected(selectedPhotos)
                                         coroutineScope.launch {
                                             snackbarHostState.showSnackbar("正在下载…")
                                         }
@@ -463,7 +463,7 @@ fun HomePage(
                                         onPhotoClick(remoteFirst.id)
                                     }
                                     localFirst != null -> {
-                                        viewModel.syncSelectedToServer(setOf(localFirst.id))
+                                        viewModel.syncSelectedToServer(listOf(localFirst))
                                         viewModel.finishFirstConnectGuide()
                                     }
                                     else -> requestMediaScan()

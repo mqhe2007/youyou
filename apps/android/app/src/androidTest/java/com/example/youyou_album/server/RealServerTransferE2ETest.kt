@@ -27,8 +27,8 @@ import com.example.youyou_album.domain.model.MediaTime
 import com.example.youyou_album.domain.model.Photo
 import com.example.youyou_album.domain.repository.PhotoRepository
 import com.example.youyou_album.domain.repository.TaskRepository
-import com.example.youyou_album.service.DownloadForegroundService
 import com.example.youyou_album.service.MediaDeletionService
+import com.example.youyou_album.service.TransferTaskLauncher
 import com.example.youyou_album.service.TransferTaskPayload
 import com.example.youyou_album.service.UploadForegroundService
 import com.example.youyou_album.presentation.server.ConnectionStage
@@ -81,6 +81,7 @@ class RealServerTransferE2ETest {
         val tokenProvider = deps.tokenProvider()
         val photoRepository = deps.photoRepository()
         val taskRepository = deps.taskRepository()
+        val transferLauncher = deps.transferTaskLauncher()
         val api = deps.apiServiceFactory().create(url)
         val created = mutableListOf<android.net.Uri>()
         val createdPhotoIds = mutableListOf<String>()
@@ -164,7 +165,7 @@ class RealServerTransferE2ETest {
                     android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK,
                 )
                 val downloadStart = System.currentTimeMillis()
-                DownloadForegroundService.start(context, remote.map { it.id }.toSet())
+                check(transferLauncher.launch("download", remote) == null)
                 val download = awaitTask(taskRepository, "download", downloadStart)
                 assertEquals(download.message, "completed", download.status)
                 assertEquals(10, TransferTaskPayload.read(download.payload)?.succeeded)
@@ -200,7 +201,7 @@ class RealServerTransferE2ETest {
                 createdPhotoIds += local.map { it.id }
                 photoRepository.upsertAll(local)
                 val uploadStart = System.currentTimeMillis()
-                UploadForegroundService.start(context, local.map { it.id }.toSet())
+                check(transferLauncher.launch("upload", local) == null)
                 val upload = awaitTask(taskRepository, "upload", uploadStart)
                 assertEquals(upload.message, "completed", upload.status)
                 assertEquals(10, TransferTaskPayload.read(upload.payload)?.succeeded)
@@ -231,13 +232,13 @@ class RealServerTransferE2ETest {
                 createdPhotoIds += retryPhoto.id
                 photoRepository.upsert(retryPhoto)
                 val failedStart = System.currentTimeMillis()
-                UploadForegroundService.start(context, setOf(retryPhoto.id))
+                check(transferLauncher.launch("upload", listOf(retryPhoto)) == null)
                 val failed = awaitTask(taskRepository, "upload", failedStart)
                 assertEquals("failed", failed.status)
                 assertEquals(1, TransferTaskPayload.read(failed.payload)?.failed)
                 context.contentResolver.openOutputStream(retryUri, "wt")!!.use { it.write(good) }
                 delay(1_000)
-                UploadForegroundService.start(context, setOf(retryPhoto.id), failed.id)
+                UploadForegroundService.start(context, failed.id)
                 val retried = withTimeout(120_000) {
                     taskRepository.observeAll().first { rows ->
                         rows.any { it.id == failed.id && it.retryCount > 0 && it.status == "completed" }
@@ -283,7 +284,7 @@ class RealServerTransferE2ETest {
                     scenario, context, connectionViewModel, connectionStore, secureStorage,
                     photoRepository, taskRepository, api, url, requireNotNull(otherPairingCode),
                     salt, created, createdPhotoIds, deps.mediaOperationDao(), pendingOldAccountOperation,
-                    deps.mediaDeletionService(), remote,
+                    deps.mediaDeletionService(), remote, transferLauncher,
                 )
                 verifyEmptyAndUnreachableConnection(
                     connectionViewModel, connectionStore, secureStorage,
@@ -320,6 +321,7 @@ class RealServerTransferE2ETest {
         pendingOldAccountOperation: String,
         deletion: MediaDeletionService,
         remote: List<Photo>,
+        transferLauncher: TransferTaskLauncher,
     ) {
         val wrongBytes = png(252, salt)
         val expectedBytes = png(253, salt)
@@ -330,13 +332,13 @@ class RealServerTransferE2ETest {
         createdPhotoIds += switchPhoto.id
         photoRepository.upsert(switchPhoto)
         val switchStart = System.currentTimeMillis()
-        UploadForegroundService.start(context, setOf(switchPhoto.id))
+        check(transferLauncher.launch("upload", listOf(switchPhoto)) == null)
         val switchFailure = awaitTask(taskRepository, "upload", switchStart)
         assertEquals("failed", switchFailure.status)
         // Model a scanner removing a vanished source row while retaining its task payload.
         photoRepository.deleteById(switchPhoto.id)
         delay(1_000)
-        UploadForegroundService.start(context, setOf(switchPhoto.id), switchFailure.id)
+        UploadForegroundService.start(context, switchFailure.id)
         val missingSource = withTimeout(30_000) {
             taskRepository.observeAll().first { rows ->
                 rows.any { it.id == switchFailure.id && it.retryCount > 0 && it.status == "failed" }
@@ -380,7 +382,7 @@ class RealServerTransferE2ETest {
             ApplicationProvider.getApplicationContext<Application>(),
         ).retryTask(switchFailure)
         assertTrue(retryMessage, retryMessage.contains("当前账号"))
-        UploadForegroundService.start(context, setOf(switchPhoto.id), switchFailure.id)
+        UploadForegroundService.start(context, switchFailure.id)
         val blocked = withTimeout(30_000) {
             taskRepository.observeAll().first { rows ->
                 rows.any { it.id == switchFailure.id && it.message?.contains("目标账号已变化") == true }

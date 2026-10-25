@@ -12,7 +12,6 @@ import androidx.core.app.NotificationCompat
 import com.example.youyou_album.MainActivity
 import com.example.youyou_album.R
 import com.example.youyou_album.data.api.interceptor.TokenProvider
-import com.example.youyou_album.domain.model.AppTask
 import com.example.youyou_album.domain.model.Photo
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
@@ -25,10 +24,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.sync.withLock
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 
@@ -52,30 +50,35 @@ class UploadForegroundService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     companion object {
-        const val EXTRA_PHOTO_IDS = "photo_ids"
         const val EXTRA_TASK_ID = "task_id"
         private const val NOTIFICATION_ID = 1001
 
-        fun start(context: Context, photoIds: Set<String>, taskId: String? = null) {
-            val intent = Intent(context, UploadForegroundService::class.java).apply {
-                putStringArrayListExtra(EXTRA_PHOTO_IDS, ArrayList(photoIds))
-                taskId?.let { putExtra(EXTRA_TASK_ID, it) }
-            }
-            context.startForegroundService(intent)
+        fun start(context: Context, taskId: String) {
+            context.startForegroundService(buildIntent(context, taskId))
         }
+
+        /** 执行内容全部来自 tasks_table.payload，Intent 不带任何列表，体积恒定。 */
+        internal fun buildIntent(context: Context, taskId: String): Intent =
+            Intent(context, UploadForegroundService::class.java).putExtra(EXTRA_TASK_ID, taskId)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val photoIds = intent?.getStringArrayListExtra(EXTRA_PHOTO_IDS)?.toSet() ?: emptySet()
-        val retryTaskId = intent?.getStringExtra(EXTRA_TASK_ID)
+        val taskId = intent?.getStringExtra(EXTRA_TASK_ID)
 
         startForeground(NOTIFICATION_ID, buildNotification("准备上传...", 0, 0))
 
+        // 先 startForeground 再判空：否则 startForegroundService 起的服务 5 秒内没前台通知会被系统判 ANR。
+        if (taskId == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         serviceScope.launch {
             try {
-                performUpload(photoIds, retryTaskId)
+                performUpload(taskId)
             } finally {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -85,30 +88,29 @@ class UploadForegroundService : Service() {
         return START_NOT_STICKY
     }
 
-    private suspend fun performUpload(photoIds: Set<String>, retryTaskId: String?) {
+    private suspend fun performUpload(taskId: String) {
         val connection = serverConnectionStore.getConnection()
-        if (connection == null) {
-            updateNotification("未连接服务端", 0, 0)
-            return
-        }
-
-        val allPhotos = photoRepository.getAll()
-        val oldTask = retryTaskId?.let { taskRepository.getById(it) }
-        val oldPayload = TransferTaskPayload.read(oldTask?.payload)
         val identity = TransferTaskPayload.identity(connection, secureStorageService.getDeviceId())
         val token = tokenProvider.getToken()
         val generation = tokenProvider.generation
-        if (retryTaskId != null && (oldTask?.kind != "upload" || oldPayload == null || identity.isNullOrBlank() || oldPayload.identity != identity)) {
-            oldTask?.let { taskRepository.upsert(it.copy(status = "failed", message = "目标账号已变化或任务上下文缺失，请重新选择照片上传", updatedAt = System.currentTimeMillis())) }
+
+        val task = taskRepository.getById(taskId)
+        val stored = TransferTaskPayload.read(task?.payload)
+        if (connection == null || identity.isNullOrBlank() || task?.kind != "upload" || stored == null || stored.identity != identity) {
+            taskRepository.updateStatus(taskId, "failed", "目标账号已变化或任务上下文缺失，请重新选择照片上传", System.currentTimeMillis())
             return
         }
-        val selectedPhotos = allPhotos.filter { it.id in photoIds }
+
+        val photoIds = stored.items.mapTo(HashSet()) { it.photoId }
+        // shortcut: 整表加载，索引到 5 万量级时内存吃紧，届时改为按 id 分批查询
+        val allPhotos = photoRepository.getAll()
         // FR-4 实况整体搬运：一段实况的静态帧与动态部分共同搬运（选中静态帧即带上本机动态部分），
         // 已在服务端的部分不重复上传——半同步态下只补传缺失的动态部分。
         val remoteHashes = allPhotos
             .filter { it.sourceType == "server" }
             .mapNotNull { it.contentHash }
             .toSet()
+        val selectedPhotos = allPhotos.filter { it.id in photoIds }
         val liveParts = selectedPhotos.mapNotNull { selected ->
             val live = selected.livePhoto ?: return@mapNotNull null
             if (!live.isStill || live.embedded) return@mapNotNull null
@@ -118,62 +120,46 @@ class UploadForegroundService : Service() {
             .distinctBy { it.id }
             .filter { it.sourceType == "local" && it.sourceUri != null && it.contentHash !in remoteHashes }
 
-        val taskId = retryTaskId ?: java.util.UUID.randomUUID().toString()
-        val payload = oldPayload ?: TransferTaskPayload(
-            identity = identity.orEmpty(),
-            items = candidates.map { TransferTaskItem(it.id, it.name, it.sourceUri, it.contentHash) },
+        // 实况动态部分不在发起时的选择集里，补进 payload，否则它传成功了也记不上状态。
+        val payload = stored.copy(
+            items = (stored.items + liveParts
+                .filter { part -> part.id !in photoIds }
+                .map { TransferTaskItem(it.id, it.name, it.sourceUri, it.contentHash) })
+                .distinctBy { it.photoId },
         )
-        val localPhotos = if (oldPayload == null) candidates else candidates.filter { photo ->
-            val item = oldPayload.items.firstOrNull { it.photoId == photo.id }
-            item != null && photo.id in oldPayload.retryIds && photo.sourceUri == item.sourceUri &&
+        val itemByPhotoId = payload.items.associateBy { it.photoId }
+        val retryIds = payload.retryIds
+        val localPhotos = candidates.filter { photo ->
+            val item = itemByPhotoId[photo.id]
+            item != null && photo.id in retryIds && photo.sourceUri == item.sourceUri &&
                 (item.contentHash == null || item.contentHash == photo.contentHash)
-        }
-
-        if (localPhotos.isEmpty() && oldPayload == null) {
-            updateNotification("没有可上传的本地照片", 0, 0)
-            return
         }
 
         val now = System.currentTimeMillis()
 
         taskRepository.upsert(
-            (oldTask ?: AppTask(
-                id = taskId,
-                kind = "upload",
+            task.copy(
                 title = "上传 ${localPhotos.size} 项到服务端",
-                status = "running",
-                message = "准备上传...",
-                current = 0,
-                total = localPhotos.size,
-                indeterminate = false,
-                createdAt = now,
-                updatedAt = now,
-            )).copy(
                 status = "running", message = "准备上传...", finishedAt = null,
                 payload = TransferTaskPayload.write(payload),
-                retryCount = (oldTask?.retryCount ?: 0) + if (oldTask == null) 0 else 1,
+                retryCount = task.retryCount + if (task.status == "failed") 1 else 0,
                 current = 0, total = localPhotos.size, updatedAt = now,
             )
         )
 
-        val stateLock = Mutex()
-        suspend fun recordItem(photoId: String, status: String, message: String? = null) {
-            stateLock.withLock {
-                taskRepository.getById(taskId)?.let { task ->
-                    TransferTaskPayload.read(task.payload)?.let { current ->
-                        taskRepository.upsert(task.copy(payload = TransferTaskPayload.write(current.update(photoId, status, message))))
-                    }
-                }
-            }
+        // 每条状态先留在内存、结束后一次性写回 payload。
+        // 原来每项都整串 decode/encode 一遍，N 项就是 O(N²)，几万条时永远跑不完。
+        val itemStates = ConcurrentHashMap<String, Pair<String, String?>>()
+        val hashOverrides = ConcurrentHashMap<String, String>()
+        fun recordItem(photoId: String, status: String, message: String? = null) {
+            itemStates[photoId] = status to message
         }
-        if (oldPayload != null) {
-            val validIds = localPhotos.map { it.id }.toSet()
-            for (item in oldPayload.items.filter { it.photoId in oldPayload.retryIds && it.photoId !in validIds }) {
-                if (item.contentHash != null && item.contentHash in remoteHashes) {
-                    recordItem(item.photoId, "succeeded")
-                } else {
-                    recordItem(item.photoId, "failed", "源文件已不存在或发生变化，请重新选择照片")
-                }
+        val validIds = localPhotos.mapTo(HashSet()) { it.id }
+        for (item in payload.items.filter { it.photoId in retryIds && it.photoId !in validIds }) {
+            if (item.contentHash != null && item.contentHash in remoteHashes) {
+                recordItem(item.photoId, "succeeded")
+            } else {
+                recordItem(item.photoId, "failed", "源文件已不存在或发生变化，请重新选择照片")
             }
         }
 
@@ -216,13 +202,7 @@ class UploadForegroundService : Service() {
                                 photoRepository.upsert(photo.copy(contentHash = hash))
                                 hash
                             }
-                            stateLock.withLock {
-                                taskRepository.getById(taskId)?.let { task ->
-                                    TransferTaskPayload.read(task.payload)?.let { current ->
-                                        taskRepository.upsert(task.copy(payload = TransferTaskPayload.write(current.recordHash(photo.id, contentHash))))
-                                    }
-                                }
-                            }
+                            hashOverrides[photo.id] = contentHash
 
                             // 失败重试：最多 3 次，指数退避（1s, 2s）
                             var lastError: Exception? = null
@@ -289,7 +269,16 @@ class UploadForegroundService : Service() {
         }
 
         val finishTime = System.currentTimeMillis()
-        val finalPayload = TransferTaskPayload.read(taskRepository.getById(taskId)?.payload) ?: payload
+        val finalPayload = payload.copy(
+            items = payload.items.map { item ->
+                val state = itemStates[item.photoId]
+                item.copy(
+                    status = state?.first ?: item.status,
+                    message = state?.second ?: item.message,
+                    contentHash = hashOverrides[item.photoId] ?: item.contentHash,
+                )
+            },
+        )
         val success = finalPayload.succeeded
         val fail = finalPayload.failed + finalPayload.unfinished
         val status = if (fail == 0) "completed" else "failed"
@@ -298,22 +287,15 @@ class UploadForegroundService : Service() {
             message += "\n" + failReasons.joinToString("\n")
         }
 
-        taskRepository.updateProgress(
-            id = taskId,
-            current = finalPayload.items.size,
-            total = finalPayload.items.size,
-            indeterminate = false,
-            phase = message,
-            updatedAt = finishTime,
-        )
-        taskRepository.updateStatus(
-            id = taskId,
-            status = status,
-            message = message,
-            updatedAt = finishTime,
-        )
         taskRepository.getById(taskId)?.let {
-            taskRepository.upsert(it.copy(finishedAt = finishTime))
+            taskRepository.upsert(
+                it.copy(
+                    status = status, message = message, phase = message,
+                    payload = TransferTaskPayload.write(finalPayload),
+                    current = finalPayload.items.size, total = finalPayload.items.size,
+                    indeterminate = false, finishedAt = finishTime, updatedAt = finishTime,
+                )
+            )
         }
         taskRepository.cleanupRecentResults(finishTime - 7L * 24 * 60 * 60 * 1000)
 

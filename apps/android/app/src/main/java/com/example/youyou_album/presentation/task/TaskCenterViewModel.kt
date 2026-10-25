@@ -86,11 +86,12 @@ class TaskCenterViewModel @Inject constructor(
         if (payload == null || payload.identity.isBlank()) return "旧任务没有可重放上下文，请重新选择照片"
         val identity = TransferTaskPayload.identity(connectionStore.getConnection(), secureStorageService.getDeviceId())
         if (identity != payload.identity) return "当前账号与任务目标不同，请切回原账号或重新选择照片"
-        if (payload.retryIds.isEmpty()) return "没有失败或未完成项可重试"
+        val retryIds = payload.retryIds
+        if (retryIds.isEmpty()) return "没有失败或未完成项可重试"
         return when (task.kind) {
             "upload" -> {
                 val inaccessible = withContext(Dispatchers.IO) {
-                    payload.items.filter { it.photoId in payload.retryIds }.firstNotNullOfOrNull { item ->
+                    payload.items.filter { it.photoId in retryIds }.firstNotNullOfOrNull { item ->
                         val source = item.sourceUri ?: return@firstNotNullOfOrNull "源文件已不存在，请重新选择照片；原记录已保留"
                         try {
                             getApplication<Application>().contentResolver.openFileDescriptor(Uri.parse(source), "r")
@@ -104,11 +105,11 @@ class TaskCenterViewModel @Inject constructor(
                     }
                 }
                 if (inaccessible != null) return inaccessible
-                UploadForegroundService.start(getApplication(), payload.retryIds, task.id)
+                UploadForegroundService.start(getApplication(), task.id)
                 "正在重试失败的上传项"
             }
             "download" -> {
-                DownloadForegroundService.start(getApplication(), payload.retryIds, task.id)
+                DownloadForegroundService.start(getApplication(), task.id)
                 "正在重试失败的下载项"
             }
             else -> "请重新发起操作；记录已保留"

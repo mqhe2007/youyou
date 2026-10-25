@@ -32,4 +32,15 @@ class TransferTaskPayloadTest {
         assertNull(TransferTaskPayload.identity(connection, null))
         assertNull(TransferTaskPayload.identity(connection.copy(serverInstanceId = null), "device"))
     }
+
+    /** 发起时落库的批次全部是 pending：服务端只凭这份 payload 取 id，漏一项就少传一张。 */
+    @Test
+    fun freshlyQueuedBatchIsEntirelyRetryable() {
+        val payload = TransferTaskPayload(
+            identity = "server\ninstance\ndevice",
+            items = listOf(TransferTaskItem("a", "a.jpg"), TransferTaskItem("b", "b.jpg")),
+        )
+        assertEquals(setOf("a", "b"), payload.retryIds)
+        assertEquals(0, payload.succeeded)
+    }
 }
