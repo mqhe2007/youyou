@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "youyou-server"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "argon2",
