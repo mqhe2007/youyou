@@ -12,9 +12,11 @@ import com.example.youyou_album.domain.model.MediaTime
 import com.example.youyou_album.data.db.entity.PhotoEntity
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.mapLatest
 
 /** 时间线行：媒体 + 派生的备份状态（哈希比对，服务端为事实来源）。 */
 data class TimelinePhoto(
@@ -389,14 +391,23 @@ interface PhotoDao {
     )
     fun observeServerScopedWindow(filter: String, namespace: String, limit: Int): Flow<List<TimelineOrder>>
 
-    /** 绑定服务端的时间线：先出首屏窗口，再补齐全量。 */
-    fun observeServerScopedTimeline(filter: String, namespace: String): Flow<List<TimelinePhoto>> =
-        observeServerScopedWindow(filter, namespace, TIMELINE_FIRST_SCREEN).flatMapLatest { window ->
-            flow {
-                emit(hydrateByIds(window))
-                emit(hydrateByScan(observeServerScopedOrder(filter, namespace).first(), includeServerRows = true))
-            }
-        }
+    /**
+     * 绑定服务端的时间线：首屏窗口只在订阅时取一次，之后跟随全量。
+     *
+     * 不能让窗口跟着每次数据变化重发——同步每落一页都会让这张表失效，重发一次就等于
+     * 把界面压回首屏大小，而全量查询（三万条实测 4 秒以上）跑不完就被下一次失效取消，
+     * 结果是同步期间时间线永远停在窗口条数。首屏只发一次后，扩容只朝「更全」走，
+     * 即便某次全量被取消，界面也保留上一份完整结果。
+     */
+    fun observeServerScopedTimeline(filter: String, namespace: String): Flow<List<TimelinePhoto>> = flow {
+        val window = observeServerScopedWindow(filter, namespace, TIMELINE_FIRST_SCREEN).first()
+        if (window.isNotEmpty()) emit(hydrateByIds(window))
+        emitAll(
+            observeServerScopedOrder(filter, namespace).mapLatest { order ->
+                hydrateByScan(order, includeServerRows = true)
+            },
+        )
+    }
 
     // ---- 回表：把「排序」与「取整行」接起来 ----
 

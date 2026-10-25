@@ -218,6 +218,12 @@ class ServerSyncService @Inject constructor(
             _activity.value = ServerSyncActivity(phase = ServerSyncPhase.APPLYING)
             // 返回值：迁移后状态 / 已是目标命名空间的原状态 / 需整份重拉时的 null。
             val previousState = migrateLegacyNamespace(serverSyncStateDao.get(), normalizedUrl)
+            Log.d(
+                TAG,
+                "sync start ns=$serverNamespace savedNs=${previousState?.serverNamespace} " +
+                    "cursorLen=${previousState?.changesCursor?.length} " +
+                    "instance=${info.serverInstanceId} userId=${info.userId}",
+            )
             val report = if (hasIncrementalCursor(
                     previousState?.serverNamespace,
                     previousState?.changesCursor,
@@ -242,6 +248,12 @@ class ServerSyncService @Inject constructor(
             // 同步失败时不动旧数据。
             purgeOtherNamespaces()
             remoteDeletionIdentity.reconcile()
+            Log.d(
+                TAG,
+                "sync done media=${report?.mediaCount} removed=${report?.removedCount} " +
+                    "stateNs=${serverSyncStateDao.get()?.serverNamespace} " +
+                    "stateCursorLen=${serverSyncStateDao.get()?.changesCursor?.length}",
+            )
             _activity.value = ServerSyncActivity()
             report
         } catch (e: CancellationException) {
@@ -512,7 +524,13 @@ class ServerSyncService @Inject constructor(
             }
             val nextCursor = page.nextCursor
             if (nextCursor != null && nextCursor.isNotEmpty()) {
-                if (nextCursor == cursor) throw IllegalStateException("变更分页没有前进")
+                if (nextCursor == cursor) {
+                    // 服务端在「客户端游标已领先于变更表水位」（服务端库重建、变更被裁剪）
+                    // 时会原样回显游标表示没有更多变更。空页回显是正常的终态，不是死循环；
+                    // 只有本页确实带了条目、游标却没前进才是分页异常。
+                    if (page.items.isEmpty()) break
+                    throw IllegalStateException("变更分页没有前进")
+                }
                 cursor = nextCursor
                 serverSyncStateDao.upsert(
                     ServerSyncStateEntity(
