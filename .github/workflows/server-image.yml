@@ -43,6 +43,13 @@ jobs:
               echo "::error::tag ${GITHUB_REF_NAME} 与 Cargo.toml version ${CARGO_VERSION} 不一致"
               exit 1
             fi
+            # 镜像里是 cargo build --locked：Cargo.lock 没跟着改版本会在两个架构上
+            # 各编译十几分钟后才失败，日志只剩一句「cannot update the lock file」。
+            LOCK_VERSION=$(sed -nE '/^name = "youyou-server"$/,/^version = /{s/^version = "([^"]+)".*/\1/p}' apps/server/Cargo.lock | head -1)
+            if [[ "$LOCK_VERSION" != "$CARGO_VERSION" ]]; then
+              echo "::error::Cargo.lock 里 youyou-server 是 ${LOCK_VERSION:-<空>}，与 Cargo.toml ${CARGO_VERSION} 不一致；--locked 构建必然失败"
+              exit 1
+            fi
             echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
