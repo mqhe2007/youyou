@@ -216,6 +216,7 @@ class ServerSyncService @Inject constructor(
             )
             repairStoredIdentity(normalizedUrl, info)
             _activity.value = ServerSyncActivity(phase = ServerSyncPhase.APPLYING)
+            // 返回值：迁移后状态 / 已是目标命名空间的原状态 / 需整份重拉时的 null。
             val previousState = migrateLegacyNamespace(serverSyncStateDao.get(), normalizedUrl)
             val report = if (hasIncrementalCursor(
                     previousState?.serverNamespace,
@@ -272,6 +273,11 @@ class ServerSyncService @Inject constructor(
      * 就把本机所有身份行（投影/标签/关联/导出/同步状态）整批改名到新命名空间并
      * 保留游标——升级后的首次同步继续走增量，不做整库重建。
      *
+     * 返回值约定（调用方用它判断是否走增量）：
+     * - 已是目标命名空间 → 原样返回 [state]，游标有效则走增量；
+     * - 发生迁移 → 返回改名后的状态，继续走增量；
+     * - 需要整份重拉（无状态 / 空游标 / 非旧式命名空间 / 迁移失败）→ null。
+     *
      * 可达场景（配对/换绑都经连接页清库）中旧数据必然属于同一身份；同址换用户
      * 的盲区在这里延续旧行为，自本次迁移后由身份化命名空间覆盖。改名失败会退化为
      * 正常的整库重建（hasIncrementalCursor 不成立），不丢数据。
@@ -282,7 +288,10 @@ class ServerSyncService @Inject constructor(
     ): ServerSyncStateEntity? {
         if (state == null) return null
         val oldNamespace = state.serverNamespace
-        if (oldNamespace.isBlank() || oldNamespace == serverNamespace) return null
+        // 已是目标命名空间时必须原样返回：调用方拿返回值判断增量游标。
+        // 若在这里返回 null，每次同步都会被当成「没有游标」而整份 bootstrap。
+        if (oldNamespace.isBlank()) return null
+        if (oldNamespace == serverNamespace) return state
         if (state.changesCursor.isBlank()) return null
         if (!isLegacyStyleNamespace(oldNamespace, baseUrl, contentHashService::sha256HexForString)) {
             return null
