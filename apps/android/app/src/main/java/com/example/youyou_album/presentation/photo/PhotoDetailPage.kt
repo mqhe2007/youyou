@@ -195,7 +195,9 @@ fun PhotoDetailPage(
             .background(containerColor),
     ) {
         when {
-            uiState.isLoading -> {
+            // 时间线首屏窗口不含深处那张时，先别把第 0 张放出来——否则用户会先看到
+            // 一张不相干的照片，几秒后再跳走。
+            uiState.isLoading || (!uiState.anchored && uiState.photos.isNotEmpty()) -> {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("加载中...", color = contentColor)
                 }
@@ -243,12 +245,13 @@ fun PhotoDetailPage(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = currentPhoto?.name ?: "照片详情",
+                        // 未定位到目标前不显示第 0 张的名字：那不是用户点的照片。
+                        text = if (uiState.anchored) currentPhoto?.name ?: "照片详情" else "照片详情",
                         style = MaterialTheme.typography.titleMedium,
                         color = contentColor,
                         maxLines = 1,
                     )
-                    if (uiState.photos.isNotEmpty()) {
+                    if (uiState.anchored && uiState.photos.isNotEmpty()) {
                         Text(
                             text = "${uiState.currentIndex + 1}/${uiState.photos.size}",
                             style = MaterialTheme.typography.labelSmall,

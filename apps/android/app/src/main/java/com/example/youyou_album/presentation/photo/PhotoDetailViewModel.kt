@@ -34,6 +34,13 @@ data class PhotoDetailUiState(
     val photos: List<Photo> = emptyList(),
     val currentIndex: Int = 0,
     val isLoading: Boolean = true,
+    /**
+     * 是否已定位到进入时指定的那一张。
+     *
+     * 时间线两段式发射，首屏 200 条常常不含用户点的那张（在更深处）。没定位成功之前
+     * 每轮发射都要继续用 entryId 重试，否则一落到第 0 张，后续发射就以它为锚点了。
+     */
+    val anchored: Boolean = false,
 )
 
 @HiltViewModel

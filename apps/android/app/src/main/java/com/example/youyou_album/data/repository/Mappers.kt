@@ -22,6 +22,23 @@ internal fun TimelinePhoto.toDomain() = photo.toDomain().copy(
 )
 
 /**
+ * 时间线行 → 领域对象，顺带用回表阶段已取到的投影键拼出远程预览地址。
+ *
+ * 地址在这里拼，而不是再回一次投影表：三层 JOIN 的 CTE 已经把投影筛过一遍，
+ * 逐行回查纯属重复劳动（三万行 = 三万次查询）。
+ */
+internal fun TimelinePhoto.toDomain(baseUrl: String?): Photo {
+    val domain = toDomain()
+    val mediaId = remoteMediaId ?: return domain
+    if (baseUrl.isNullOrBlank() || domain.sourceType != "server") return domain
+    val mediaUrl = "${baseUrl.trimEnd('/')}/api/v1/media/$mediaId"
+    return domain.copy(
+        remoteThumbnailUrl = "$mediaUrl/thumbnail?size=512&v=$remoteVersion",
+        remoteContentUrl = "$mediaUrl/content?v=$remoteVersion",
+    )
+}
+
+/**
  * 非时间线列表（详情/收藏）也按同一事实派生状态，不使用 Photo 的默认值。
  *
  * 三态按「实况整体」派生（FR-4）：一段实况的静态帧与动态部分共同构成一个备份单位，

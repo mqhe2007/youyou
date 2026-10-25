@@ -588,12 +588,17 @@ class ServerSyncService @Inject constructor(
     private suspend fun upsertMediaBatch(items: List<ServerMediaDto>, revision: Int) {
         if (items.isEmpty()) return
         val now = System.currentTimeMillis()
+        // 一页 100 条一次 IN 取回已存在行；逐条 getByServerMediaId 会让每页多跑 100 次
+        // JOIN 查询，整份三万条清单就是三万次。
+        val existingByMediaId = serverProjectionDao
+            .listPhotosByMediaIds(serverNamespace, items.map { it.id }.filter { it.isNotEmpty() })
+            .associateBy { it.serverMediaId }
         val photos = mutableListOf<Photo>()
         val projections = mutableListOf<ServerMediaProjectionEntity>()
         val favoriteUpdates = mutableListOf<Pair<String, Boolean>>()
         for (media in items) {
             if (media.id.isEmpty()) continue
-            val existing = photoRepository.getByServerMediaId(serverNamespace, media.id)
+            val existing = existingByMediaId[media.id]?.photo
             // 删除前启动的旧快照/变更响应不得覆盖已删除状态；更高版本（恢复/重建）则放行。
             if (existing == null &&
                 mediaTaskCoordinator.shouldDiscardRemoteUpsert(serverNamespace, media.id, media.version)
@@ -634,7 +639,10 @@ class ServerSyncService @Inject constructor(
         }
     }
 
-    private fun projectedPhoto(media: ServerMediaDto, existing: Photo?): Photo {
+    private fun projectedPhoto(
+        media: ServerMediaDto,
+        existing: com.example.youyou_album.data.db.entity.PhotoEntity?,
+    ): Photo {
         val time = if (media.timeVersion >= 1) {
             com.example.youyou_album.domain.model.MediaTime.Value(media.sortAt, media.sortSource ?: "unknown")
         } else {

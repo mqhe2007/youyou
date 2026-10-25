@@ -121,12 +121,13 @@ class PhotoRepositoryImpl @Inject constructor(
                 }
         }
 
+    /** 时间线：远程预览地址已在回表阶段随行带出，这里不再访问投影表。 */
     override fun observeTimeline(filter: MediaSyncDisplay?): Flow<List<Photo>> =
         activeNamespace().flatMapLatest { namespace ->
             photoDao.observeTimeline(filter?.name ?: "ALL", namespace)
                 .map { list ->
                     val baseUrl = connectionStore.getConnection()?.baseUrl
-                    list.map { it.toDomain().withRemotePreview(namespace, baseUrl) }
+                    list.map { it.toDomain(baseUrl) }
                 }
         }
 
@@ -139,8 +140,7 @@ class PhotoRepositoryImpl @Inject constructor(
     override suspend fun getTimeline(): List<Photo> {
         val namespace = activeNamespace().first()
         val baseUrl = connectionStore.getConnection()?.baseUrl
-        return photoDao.getTimelineOnce("ALL", namespace)
-            .map { it.toDomain().withRemotePreview(namespace, baseUrl) }
+        return photoDao.getTimelineOnce("ALL", namespace).map { it.toDomain(baseUrl) }
     }
 
     override suspend fun resolveServerMediaId(photo: Photo): String? {

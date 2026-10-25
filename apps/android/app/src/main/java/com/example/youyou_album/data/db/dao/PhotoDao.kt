@@ -25,6 +25,21 @@ data class TimelinePhoto(
     val timelineAt: Long? = null,
     val timelineSource: String? = null,
     val timelineKey: String = "",
+    /**
+     * 远程预览地址所需的投影列，由回表阶段一次补齐（查询里用 LEFT JOIN 提供）。
+     *
+     * 之前是每张远程行各自查一次投影：真机三万条时间线 = 三万次 query，每次落库失效
+     * 都要重跑一遍。现在跟着回表的那一条查询一起出来，多两列、零额外查询。
+     */
+    val remoteMediaId: String? = null,
+    val remoteVersion: Int? = null,
+)
+
+/** 远程预览地址的投影键；回表时和整行一起 LEFT JOIN 出来。 */
+data class TimelineRow(
+    @Embedded val photo: PhotoEntity,
+    val remoteMediaId: String? = null,
+    val remoteVersion: Int? = null,
 )
 
 /**
@@ -44,8 +59,8 @@ data class TimelineOrder(
     val timelineSource: String?,
     val backupState: String,
 ) {
-    fun toTimelinePhoto(photo: PhotoEntity) =
-        TimelinePhoto(photo, backupState, timelineAt, timelineSource, timelineKey)
+    fun toTimelinePhoto(row: TimelineRow) =
+        TimelinePhoto(row.photo, backupState, timelineAt, timelineSource, timelineKey, row.remoteMediaId, row.remoteVersion)
 }
 
 /** 首屏窗口行数：一屏网格约 20-40 行，200 足以覆盖滚动前的可见区。 */
@@ -185,8 +200,8 @@ interface PhotoDao {
     fun observeUnboundTimeline(filter: String): Flow<List<TimelinePhoto>> =
         observeUnboundWindow(filter, TIMELINE_FIRST_SCREEN).flatMapLatest { window ->
             flow {
-                emit(hydrateByIds(window))
-                emit(hydrateByScan(observeUnboundOrder(filter).first(), includeServerRows = false))
+                emit(hydrateByIds(window, namespace = ""))
+                emit(hydrateByScan(observeUnboundOrder(filter).first(), includeServerRows = false, namespace = ""))
             }
         }
 
@@ -401,23 +416,29 @@ interface PhotoDao {
      */
     fun observeServerScopedTimeline(filter: String, namespace: String): Flow<List<TimelinePhoto>> = flow {
         val window = observeServerScopedWindow(filter, namespace, TIMELINE_FIRST_SCREEN).first()
-        if (window.isNotEmpty()) emit(hydrateByIds(window))
+        if (window.isNotEmpty()) emit(hydrateByIds(window, namespace))
         emitAll(
             observeServerScopedOrder(filter, namespace).mapLatest { order ->
-                hydrateByScan(order, includeServerRows = true)
+                hydrateByScan(order, includeServerRows = true, namespace = namespace)
             },
         )
     }
 
     // ---- 回表：把「排序」与「取整行」接起来 ----
+    //
+    // 回表顺带 LEFT JOIN 出远程预览所需的投影列：投影表在 local_photo_id 上有唯一索引，
+    // 一次 join 不会放大行数。这样时间线不再逐行回查投影表（三万行 = 三万次 query）。
 
     /** 首屏回表：按主键定位。行数小，走主键索引最快。 */
-    private suspend fun hydrateByIds(order: List<TimelineOrder>): List<TimelinePhoto> {
+    private suspend fun hydrateByIds(
+        order: List<TimelineOrder>,
+        namespace: String,
+    ): List<TimelinePhoto> {
         if (order.isEmpty()) return emptyList()
         val byId = order.map { it.id }
             .chunked(SQLITE_MAX_BIND_ARGS)
-            .flatMap { getByIds(it) }
-            .associateBy { it.id }
+            .flatMap { getTimelineRowsByIds(it, namespace) }
+            .associateBy { it.photo.id }
         return order.mapNotNull { row -> byId[row.id]?.let(row::toTimelinePhoto) }
     }
 
@@ -427,14 +448,21 @@ interface PhotoDao {
      * 不复用 [hydrateByIds] 是因为十万次主键定位会退化成随机读：真机实测按主键分块回表
      * 4617ms，而顺序扫描整表只读一遍数据页（约 950ms）。
      */
-    private suspend fun hydrateByScan(order: List<TimelineOrder>, includeServerRows: Boolean): List<TimelinePhoto> {
+    private suspend fun hydrateByScan(
+        order: List<TimelineOrder>,
+        includeServerRows: Boolean,
+        namespace: String,
+    ): List<TimelinePhoto> {
         if (order.isEmpty()) return emptyList()
-        val rows = if (includeServerRows) getAllPhotosForTimeline() else getLocalPhotosForTimeline()
-        val byId = rows.associateBy { it.id }
+        val rows = if (includeServerRows) {
+            getTimelineRowsByScan(namespace)
+        } else {
+            getLocalTimelineRowsByScan(namespace)
+        }
+        val byId = rows.associateBy { it.photo.id }
         return order.mapNotNull { row -> byId[row.id]?.let(row::toTimelinePhoto) }
     }
 
-    /** 顺序扫描用：只取本机行。 */
     /** 按内容哈希取当前身份的投影行（实况整体删除要读它的 live_partner_id）。 */
     @Query(
         "SELECT * FROM photos_table WHERE source_type = 'server' AND content_hash = :hash " +
@@ -442,12 +470,40 @@ interface PhotoDao {
     )
     suspend fun getServerRowByHash(hash: String): PhotoEntity?
 
-    @Query("SELECT * FROM photos_table WHERE source_type != 'server'")
-    suspend fun getLocalPhotosForTimeline(): List<PhotoEntity>
+    /** 首屏回表：主键定位，带当前身份的投影列。 */
+    @Query(
+        """
+        SELECT p.*, sp.server_media_id AS remoteMediaId, sp.server_version AS remoteVersion
+        FROM photos_table p
+        LEFT JOIN server_media_projection sp
+            ON sp.local_photo_id = p.id AND sp.server_namespace = :namespace
+        WHERE p.id IN (:ids)
+        """,
+    )
+    suspend fun getTimelineRowsByIds(ids: List<String>, namespace: String): List<TimelineRow>
+
+    /** 顺序扫描用：只取本机行。 */
+    @Query(
+        """
+        SELECT p.*, sp.server_media_id AS remoteMediaId, sp.server_version AS remoteVersion
+        FROM photos_table p
+        LEFT JOIN server_media_projection sp
+            ON sp.local_photo_id = p.id AND sp.server_namespace = :namespace
+        WHERE p.source_type != 'server'
+        """,
+    )
+    suspend fun getLocalTimelineRowsByScan(namespace: String): List<TimelineRow>
 
     /** 顺序扫描用：取全部行（绑定服务端时需连当前身份的投影行一起回填）。 */
-    @Query("SELECT * FROM photos_table")
-    suspend fun getAllPhotosForTimeline(): List<PhotoEntity>
+    @Query(
+        """
+        SELECT p.*, sp.server_media_id AS remoteMediaId, sp.server_version AS remoteVersion
+        FROM photos_table p
+        LEFT JOIN server_media_projection sp
+            ON sp.local_photo_id = p.id AND sp.server_namespace = :namespace
+        """,
+    )
+    suspend fun getTimelineRowsByScan(namespace: String): List<TimelineRow>
 
     /**
      * 一次性取**全量**时间线（不走首屏分段）。
@@ -457,9 +513,9 @@ interface PhotoDao {
      */
     suspend fun getTimelineOnce(filter: String, namespace: String): List<TimelinePhoto> =
         if (namespace.isEmpty()) {
-            hydrateByScan(observeUnboundOrder(filter).first(), includeServerRows = false)
+            hydrateByScan(observeUnboundOrder(filter).first(), includeServerRows = false, namespace = "")
         } else {
-            hydrateByScan(observeServerScopedOrder(filter, namespace).first(), includeServerRows = true)
+            hydrateByScan(observeServerScopedOrder(filter, namespace).first(), includeServerRows = true, namespace = namespace)
         }
 
     @Query("SELECT * FROM photos_table ORDER BY sort_at DESC")

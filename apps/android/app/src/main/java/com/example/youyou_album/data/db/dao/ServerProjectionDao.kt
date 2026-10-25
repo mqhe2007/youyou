@@ -1,10 +1,18 @@
 package com.example.youyou_album.data.db.dao
 
 import androidx.room.Dao
+import androidx.room.Embedded
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import com.example.youyou_album.data.db.entity.PhotoEntity
 import com.example.youyou_album.data.db.entity.ServerMediaProjectionEntity
+
+/** 服务端媒体 id + 它在 `photos_table` 里的已存在行（批量落库时一次取回）。 */
+data class ServerMediaPhoto(
+    val serverMediaId: String,
+    @Embedded val photo: PhotoEntity,
+)
 
 @Dao
 interface ServerProjectionDao {
@@ -34,6 +42,22 @@ interface ServerProjectionDao {
 
     @Query("SELECT local_photo_id FROM server_media_projection WHERE server_namespace = :namespace")
     suspend fun listLocalPhotoIds(namespace: String): List<String>
+
+    /**
+     * 本页媒体的已存在行（bootstrap 落库用）。
+     *
+     * 逐条 `getByServerMediaId` 时每页 100 条就是 100 次 JOIN 查询，整份清单三万条要跑
+     * 三万次——真机实测 bootstrap 每页约 0.8s 主要是这个开销量级。一次 IN 取回即可。
+     */
+    @Query(
+        """
+        SELECT sp.server_media_id AS serverMediaId, p.*
+        FROM server_media_projection sp
+        INNER JOIN photos_table p ON p.id = sp.local_photo_id
+        WHERE sp.server_namespace = :namespace AND sp.server_media_id IN (:mediaIds)
+        """,
+    )
+    suspend fun listPhotosByMediaIds(namespace: String, mediaIds: List<String>): List<ServerMediaPhoto>
 
     @Query("SELECT server_media_id FROM server_media_projection WHERE server_namespace = :namespace")
     suspend fun listServerMediaIds(namespace: String): List<String>

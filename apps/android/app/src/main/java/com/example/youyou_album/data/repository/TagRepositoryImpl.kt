@@ -44,23 +44,15 @@ class TagRepositoryImpl @Inject constructor(
             state?.serverNamespace?.takeIf { it.isNotBlank() } ?: ""
         }
 
+    /** 标签详情与时间线同源：投影列随查询带出，这里不再逐条回查投影表。 */
     override fun observePhotosByTag(tagId: String): Flow<List<Photo>> =
         activeNamespace().flatMapLatest { namespace ->
             tagDao.observePhotosByTag(tagId, namespace)
-                .map { list -> list.map { it.toDomain() }.map { it.withRemotePreview() } }
+                .map { list ->
+                    val baseUrl = connectionStore.getConnection()?.baseUrl
+                    list.map { it.toDomain(baseUrl) }
+                }
         }
-
-    /** 远程条目补预览地址，与时间线/收藏入口一致。 */
-    private suspend fun Photo.withRemotePreview(): Photo {
-        if (sourceType != "server") return this
-        val connection = connectionStore.getConnection() ?: return this
-        val projection = serverProjectionDao.getByLocalPhotoId(id) ?: return this
-        val mediaUrl = "${connection.baseUrl.trimEnd('/')}/api/v1/media/${projection.serverMediaId}"
-        return copy(
-            remoteThumbnailUrl = "$mediaUrl/thumbnail?size=512&v=${projection.serverVersion}",
-            remoteContentUrl = "$mediaUrl/content?v=${projection.serverVersion}",
-        )
-    }
 
     override suspend fun addTagToPhoto(tagId: String, photoId: String, serverNamespace: String?) =
         tagDao.addTagToPhoto(

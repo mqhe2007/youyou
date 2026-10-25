@@ -84,10 +84,14 @@ interface TagDao {
                                AND sp.server_namespace = :namespace
                          ) THEN 'SYNCED'
                          ELSE 'LOCAL_ONLY' END
-                END AS backupState
+                END AS backupState,
+                sp.server_media_id AS remoteMediaId,
+                sp.server_version AS remoteVersion
             FROM photos_table p
             INNER JOIN photo_tags_table pt ON p.id = pt.photo_id
             LEFT JOIN timeline_times tt ON tt.hash = p.content_hash AND tt.namespace = :namespace
+            LEFT JOIN server_media_projection sp
+                ON sp.local_photo_id = p.id AND sp.server_namespace = :namespace
             WHERE pt.tag_id = :tagId
         )
         ORDER BY timelineAt DESC, timelineKey ASC, id ASC

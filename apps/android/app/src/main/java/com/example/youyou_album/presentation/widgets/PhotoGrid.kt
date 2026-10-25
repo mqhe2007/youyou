@@ -386,7 +386,9 @@ internal fun PhotoTile(
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         )
                         Text(
-                            text = if (photo.sourceUri.isNullOrBlank()) "可重新扫描" else "可重试加载",
+                            // 远程行（sourceUri 为空）没有本机文件可扫，说「可重新扫描」
+                            // 是误导；它只是缩略图没取到，点开详情仍会加载原件。
+                            text = if (photo.sourceUri.isNullOrBlank()) "暂无预览" else "可重试加载",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
